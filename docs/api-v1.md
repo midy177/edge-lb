@@ -17,8 +17,10 @@ Import and export are subresources of their owning collection, for example
 `/api/v1/listener-configs/export` and `/api/v1/target-groups/import`.
 
 HA configuration and operations live under `/api/v1/ha`: `config`, `status`,
-`pair`, `failover`, and `refresh-datapath`. Peer-only replication paths are
-also under this namespace and require the paired peer bearer token.
+`pair`, `failover`, and `refresh-datapath`. Peer-only configuration replica
+paths are also under this namespace and require the paired peer bearer token.
+Native flow-state xSync uses the `FlowSync` gRPC service on the control-plane
+port, not an HTTP API endpoint.
 
 `POST /api/v1/ha/peer/activate` is a peer-only operation used by coordinated
 manual failover. The receiving gateway accepts the request only when the target

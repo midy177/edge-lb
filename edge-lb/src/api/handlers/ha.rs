@@ -333,18 +333,6 @@ pub(in crate::api) fn peer_status(cfg: &Config) -> Reply {
     )
 }
 
-pub(in crate::api) fn peer_receive_native_flows(cfg: &Config, body: &str) -> Reply {
-    let request: crate::provider::native::flow_sync::FlowReplRequest =
-        match serde_json::from_str(body) {
-            Ok(value) => value,
-            Err(e) => return Reply::error(400, format!("bad flow replication JSON: {e}")),
-        };
-    match crate::provider::native::flow_sync::apply_replicated(cfg, &request) {
-        Ok(applied) => Reply::json(200, json!({ "applied": applied, "from": request.from })),
-        Err(e) => Reply::error(500, format!("flow replication failed: {e:#}")),
-    }
-}
-
 /// Apply a coordinated manual promotion requested by the paired gateway.
 pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
     if let Some(reply) = require_gateway(cfg) {

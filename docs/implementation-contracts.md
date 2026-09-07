@@ -7,6 +7,12 @@
 - 监听配置和目标组是 edge-lb 自有模型，不映射成外部负载均衡器的业务对象。
 - 监听配置只负责对外地址、对外端口、协议、调度策略、转发模式、目标组绑定和连接超时。
 - 目标组只负责后端地址、权重和健康探测配置；监听配置负责目标转发端口。
+- `Config.services` 只是 gateway 本地从监听配置和目标组派生出的运行期投影，
+  只能用于 legacy-free native map 写入、DSCP 端口推导和回程端口推导；不得进入
+  API、SQLite 业务资源或 backend xDS snapshot。
+- backend xDS 的 `backend_return_ports` 必须优先直接从 `listeners + target_groups`
+  推导，旧 `Config.services` projection 只能作为无新模型输入时的内部兜底，不能
+  成为 backend 控制面契约。
 - 自动配置模板只生成或覆盖目标组，字段名必须是 `target_group`；不接受
   `listener` 字段别名。
 - 自动配置目标组在没有匹配节点时可以创建空目标组，方便监听提前绑定；但

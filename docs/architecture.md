@@ -75,8 +75,9 @@ gateway 下发的 snapshot 只包含 backend 数据面所需内容：active gate
 overlay CIDR、gateway VXLAN 接口名、VNI、VXLAN 端口、MTU、DSCP、gateway/backend
 节点清单，以及当前 default-mode listener + target group 推导出的本 backend
 相关回程端口。gateway/backend 节点清单保持全量下发，用于 VXLAN overlay 拓扑；
-业务相关的运行期服务投影和 `backend_return_ports` 按订阅 backend 的 underlay IP
-裁剪。不同 backend 可以收到不同的后端目标、转发端口、权重和回程端口。
+业务 listener、target group、健康探测配置和运行期服务投影不进入 backend xDS。
+`backend_return_ports` 按订阅 backend 的 underlay IP 裁剪，不同 backend 可以收到
+不同的回程端口、gateway DSCP、mark 和 route table。
 
 HA 多 gateway 下，backend 会同时配置多套回程路径。回程 mark 和 route table 由
 **(gateway slot, DSCP)** 二元组派生，单一实现在 `config/model.rs`：

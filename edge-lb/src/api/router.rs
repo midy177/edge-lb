@@ -72,9 +72,6 @@ pub(in crate::api) fn route(
         (Method::Put, "/api/ha/config") => handlers::ha::put_config(cfg, body),
         (Method::Get, "/api/ha/status") => handlers::ha::status(cfg),
         (Method::Get, "/api/ha/peer/status") => handlers::ha::peer_status(cfg),
-        (Method::Post, "/api/ha/peer/native/flows/repl") => {
-            handlers::ha::peer_receive_native_flows(cfg, body)
-        }
         (Method::Post, "/api/ha/peer/activate") => handlers::ha::peer_activate(cfg, body),
         (Method::Put, "/api/ha/peer/notifications/active") => {
             handlers::notifications::peer_replace_active(cfg, body)
@@ -177,7 +174,6 @@ fn canonical_path(path: &str) -> Option<String> {
         "/ha/config" => "/api/ha/config",
         "/ha/status" => "/api/ha/status",
         "/ha/peer/status" => "/api/ha/peer/status",
-        "/ha/peer/native/flows/repl" => "/api/ha/peer/native/flows/repl",
         "/ha/peer/activate" => "/api/ha/peer/activate",
         "/ha/peer/notifications/active" => "/api/ha/peer/notifications/active",
         "/ha/peer/notifications/replica" => "/api/ha/peer/notifications/replica",

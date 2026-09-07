@@ -59,7 +59,7 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
         .map(|b| b.underlay_ip)
         .collect::<Vec<_>>();
     tracing::info!(
-        "[gateway] apply node={} active={} hub_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} runtime_services={} backend_peers={}",
+        "[gateway] apply node={} active={} hub_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} runtime_listeners={} backend_peers={}",
         cfg.node_name,
         is_active_gateway(cfg),
         n.vxlan_dev,
@@ -356,7 +356,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     crate::runtime::bfd::spawn(&cfg);
     control::spawn_gateway(&cfg);
     tracing::info!(
-        "[gateway] watching for drift ({}s interval); node={} hub_dev={} underlay_dev={} active={} runtime_services={} backends={} UI/API listen {}; control-plane {}",
+        "[gateway] watching for drift ({}s interval); node={} hub_dev={} underlay_dev={} active={} runtime_listeners={} backends={} UI/API listen {}; control-plane {}",
         cfg.ha.watch_interval_secs,
         cfg.node_name,
         cfg.network().vxlan_dev,

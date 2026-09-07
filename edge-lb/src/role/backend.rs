@@ -55,7 +55,7 @@ fn apply_with(
     crate::linux::sysctl::ensure_backend_datapath_tuning()
         .with_context(|| "applying backend datapath sysctl tuning")?;
     tracing::info!(
-        "[backend] apply node={} return_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} gateway_reference={} gateway_underlay={} gateway_overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} runtime_services={} return_ports={} return_engine=nftables",
+        "[backend] apply node={} return_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} gateway_reference={} gateway_underlay={} gateway_overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} return_engine=nftables",
         cfg.node_name,
         n.vxlan_dev,
         n.underlay_dev,
@@ -70,7 +70,6 @@ fn apply_with(
         n.vxlan_port,
         n.vxlan_mtu,
         n.dscp,
-        cfg.services.len(),
         return_ports.len(),
     );
     let created = ensure_vxlan(cfg, gw.underlay_ip)?;

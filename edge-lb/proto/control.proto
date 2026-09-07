@@ -45,7 +45,8 @@ message ConfigSnapshot {
   Network network = 2;
   repeated GatewayNode gateway_nodes = 3;
   repeated BackendNode backend_nodes = 4;
-  repeated Service services = 5;
+  reserved 5;
+  reserved "services";
   repeated BackendReturnPort backend_return_ports = 6;
 }
 
@@ -75,24 +76,6 @@ message BackendNode {
   string public_ip = 2;
   string underlay_ip = 3;
   string overlay_ip = 4;
-}
-
-message Service {
-  string name = 1;
-  uint32 vip_port = 2;
-  string backend_ip = 3;
-  uint32 backend_port = 4;
-  uint32 backend_weight = 5;
-  repeated string protocols = 6;
-  repeated Endpoint endpoints = 7;
-  string target_group = 8;
-}
-
-message Endpoint {
-  string backend = 1;
-  string address = 2;
-  uint32 port = 3;
-  uint32 weight = 4;
 }
 
 message BackendReturnPort {

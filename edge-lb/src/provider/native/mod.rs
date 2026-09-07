@@ -6,7 +6,6 @@
 //! instead of manipulating maps directly.
 
 mod api_model;
-pub mod flow_sync;
 pub mod ha;
 mod model;
 pub mod probe;
@@ -21,7 +20,7 @@ pub use api_model::{
 #[allow(unused_imports)]
 pub use model::{
     NativeListener, NativeListenerKey, NativeProtocol, NativeTarget, NativeTargetState,
-    RuntimeRuleEntry, effective_vip_ips, listener_from_service, listeners_from_config,
+    RuntimeRuleEntry, effective_vip_ips, listeners_from_config,
 };
 #[allow(unused_imports)]
 pub use probe::run_worker as run_probe_worker;

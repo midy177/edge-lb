@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::{
         self, ActiveSource, BackendNode, BackendReturnPort, Config, FileConfig, GatewayNode,
-        NetworkConfig, Protocol, Service, TargetEndpoint,
+        NetworkConfig, Protocol,
     },
     control::pb::{self, ConfigSnapshot, DiscoveryResponse},
 };
@@ -35,7 +35,7 @@ pub fn log_send(node_name: &str, resp: &DiscoveryResponse) {
     };
     let network = snapshot.network.as_ref();
     tracing::debug!(
-        "[control] sending snapshot to {} version {} active_gateway={} gateway_vxlan_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} runtime_services={} return_ports={} backends={}",
+        "[control] sending snapshot to {} version {} active_gateway={} gateway_vxlan_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
         node_name,
         resp.version,
         snapshot.active_gateway,
@@ -49,7 +49,6 @@ pub fn log_send(node_name: &str, resp: &DiscoveryResponse) {
         network.map(|n| n.vxlan_port).unwrap_or_default(),
         network.map(|n| n.vxlan_mtu).unwrap_or_default(),
         network.map(|n| n.dscp).unwrap_or_default(),
-        snapshot.services.len(),
         snapshot.backend_return_ports.len(),
         snapshot.backend_nodes.len(),
     );
@@ -66,7 +65,7 @@ pub fn log_recv(cfg: &Config, resp: &DiscoveryResponse) {
     };
     let network = snapshot.network.as_ref();
     tracing::debug!(
-        "[backend] xDS received snapshot version {} nonce {} active_gateway={} gateway_vxlan_dev={} local_return_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} runtime_services={} return_ports={} backends={}",
+        "[backend] xDS received snapshot version {} nonce {} active_gateway={} gateway_vxlan_dev={} local_return_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
         resp.version,
         resp.nonce,
         snapshot.active_gateway,
@@ -81,7 +80,6 @@ pub fn log_recv(cfg: &Config, resp: &DiscoveryResponse) {
         network.map(|n| n.vxlan_port).unwrap_or_default(),
         network.map(|n| n.vxlan_mtu).unwrap_or_default(),
         network.map(|n| n.dscp).unwrap_or_default(),
-        snapshot.services.len(),
         snapshot.backend_return_ports.len(),
         snapshot.backend_nodes.len(),
     );
@@ -137,7 +135,6 @@ pub fn combine_gateway_responses(responses: Vec<DiscoveryResponse>) -> Result<Di
         .context("missing latest snapshot")?;
     combined.gateway_nodes.clear();
     combined.backend_nodes.clear();
-    combined.services.clear();
     combined.backend_return_ports.clear();
 
     let mut gateway_keys = BTreeSet::new();
@@ -161,9 +158,6 @@ pub fn combine_gateway_responses(responses: Vec<DiscoveryResponse>) -> Result<Di
                 combined.backend_nodes.push(backend);
             }
         }
-        // Services are gateway-owned listener resources. They are not needed
-        // to build a backend return path and must not be interpreted as a
-        // backend listener configuration.
         for port in snapshot.backend_return_ports {
             let key = (
                 port.gateway_underlay_ip.clone(),
@@ -206,7 +200,6 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
     // Marks/tables are gateway-slotted so two HA gateways never share one
     // return table.
     let slot = config::gateway_slot(&cfg.gateway_nodes, source_gateway.underlay_ip);
-    let services = services_for_backend(cfg, backend_underlay);
     let backend_return_ports = backend_return_ports_from_config(cfg)
         .into_iter()
         .filter(|p| p.address == backend_underlay)
@@ -256,68 +249,7 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
                 overlay_ip: b.overlay_ip.clone(),
             })
             .collect(),
-        services,
         backend_return_ports,
-    })
-}
-
-fn services_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Vec<pb::Service> {
-    let mut seen = BTreeSet::new();
-    let mut services = Vec::new();
-    for service in &cfg.services {
-        let Some(proto) = service_to_proto(cfg, service, backend_underlay) else {
-            continue;
-        };
-        if seen.insert(proto.name.clone()) {
-            services.push(proto);
-        } else {
-            tracing::debug!(
-                "[control] skipping duplicate service {} in backend snapshot; HA VIP and underlay LB share one backend service",
-                proto.name
-            );
-        }
-    }
-    services
-}
-
-fn service_to_proto(
-    cfg: &Config,
-    service: &Service,
-    backend_underlay: IpAddr,
-) -> Option<pb::Service> {
-    let endpoints = cfg
-        .service_endpoints(service)
-        .into_iter()
-        .filter_map(|endpoint| {
-            let address = cfg.resolve_endpoint_address(&endpoint);
-            if address != backend_underlay {
-                return None;
-            }
-            Some((endpoint, address))
-        })
-        .collect::<Vec<_>>();
-    let first = endpoints.first()?;
-    Some(pb::Service {
-        name: service.name.clone(),
-        vip_port: service.vip_port as u32,
-        backend_ip: first.1.to_string(),
-        backend_port: first.0.port as u32,
-        backend_weight: first.0.weight,
-        protocols: service
-            .protocols()
-            .iter()
-            .map(|p| p.as_str().to_string())
-            .collect(),
-        endpoints: endpoints
-            .iter()
-            .map(|(endpoint, address)| pb::Endpoint {
-                backend: endpoint.backend.clone().unwrap_or_default(),
-                address: address.to_string(),
-                port: endpoint.port as u32,
-                weight: endpoint.weight,
-            })
-            .collect(),
-        target_group: service.target_group.clone().unwrap_or_default(),
     })
 }
 
@@ -372,11 +304,9 @@ fn file_from_snapshot(base: &Config, snapshot: &ConfigSnapshot) -> Result<FileCo
         })
         .collect::<Result<Vec<_>>>()?;
     let local = local_backend_for_snapshot(base, &file)?;
-    file.services = snapshot
-        .services
-        .iter()
-        .filter_map(|s| service_from_proto_for_local(s, local.underlay_ip).transpose())
-        .collect::<Result<Vec<_>>>()?;
+    file.listeners.clear();
+    file.target_groups.clear();
+    file.services.clear();
     file.backend_return_ports = snapshot
         .backend_return_ports
         .iter()
@@ -389,30 +319,9 @@ fn file_from_snapshot(base: &Config, snapshot: &ConfigSnapshot) -> Result<FileCo
 }
 
 fn backend_return_ports_from_config(cfg: &Config) -> Vec<BackendReturnPort> {
-    let mut ports = Vec::new();
-    for svc in &cfg.services {
-        if !svc.mode.preserves_client_ip() {
-            continue;
-        }
-        let protocols = svc.protocols();
-        for endpoint in cfg.service_endpoints(svc) {
-            let address = cfg.resolve_endpoint_address(&endpoint);
-            for protocol in &protocols {
-                ports.push(BackendReturnPort {
-                    backend: endpoint.backend.clone(),
-                    address,
-                    protocol: *protocol,
-                    port: endpoint.port,
-                    gateway: None,
-                    gateway_underlay_ip: None,
-                    gateway_overlay_ip: None,
-                    backend_overlay_ip: backend_overlay_ip(cfg, &endpoint, address),
-                    dscp: None,
-                    mark: None,
-                    route_table_id: None,
-                });
-            }
-        }
+    let mut ports = cfg.listener_backend_return_ports();
+    if ports.is_empty() {
+        ports = cfg.backend_return_ports();
     }
     ports.sort_by(|a, b| {
         (
@@ -439,62 +348,6 @@ fn backend_return_ports_from_config(cfg: &Config) -> Vec<BackendReturnPort> {
             && a.route_table_id == b.route_table_id
     });
     ports
-}
-
-fn service_from_proto(s: &pb::Service) -> Result<Service> {
-    let mut service = Service {
-        name: s.name.clone(),
-        vip_port: u16::try_from(s.vip_port).context("vip_port out of range")?,
-        backend_ip: parse_ip(&s.backend_ip, "service backend_ip")?,
-        backend_port: u16::try_from(s.backend_port).context("backend_port out of range")?,
-        backend_weight: s.backend_weight,
-        ..Service::default()
-    };
-    service.protocols = s
-        .protocols
-        .iter()
-        .map(|p| match p.as_str() {
-            "tcp" => Ok(Protocol::Tcp),
-            "udp" => Ok(Protocol::Udp),
-            other => bail!("unknown protocol {other:?}"),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(service)
-}
-
-fn service_from_proto_for_local(
-    s: &pb::Service,
-    local_underlay: IpAddr,
-) -> Result<Option<Service>> {
-    let mut service = service_from_proto(s)?;
-    if s.endpoints.is_empty() {
-        return Ok((service.backend_ip == local_underlay).then_some(service));
-    }
-    service.endpoints = s
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.address == local_underlay.to_string())
-        .map(endpoint_from_proto)
-        .collect::<Result<Vec<_>>>()?;
-    if service.endpoints.is_empty() {
-        return Ok(None);
-    }
-    let first = &service.endpoints[0];
-    service.backend = first.backend.clone();
-    service.backend_ip = first.address;
-    service.backend_port = first.port;
-    service.backend_weight = first.weight;
-    service.target_group = (!s.target_group.is_empty()).then(|| s.target_group.clone());
-    Ok(Some(service))
-}
-
-fn endpoint_from_proto(endpoint: &pb::Endpoint) -> Result<TargetEndpoint> {
-    Ok(TargetEndpoint {
-        backend: (!endpoint.backend.is_empty()).then(|| endpoint.backend.clone()),
-        address: parse_ip(&endpoint.address, "endpoint address")?,
-        port: u16::try_from(endpoint.port).context("endpoint port out of range")?,
-        weight: endpoint.weight,
-    })
 }
 
 fn backend_return_port_from_proto_for_local(
@@ -531,24 +384,6 @@ fn source_gateway<'a>(cfg: &'a Config, fallback: &'a GatewayNode) -> &'a Gateway
         .iter()
         .find(|gw| gw.name == cfg.node_name || gw.underlay_ip == cfg.underlay_ip)
         .unwrap_or(fallback)
-}
-
-fn backend_overlay_ip(cfg: &Config, endpoint: &TargetEndpoint, address: IpAddr) -> Option<String> {
-    endpoint
-        .backend
-        .as_ref()
-        .and_then(|name| {
-            cfg.backend_nodes_effective()
-                .iter()
-                .find(|node| &node.name == name)
-                .map(|node| node.overlay_ip.clone())
-        })
-        .or_else(|| {
-            cfg.backend_nodes_effective()
-                .iter()
-                .find(|node| node.underlay_ip == address)
-                .map(|node| node.overlay_ip.clone())
-        })
 }
 
 fn overlay_addr(value: &str, name: &str) -> Result<IpAddr> {
@@ -622,7 +457,8 @@ fn parse_ip(value: &str, name: &str) -> Result<IpAddr> {
 mod tests {
     use super::*;
     use crate::config::{
-        BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole, TargetGroup,
+        BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole, Service,
+        TargetEndpoint, TargetGroup,
     };
     use std::{fs, path::PathBuf};
 
@@ -668,7 +504,6 @@ mod tests {
                     underlay_ip: "192.0.2.22".to_string(),
                     overlay_ip: "10.255.12.2/24".to_string(),
                 }],
-                services: Vec::new(),
                 backend_return_ports: vec![{
                     let gateway_underlay = parse_ip(gateway_ip, "gateway underlay").unwrap();
                     let slot = config::gateway_slot(
@@ -735,7 +570,6 @@ mod tests {
         .expect("snapshots combine");
         let snapshot = combined.snapshot.expect("combined snapshot");
         assert_eq!(snapshot.backend_return_ports.len(), 2);
-        assert!(snapshot.services.is_empty());
     }
 
     #[test]
@@ -804,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_to_backend_config_keeps_only_local_services() {
+    fn snapshot_to_backend_config_keeps_only_return_path_contract() {
         let mut base_file = FileConfig::default();
         base_file.node_name = "backend-2".to_string();
         base_file.ha = HaConfig {
@@ -858,28 +692,6 @@ mod tests {
                     overlay_ip: "10.255.255.3/24".to_string(),
                 },
             ],
-            services: vec![
-                pb::Service {
-                    name: "local".to_string(),
-                    vip_port: 48080,
-                    backend_ip: "192.0.2.23".to_string(),
-                    backend_port: 58080,
-                    backend_weight: 2,
-                    protocols: vec!["tcp".to_string(), "udp".to_string()],
-                    endpoints: Vec::new(),
-                    target_group: String::new(),
-                },
-                pb::Service {
-                    name: "remote".to_string(),
-                    vip_port: 48081,
-                    backend_ip: "192.0.2.22".to_string(),
-                    backend_port: 58081,
-                    backend_weight: 1,
-                    protocols: vec!["tcp".to_string()],
-                    endpoints: Vec::new(),
-                    target_group: String::new(),
-                },
-            ],
             backend_return_ports: vec![
                 pb::BackendReturnPort {
                     backend: "backend-2".to_string(),
@@ -907,20 +719,16 @@ mod tests {
 
         let file = file_from_snapshot(&base, &snapshot).expect("snapshot converts");
 
-        assert_eq!(file.services.len(), 1);
-        assert_eq!(file.services[0].name, "local");
-        assert_eq!(file.services[0].backend_weight, 2);
-        assert_eq!(
-            file.services[0].protocols(),
-            vec![Protocol::Tcp, Protocol::Udp]
-        );
+        assert!(file.listeners.is_empty());
+        assert!(file.target_groups.is_empty());
+        assert!(file.services.is_empty());
         assert_eq!(file.backend_return_ports.len(), 2);
         assert_eq!(file.backend_return_ports[0].address, local_ip("192.0.2.23"));
         assert_eq!(file.backend_return_ports[0].port, 58080);
     }
 
     #[test]
-    fn backend_snapshot_dedups_ha_vip_and_underlay_service_names() {
+    fn backend_snapshot_excludes_listener_services() {
         let backend_ip = local_ip("192.0.2.23");
         let cfg = Config {
             file: FileConfig {
@@ -969,8 +777,6 @@ mod tests {
 
         let snapshot = from_config_for_backend(&cfg, backend_ip).unwrap();
 
-        assert_eq!(snapshot.services.len(), 1);
-        assert_eq!(snapshot.services[0].name, "tcp-48080");
         assert_eq!(snapshot.backend_return_ports.len(), 1);
     }
 
@@ -1034,27 +840,30 @@ mod tests {
                         overlay_ip: "10.255.255.3/24".to_string(),
                     },
                 ],
-                services: vec![Service {
-                    name: "multi-backend".to_string(),
-                    vip_port: 48080,
-                    target_group: Some("targets".to_string()),
-                    protocols: vec![Protocol::Tcp],
-                    mode: LbMode::Default,
-                    endpoints: vec![
-                        TargetEndpoint {
+                target_groups: vec![TargetGroup {
+                    name: "targets".to_string(),
+                    targets: vec![
+                        BackendTarget {
                             backend: Some("backend-1".to_string()),
                             address: "192.0.2.20".parse().unwrap(),
-                            port: 58080,
                             weight: 1,
                         },
-                        TargetEndpoint {
+                        BackendTarget {
                             backend: Some("backend-2".to_string()),
                             address: "192.0.2.21".parse().unwrap(),
-                            port: 58081,
                             weight: 2,
                         },
                     ],
-                    ..Service::default()
+                    ..TargetGroup::default()
+                }],
+                listeners: vec![Listener {
+                    name: "multi-backend".to_string(),
+                    port: 48080,
+                    target_port: 58081,
+                    target_group: "targets".to_string(),
+                    protocols: vec![Protocol::Tcp],
+                    mode: LbMode::Default,
+                    ..Listener::default()
                 }],
                 ..FileConfig::default()
             },
@@ -1064,12 +873,6 @@ mod tests {
         let snapshot = from_config_for_backend(&cfg, local_ip("192.0.2.21")).unwrap();
 
         assert_eq!(snapshot.backend_nodes.len(), 2);
-        assert_eq!(snapshot.services.len(), 1);
-        assert_eq!(snapshot.services[0].backend_ip, "192.0.2.21");
-        assert_eq!(snapshot.services[0].backend_port, 58081);
-        assert_eq!(snapshot.services[0].backend_weight, 2);
-        assert_eq!(snapshot.services[0].endpoints.len(), 1);
-        assert_eq!(snapshot.services[0].endpoints[0].address, "192.0.2.21");
         assert_eq!(snapshot.backend_return_ports.len(), 1);
         assert_eq!(snapshot.backend_return_ports[0].address, "192.0.2.21");
         assert_eq!(snapshot.backend_return_ports[0].port, 58081);

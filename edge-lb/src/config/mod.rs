@@ -124,12 +124,62 @@ impl FileConfig {
             .unwrap_or(target.address)
     }
 
+    pub fn listener_backend_return_ports(&self) -> Vec<BackendReturnPort> {
+        let mut ports = Vec::new();
+        for listener in &self.listeners {
+            if !listener.mode.preserves_client_ip() {
+                continue;
+            }
+            let Some(group) = self
+                .target_groups
+                .iter()
+                .find(|group| group.name == listener.target_group)
+            else {
+                continue;
+            };
+            for target in &group.targets {
+                let address = self.resolve_backend_target_address(target);
+                for protocol in listener.protocols.iter().copied() {
+                    ports.push(BackendReturnPort {
+                        backend: target.backend.clone(),
+                        address,
+                        protocol,
+                        port: listener.target_port,
+                        gateway: None,
+                        gateway_underlay_ip: None,
+                        gateway_overlay_ip: None,
+                        backend_overlay_ip: target.backend.as_ref().and_then(|name| {
+                            self.backend_nodes_effective()
+                                .iter()
+                                .find(|backend| &backend.name == name)
+                                .map(|backend| backend.overlay_ip.clone())
+                        }),
+                        dscp: None,
+                        mark: None,
+                        route_table_id: None,
+                    });
+                }
+            }
+        }
+        dedup_backend_return_ports(ports)
+    }
+
     pub fn backend_return_ports(&self) -> Vec<BackendReturnPort> {
         if !self.backend_return_ports.is_empty() {
             return dedup_backend_return_ports(self.backend_return_ports.clone());
         }
 
+        let listener_ports = self.listener_backend_return_ports();
         let local_underlay = self.local_backend().ok().map(|backend| backend.underlay_ip);
+        if !listener_ports.is_empty() {
+            return dedup_backend_return_ports(
+                listener_ports
+                    .into_iter()
+                    .filter(|port| local_underlay.is_none_or(|local| port.address == local))
+                    .collect(),
+            );
+        }
+
         let mut ports = Vec::new();
         for svc in &self.services {
             if !svc.mode.preserves_client_ip() {

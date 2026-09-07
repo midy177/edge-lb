@@ -3,6 +3,8 @@
 
 use anyhow::{Context, Result};
 
+use std::net::IpAddr;
+
 use crate::{cli::VerifyArgs, config::Config, linux::dscp};
 
 pub struct VerifyOutcome {
@@ -33,30 +35,13 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
         }
     }
     if !args.skip_backend {
-        let svc = cfg
-            .services
-            .first()
-            .cloned()
-            .unwrap_or_else(|| crate::config::Service {
-                name: "default".into(),
-                vip_port: 48080,
-                backend_ip: cfg
-                    .backend_nodes_effective()
-                    .first()
-                    .map(|b| b.underlay_ip)
-                    .or(n.backend_ip)
-                    .unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
-                backend_port: 58080,
-                protocol: None,
-                protocols: vec![crate::config::Protocol::Tcp],
-                ..Default::default()
-            });
+        let backend = first_backend_probe_target(cfg);
         let backend_public = cfg
-            .backend_by_underlay(svc.backend_ip)
+            .backend_by_underlay(backend.address)
             .map(|b| b.public_ip)
             .or(n.backend_public_ip)
-            .unwrap_or(svc.backend_ip);
-        let url = format!("http://{}:{}/health", backend_public, svc.backend_port);
+            .unwrap_or(backend.address);
+        let url = format!("http://{}:{}/health", backend_public, backend.port);
         println!("== Backend direct path: {url}");
         match curl(&url, args.timeout) {
             Ok((code, body)) => {
@@ -84,10 +69,7 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
     println!(
         "   tcpdump -ni any -vv 'port {} or port {} or udp port {}'",
         vip_port(cfg),
-        cfg.services
-            .first()
-            .map(|s| s.backend_port)
-            .unwrap_or(58080),
+        first_backend_probe_target(cfg).port,
         n.vxlan_port,
     );
     println!(
@@ -104,7 +86,50 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
 }
 
 fn vip_port(cfg: &Config) -> u16 {
-    cfg.services.first().map(|s| s.vip_port).unwrap_or(48080)
+    cfg.listeners
+        .first()
+        .map(|listener| listener.port)
+        .or_else(|| cfg.services.first().map(|service| service.vip_port))
+        .unwrap_or(48080)
+}
+
+#[derive(Clone, Copy)]
+struct BackendProbeTarget {
+    address: IpAddr,
+    port: u16,
+}
+
+fn first_backend_probe_target(cfg: &Config) -> BackendProbeTarget {
+    for listener in &cfg.listeners {
+        let Some(group) = cfg
+            .target_groups
+            .iter()
+            .find(|group| group.name == listener.target_group)
+        else {
+            continue;
+        };
+        if let Some(target) = group.targets.first() {
+            return BackendProbeTarget {
+                address: cfg.resolve_backend_target_address(target),
+                port: listener.target_port,
+            };
+        }
+    }
+    if let Some(service) = cfg.services.first() {
+        return BackendProbeTarget {
+            address: service.backend_ip,
+            port: service.backend_port,
+        };
+    }
+    BackendProbeTarget {
+        address: cfg
+            .backend_nodes_effective()
+            .first()
+            .map(|b| b.underlay_ip)
+            .or(cfg.network().backend_ip)
+            .unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
+        port: 58080,
+    }
 }
 
 /// curl a URL; returns (status, body snippet).
