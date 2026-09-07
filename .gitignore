@@ -1,0 +1,7 @@
+/target
+/dist
+.zig-cache-global
+ui/node_modules
+ui/dist
+*.prom
+.DS_Store

@@ -1,0 +1,182 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  EBPF_TOOLCHAIN: nightly-2025-12-01
+  BPF_LINKER_VERSION: v0.11.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Build deb packages and container image
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.1.0-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            dpkg-dev \
+            libssl-dev \
+            llvm \
+            pkg-config \
+            protobuf-compiler \
+            upx-ucl \
+            zstd
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust Linux targets
+        run: |
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+
+      - name: Install Rust eBPF toolchain
+        run: |
+          rustup toolchain install "${EBPF_TOOLCHAIN}" --profile minimal --component rust-src
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install cargo tools
+        run: |
+          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+            cargo install cargo-zigbuild --locked
+          fi
+
+      - name: Install bpf-linker
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          tar -xpf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/bpf-linker"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/bpf-linker" --version
+
+      - name: Build UI
+        run: make ui
+
+      - name: Build eBPF object
+        run: make ebpf
+
+      - name: Build and compress Linux binaries
+        run: |
+          cargo zigbuild --release -p edge-lb --target x86_64-unknown-linux-gnu
+          cargo zigbuild --release -p edge-lb --target aarch64-unknown-linux-gnu
+          mkdir -p dist/compressed
+          cp target/x86_64-unknown-linux-gnu/release/edge-lb dist/compressed/edge-lb-${VERSION}-amd64-upx
+          cp target/aarch64-unknown-linux-gnu/release/edge-lb dist/compressed/edge-lb-${VERSION}-arm64-upx
+          upx --best --lzma dist/compressed/edge-lb-${VERSION}-amd64-upx dist/compressed/edge-lb-${VERSION}-arm64-upx
+
+      - name: Build Debian packages
+        run: |
+          bash ./scripts/deb.sh x86_64-unknown-linux-gnu "${VERSION}"
+          bash ./scripts/deb.sh aarch64-unknown-linux-gnu "${VERSION}"
+
+      - name: Stage container binaries
+        run: |
+          install -D -m 0755 dist/compressed/edge-lb-${VERSION}-amd64-upx dist/docker/amd64/edge-lb
+          install -D -m 0755 dist/compressed/edge-lb-${VERSION}-arm64-upx dist/docker/arm64/edge-lb
+
+      - name: Upload Debian packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-lb-deb-${{ steps.version.outputs.version }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: |
+          image="ghcr.io/midy177/edge-lb"
+          echo "name=${image}" >> "${GITHUB_OUTPUT}"
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and publish container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/container.ci.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

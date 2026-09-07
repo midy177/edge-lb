@@ -1,0 +1,11 @@
+[package]
+name = "edge-lb-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya-ebpf.workspace = true
+aya-ebpf-cty.workspace = true
+edge-lb-common.workspace = true
+network-types.workspace = true

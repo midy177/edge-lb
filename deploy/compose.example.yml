@@ -1,0 +1,57 @@
+# Docker Compose deployment template for edge-lb.
+#
+# Prepare one role-specific config before starting:
+#   sudo install -d -m 0755 /etc/edge-lb /var/lib/edge-lb /var/log/edge-lb
+#   sudo install -m 0644 deploy/config.gateway.example.toml /etc/edge-lb/config.toml
+#   sudo install -m 0644 deploy/config.backend.example.toml /etc/edge-lb/config.toml
+#
+# Start exactly one role on a host:
+#   EDGE_LB_IMAGE=ghcr.io/midy177/edge-lb:0.1.6 docker compose -f deploy/compose.example.yml --profile gateway up -d
+#   EDGE_LB_IMAGE=ghcr.io/midy177/edge-lb:0.1.6 docker compose -f deploy/compose.example.yml --profile backend up -d
+#
+# The container runs with host networking because edge-lb owns Linux TC/eBPF,
+# nftables, VXLAN devices, policy routes and VIP addresses on the host.
+# Gateway hosts must enable IPv4 forwarding on the host, for example:
+#   sudo sysctl -w net.ipv4.ip_forward=1
+
+x-edge-lb-common: &edge-lb-common
+  image: ${EDGE_LB_IMAGE:-ghcr.io/midy177/edge-lb:0.1.6}
+  restart: unless-stopped
+  network_mode: host
+  pid: host
+  privileged: true
+  environment:
+    RUST_LOG: ${RUST_LOG:-info}
+    EDGE_LB_PUBLIC_IP: ${EDGE_LB_PUBLIC_IP:-}
+    EDGE_LB_UNDERLAY_IP: ${EDGE_LB_UNDERLAY_IP:-}
+    EDGE_LB_UNDERLAY_DEV: ${EDGE_LB_UNDERLAY_DEV:-}
+  volumes:
+    - /etc/edge-lb:/etc/edge-lb:ro
+    - /var/lib/edge-lb:/var/lib/edge-lb
+    - /var/log/edge-lb:/var/log/edge-lb
+    - /sys/fs/bpf:/sys/fs/bpf
+    - /lib/modules:/lib/modules:ro
+    - /dev/log:/dev/log
+  command: ["--config", "/etc/edge-lb/config.toml"]
+  healthcheck:
+    test: ["CMD", "edge-lb", "--config", "/etc/edge-lb/config.toml", "config", "validate"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+
+services:
+  gateway:
+    <<: *edge-lb-common
+    container_name: edge-lb-gateway
+    profiles: ["gateway"]
+
+  backend:
+    <<: *edge-lb-common
+    container_name: edge-lb-backend
+    profiles: ["backend"]

@@ -1,0 +1,8 @@
+[build]
+target-dir = "target"
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+
+[target.bpfeb-unknown-none]
+linker = "bpf-linker"

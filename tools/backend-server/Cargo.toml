@@ -1,0 +1,13 @@
+[package]
+name = "backend-server"
+version = "0.1.6"
+edition = "2024"
+rust-version = "1.85"
+description = "TCP/UDP backend identity server for edge-lb load-balancing tests"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+libc = "0.2"
+stunclient = { version = "0.4.2", default-features = false }
+ureq = "2"

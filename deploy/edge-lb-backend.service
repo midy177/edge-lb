@@ -1,0 +1,17 @@
+[Unit]
+Description=Edge LB agent (backend node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=MALLOC_ARENA_MAX=2
+OOMScoreAdjust=-900
+ExecStart=/usr/local/bin/edge-lb --config /etc/edge-lb/config.toml
+Restart=always
+RestartSec=3
+
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,123 @@
+//! End-to-end verification: VIP path, backend direct path, eBPF counters,
+//! plus recommended capture commands for deeper debugging.
+
+use anyhow::{Context, Result};
+
+use crate::{cli::VerifyArgs, config::Config, linux::dscp};
+
+pub struct VerifyOutcome {
+    pub vip_ok: bool,
+    pub backend_ok: bool,
+    pub detail: String,
+}
+
+pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
+    let n = cfg.network();
+    let mut detail = String::new();
+    let mut vip_ok = false;
+    let mut backend_ok = false;
+
+    if !args.skip_vip {
+        let url = format!("http://{}:{}/health", n.gateway_public_ip, vip_port(cfg));
+        println!("== VIP path: {url}");
+        match curl(&url, args.timeout) {
+            Ok((code, body)) => {
+                vip_ok = code == 200;
+                detail.push_str(&format!("VIP {url} -> {code} {body}\n"));
+                println!("   HTTP {code} {body}");
+            }
+            Err(e) => {
+                detail.push_str(&format!("VIP {url} -> ERROR {e}\n"));
+                println!("   ERROR: {e}");
+            }
+        }
+    }
+    if !args.skip_backend {
+        let svc = cfg
+            .services
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::config::Service {
+                name: "default".into(),
+                vip_port: 48080,
+                backend_ip: cfg
+                    .backend_nodes_effective()
+                    .first()
+                    .map(|b| b.underlay_ip)
+                    .or(n.backend_ip)
+                    .unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
+                backend_port: 58080,
+                protocol: None,
+                protocols: vec![crate::config::Protocol::Tcp],
+                ..Default::default()
+            });
+        let backend_public = cfg
+            .backend_by_underlay(svc.backend_ip)
+            .map(|b| b.public_ip)
+            .or(n.backend_public_ip)
+            .unwrap_or(svc.backend_ip);
+        let url = format!("http://{}:{}/health", backend_public, svc.backend_port);
+        println!("== Backend direct path: {url}");
+        match curl(&url, args.timeout) {
+            Ok((code, body)) => {
+                backend_ok = code == 200;
+                detail.push_str(&format!("backend {url} -> {code} {body}\n"));
+                println!("   HTTP {code} {body}");
+            }
+            Err(e) => {
+                detail.push_str(&format!("backend {url} -> ERROR {e}\n"));
+                println!("   ERROR: {e}");
+            }
+        }
+    }
+    if let Ok(stats) = dscp::stats(cfg) {
+        println!(
+            "== DSCP marker: matched={} changed={}",
+            stats.matched, stats.changed
+        );
+        detail.push_str(format!("dscp stats: {stats:?}\n").as_str());
+        if stats.matched == 0 {
+            println!("   NOTE: no packets matched yet; generate VIP traffic first");
+        }
+    }
+    println!("\n== Suggested capture");
+    println!(
+        "   tcpdump -ni any -vv 'port {} or port {} or udp port {}'",
+        vip_port(cfg),
+        cfg.services
+            .first()
+            .map(|s| s.backend_port)
+            .unwrap_or(58080),
+        n.vxlan_port,
+    );
+    println!(
+        "   expect: forward tos 0x{:02x} (plus ECN bits); replies via {} outer udp {}",
+        n.dscp << 2,
+        n.vxlan_dev,
+        n.vxlan_port
+    );
+    Ok(VerifyOutcome {
+        vip_ok,
+        backend_ok,
+        detail,
+    })
+}
+
+fn vip_port(cfg: &Config) -> u16 {
+    cfg.services.first().map(|s| s.vip_port).unwrap_or(48080)
+}
+
+/// curl a URL; returns (status, body snippet).
+fn curl(url: &str, timeout: u64) -> Result<(u32, String)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .build()
+        .context("building verification HTTP client")?;
+    let response = client
+        .get(url)
+        .send()
+        .context("sending verification request")?;
+    let code = response.status().as_u16() as u32;
+    let body = response.text().unwrap_or_else(|_| "(no body)".to_string());
+    Ok((code, body))
+}

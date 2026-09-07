@@ -1,0 +1,311 @@
+//! 共享数据状态(模块级单例)与加载逻辑:status/nodes/listeners 等
+//! 所有页面组件直接 import;不渲染 UI。`run` 是操作包装(busy + 刷新)。
+
+import { computed, ref, watch } from 'vue'
+import { AuthError, api, clearToken, getToken, setToken } from '@/api'
+import type {
+  BackendNode,
+  BackendSubscription,
+  AutomationTemplate,
+  GatewayHaConfig,
+  GatewayHaStatus,
+  GatewayNode,
+  ListenerConfig,
+  NotificationChannelSummary,
+  NotificationList,
+  Status,
+  TargetGroup,
+} from '@/api/types'
+import { t } from '@/lib/i18n'
+
+export type Tab =
+  | 'overview'
+  | 'nodes'
+  | 'target-groups'
+  | 'listeners'
+  | 'automations'
+  | 'ha'
+  | 'notifications'
+
+const TABS: Tab[] = [
+  'overview',
+  'nodes',
+  'target-groups',
+  'listeners',
+  'automations',
+  'ha',
+  'notifications',
+]
+
+export const tab = ref<Tab>('overview')
+
+// ---- hash 路由(tab ↔ location.hash 双向同步)----
+// 平级 tab 的嵌入式面板不需要 vue-router:hash 片段不经过服务端,刷新/
+// 分享/浏览器后退都能恢复到对应页面。手写同步保持零依赖。
+function tabFromHash(): Tab | null {
+  const value = window.location.hash.replace(/^#\/?/, '').split(/[/?#]/)[0] as Tab
+  return TABS.includes(value) ? value : null
+}
+
+// 登录 gate 阶段模块加载即执行:先恢复 hash 中的 tab,再监听双向变化。
+const initialTab = tabFromHash()
+if (initialTab) {
+  tab.value = initialTab
+} else if (window.location.hash) {
+  // 非法 hash 清理,避免 URL 与实际页面不一致。
+  window.history.replaceState(null, '', window.location.pathname + window.location.search)
+}
+
+window.addEventListener('hashchange', () => {
+  const next = tabFromHash()
+  if (next && next !== tab.value) {
+    tab.value = next
+  }
+})
+
+watch(tab, (next) => {
+  const target = `#/${next}`
+  if (window.location.hash !== target) {
+    window.location.hash = target
+  }
+})
+
+export const failoverTarget = ref('')
+
+export const status = ref<Status | null>(null)
+export const targetGroups = ref<TargetGroup[]>([])
+export const listeners = ref<ListenerConfig[]>([])
+export const gatewayNodes = ref<GatewayNode[]>([])
+export const backendNodes = ref<BackendNode[]>([])
+export const backendSubscriptions = ref<Record<string, BackendSubscription>>({})
+export const haConfig = ref<GatewayHaConfig | null>(null)
+export const haStatus = ref<GatewayHaStatus | null>(null)
+export const automationTemplates = ref<AutomationTemplate[]>([])
+export const notifications = ref<NotificationChannelSummary[]>([])
+export const notificationEvents = ref<string[]>([])
+export const automationsError = ref('')
+export const notificationsError = ref('')
+export const haStatusError = ref('')
+export const backendSubscriptionsError = ref('')
+export const error = ref('')
+export const authRequired = ref(false)
+export const authenticated = ref(false)
+export const busy = ref('')
+export const token = ref(getToken())
+
+export const isGateway = computed(() => status.value?.node_role === 'gateway')
+
+export const localNode = computed(() => {
+  const current = status.value
+  if (!current) return null
+  return {
+    name: current.node_name,
+    public_ip: current.public_ip,
+    underlay_ip: current.underlay_ip,
+    overlay_ip: current.overlay_ip,
+  }
+})
+
+export const activeGatewayNode = computed(() => {
+  const current = status.value
+  if (!current?.active_gateway) return null
+  return gatewayNodes.value.find((node) => node.name === current.active_gateway) ?? null
+})
+
+export const backendRegistrations = computed(() =>
+  Object.entries(backendSubscriptions.value).sort(([a], [b]) => a.localeCompare(b)),
+)
+
+export async function refreshTabData(currentTab: Tab) {
+  if (!status.value) return
+  switch (currentTab) {
+    case 'overview':
+      await refreshOverviewData()
+      break
+    case 'nodes':
+      await refreshNodeData()
+      break
+    case 'target-groups':
+      await refreshTargetGroupData()
+      break
+    case 'listeners':
+      await refreshListenerData()
+      break
+    case 'automations':
+      await refreshAutomationData()
+      break
+    case 'ha':
+      await refreshHaData()
+      break
+    case 'notifications':
+      await refreshNotificationData()
+      break
+  }
+}
+
+export async function refreshOverviewData() {
+  if (!isGateway.value) return
+  await Promise.all([refreshGatewayNodes(), refreshSubscriptions()])
+}
+
+export async function refreshNodeData() {
+  await refreshBackendNodes()
+}
+
+export async function refreshTargetGroupData() {
+  await Promise.all([refreshBackendNodes(), refreshTargetGroups()])
+}
+
+export async function refreshListenerData() {
+  await Promise.all([refreshBackendNodes(), refreshTargetGroups(), refreshListeners()])
+}
+
+export async function refreshGatewayNodes() {
+  gatewayNodes.value = await api.gatewayNodes()
+}
+
+export async function refreshBackendNodes() {
+  backendNodes.value = await api.backendNodes()
+}
+
+export async function refreshTargetGroups() {
+  targetGroups.value = await api.targetGroups()
+}
+
+export async function refreshListeners() {
+  listeners.value = await api.listenerConfigs()
+}
+
+export async function refreshSubscriptions() {
+  backendSubscriptionsError.value = ''
+  try {
+    backendSubscriptions.value = await api.backendSubscriptions()
+  } catch (e) {
+    backendSubscriptionsError.value = e instanceof Error ? e.message : String(e)
+    backendSubscriptions.value = {}
+  }
+}
+
+export async function refreshHaData() {
+  haStatusError.value = ''
+  if (!isGateway.value) {
+    haConfig.value = null
+    haStatus.value = null
+    return
+  }
+  try {
+    const [config, currentStatus, gateways] = await Promise.all([
+      api.haConfig(),
+      api.haStatus(),
+      api.gatewayNodes(),
+    ])
+    haConfig.value = config
+    haStatus.value = currentStatus
+    gatewayNodes.value = gateways
+  } catch (e) {
+    haStatusError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+export async function refreshNotificationData() {
+  notificationsError.value = ''
+  if (!isGateway.value) {
+    notifications.value = []
+    notificationEvents.value = []
+    return
+  }
+  try {
+    const result: NotificationList = await api.notifications()
+    notifications.value = result.channels
+    notificationEvents.value = result.events
+  } catch (e) {
+    notificationsError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+export async function refreshAutomationData() {
+  automationsError.value = ''
+  if (!isGateway.value) {
+    automationTemplates.value = []
+    return
+  }
+  try {
+    const [result] = await Promise.all([api.automationTemplates(), refreshBackendNodes()])
+    automationTemplates.value = result.templates
+  } catch (e) {
+    automationsError.value = e instanceof Error ? e.message : String(e)
+    automationTemplates.value = []
+  }
+}
+
+export async function run(label: string, fn: () => Promise<unknown>) {
+  busy.value = label
+  error.value = ''
+  try {
+    await fn()
+    await refreshAll(tab.value)
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    busy.value = ''
+  }
+}
+
+export async function login() {
+  setToken(token.value)
+  await refreshAll(tab.value)
+  if (!authenticated.value) {
+    throw new Error(t('tokenInvalid'))
+  }
+}
+
+export function logout() {
+  clearToken()
+  token.value = ''
+  authenticated.value = false
+  authRequired.value = true
+  status.value = null
+}
+
+//! 切 tab 时只刷新当前页需要的数据;status 已加载则复用,不重复拉取。
+//! 首次加载(status 为空)或认证失效时退回完整 refreshAll。
+export async function refreshForTab(currentTab: Tab) {
+  if (!status.value) {
+    await refreshAll(currentTab)
+    return
+  }
+  try {
+    await refreshTabData(currentTab)
+    error.value = ''
+  } catch (e) {
+    if (e instanceof AuthError) {
+      authRequired.value = true
+      authenticated.value = false
+      status.value = null
+      error.value = ''
+    } else {
+      error.value = e instanceof Error ? e.message : String(e)
+    }
+  }
+}
+
+//! 拉取 status 并按当前 tab 刷新;认证/错误状态在此收敛。
+//! 页面局部副作用(表单默认值回填等)由调用方的包装 refresh 处理。
+export async function refreshAll(currentTab: Tab) {
+  try {
+    status.value = await api.status()
+    await refreshTabData(currentTab)
+    error.value = ''
+    authRequired.value = false
+    authenticated.value = true
+  } catch (e) {
+    if (e instanceof AuthError) {
+      authRequired.value = true
+      authenticated.value = false
+      status.value = null
+      error.value = ''
+    } else {
+      error.value = e instanceof Error ? e.message : String(e)
+    }
+  }
+}

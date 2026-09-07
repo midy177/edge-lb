@@ -1,0 +1,43 @@
+# edge-lb gateway 配置模板
+#
+# 顶层只放本机身份和自动发现。监听配置、目标组、HA peer、VIP 管理和通知
+# 都通过 gateway UI/API 管理，并持久化到 state_dir 下的 SQLite。
+
+node_role = "gateway"
+# node_name = "gateway-a"      # 可选；省略时默认取系统主机名
+public_ip = "auto"
+underlay_ip = "auto"
+log_level = "info"
+state_dir = "/var/lib/edge-lb"
+
+[discovery]
+public_ip_env = "EDGE_LB_PUBLIC_IP"
+underlay_ip_env = "EDGE_LB_UNDERLAY_IP"
+underlay_dev_env = "EDGE_LB_UNDERLAY_DEV"
+stun_servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
+udp_probe_addr = "8.8.8.8:53"
+
+[gateway.reconcile]
+interval_secs = 3
+
+[gateway.xds]
+listen = "0.0.0.0:22222"
+token = "change-me-token-123456"
+trusted_source_cidrs = []      # 空数组表示自动信任本机 underlay_ip 所在网段
+
+[gateway.network]
+overlay_cidr = "10.255.255.0/24"
+underlay_dev = "auto"
+vxlan_dev = "edge-hub"
+vni = 100
+vxlan_port = 4789
+vxlan_mtu = "auto"             # auto = underlay PMTU 实测后减去 VXLAN 开销；可固定为 1450
+dscp = 46
+
+[gateway.api]
+listen = "0.0.0.0:18080"
+auth_token = "change-me-token-123456"
+trusted_source_cidrs = []      # 空数组表示自动信任本机 underlay_ip 所在网段
+
+# HA 配置通过 UI/API 保存到 SQLite。二层 VIP 默认绑定 lo；如 L2/云网络
+# 要求 VIP 出现在物理接口，可在 UI 高级配置中选择 underlay。

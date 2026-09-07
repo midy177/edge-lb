@@ -1,0 +1,148 @@
+# edge-lb backend agent — Kubernetes 部署清单
+#
+# 仅部署 backend 角色（VXLAN 回程 + nft 策略路由）。gateway 仍部署在
+# 独立虚拟机上，通过 [backend.xds] 指向其控制面地址。
+#
+# 镜像：ghcr.io/midy177/edge-lb:0.1.6
+#
+# 部署步骤：
+#   1. 私有仓库需要 imagePullSecrets：按下方注释模板创建 Secret，
+#      并取消 DaemonSet 中 imagePullSecrets 的注释。
+#   2. 修改 ConfigMap 中的 gateway xDS 地址与 token（搜索 change-me）。
+#   3. kubectl apply -f deploy/k8s.yaml
+#
+# 说明：
+# - DaemonSet 不设 nodeSelector，默认在**所有节点**安装；通过容忍所有
+#   污点（tolerations: operator=Exists）确保控制面等带污点节点也能调度。
+#   如需排除个别节点，给该节点加自定义污点并在下方 tolerations 中
+#   显式不匹配，或改用 nodeName/label 方式。
+# - backend agent 需要 hostNetwork + hostPID + privileged：它在本机
+#   配置 VXLAN 设备、nftables（内置 netlink，不依赖宿主 nft 命令）与
+#   策略路由；业务端口由 Pod 自行监听在主机网络。
+# - 业务监听不写 backend 配置文件：在 gateway 管理 UI/API 上创建监听
+#   配置和目标组，目标组成员引用本节点的 node_name（未配置则默认主机名）。
+# - token 走 ConfigMap 属明文（K8s 常规形态）；如需收严，可改为 Secret
+#   挂载单独的 token 文件。
+#
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: edge-lb-registry
+#   namespace: edge-lb
+# type: kubernetes.io/dockerconfigjson
+# data:
+#   # echo -n '{"auths":{"ghcr.io":{"username":"...","password":"...","auth":"base64(user:token)"}}}' | base64
+#   .dockerconfigjson: <base64>
+# ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge-lb
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-lb-backend-config
+  namespace: edge-lb
+data:
+  config.toml: |
+    # edge-lb backend 配置模板
+    #
+    # backend 只连接 gateway xDS-like 控制面，接收 VXLAN、DSCP、回程端口和策略
+    # 路由配置；本机 public_ip、underlay_ip 和 underlay_dev 默认自动发现。
+
+    node_role = "backend"
+    # node_name = "backend-1"      # 可选；省略时默认取系统主机名
+    public_ip = "auto"
+    underlay_ip = "auto"
+    log_level = "info"
+    state_dir = "/var/lib/edge-lb"
+
+    [discovery]
+    public_ip_env = "EDGE_LB_PUBLIC_IP"
+    underlay_ip_env = "EDGE_LB_UNDERLAY_IP"
+    underlay_dev_env = "EDGE_LB_UNDERLAY_DEV"
+    stun_servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
+    udp_probe_addr = "8.8.8.8:53"
+
+    [backend.xds]
+    # 单 gateway 写 gateway；HA active-backup 最多写两个 gateway。
+    gateway = "gateway-underlay-ip:22222"
+    # gateways = ["gateway-a-underlay-ip:22222", "gateway-b-underlay-ip:22222"]
+    token = "change-me-token-123456"
+    reconnect_interval_secs = 3
+
+    [backend.return_path]
+    # 本节可以整体省略；下面是可调的本机行为参数。
+    # DSCP、ct mark、fwmark、route table ID 由 gateway xDS 按监听和 HA gateway 自动下发。
+    vxlan_dev = "edge-return"
+    nft_table = "edge_lb_return"
+    mss = 1410
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: edge-lb-backend
+  namespace: edge-lb
+  labels:
+    app.kubernetes.io/name: edge-lb
+    app.kubernetes.io/component: backend
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: edge-lb
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: edge-lb
+        app.kubernetes.io/component: backend
+    spec:
+      # imagePullSecrets:
+      #   - name: edge-lb-registry
+      # 无 nodeSelector：在所有节点安装；容忍所有污点（含控制面 NoSchedule 等）
+      tolerations:
+        - operator: Exists
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: edge-lb
+          image: ghcr.io/midy177/edge-lb:0.1.6
+          imagePullPolicy: IfNotPresent
+          args:
+            - '--config'
+            - /etc/edge-lb/config.toml
+          command:
+            - edge-lb
+          securityContext:
+            privileged: true          # VXLAN/nft netlink/策略路由
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-x", "edge-lb"]
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/edge-lb/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/edge-lb
+      volumes:
+        - name: config
+          configMap:
+            name: edge-lb-backend-config
+        - name: state
+          hostPath:
+            path: /var/lib/edge-lb
+            type: DirectoryOrCreate

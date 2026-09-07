@@ -1,0 +1,32 @@
+# edge-lb backend 配置模板
+#
+# backend 只连接 gateway xDS-like 控制面，接收 VXLAN、DSCP、回程端口和策略
+# 路由配置；本机 public_ip、underlay_ip 和 underlay_dev 默认自动发现。
+
+node_role = "backend"
+# node_name = "backend-1"      # 可选；省略时默认取系统主机名
+public_ip = "auto"
+underlay_ip = "auto"
+log_level = "info"
+state_dir = "/var/lib/edge-lb"
+
+[discovery]
+public_ip_env = "EDGE_LB_PUBLIC_IP"
+underlay_ip_env = "EDGE_LB_UNDERLAY_IP"
+underlay_dev_env = "EDGE_LB_UNDERLAY_DEV"
+stun_servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
+udp_probe_addr = "8.8.8.8:53"
+
+[backend.xds]
+# 单 gateway 写 gateway；HA active-backup 最多写两个 gateway。
+gateway = "gateway-underlay-ip:22222"
+# gateways = ["gateway-a-underlay-ip:22222", "gateway-b-underlay-ip:22222"]
+token = "change-me-token-123456"
+reconnect_interval_secs = 3
+
+[backend.return_path]
+# 本节可以整体省略；下面是可调的本机行为参数。
+# DSCP、ct mark、fwmark、route table ID 由 gateway xDS 按监听和 HA gateway 自动下发。
+vxlan_dev = "edge-return"
+nft_table = "edge_lb_return"
+mss = 1410

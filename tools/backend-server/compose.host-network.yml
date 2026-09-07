@@ -1,0 +1,6 @@
+services:
+  backend-server:
+    image: backend-server:latest
+    network_mode: host
+    restart: unless-stopped
+    command: ["-serve", "-listen", "0.0.0.0:8080"]

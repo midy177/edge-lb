@@ -1,0 +1,12 @@
+[package]
+name = "edge-lb-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+user = ["aya", "serde"]
+
+[dependencies]
+aya = { workspace = true, optional = true }
+serde = { version = "1", default-features = false, optional = true }

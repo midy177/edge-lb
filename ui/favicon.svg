@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- 渐变背景 -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <!-- 网关主体渐变 -->
+    <linearGradient id="gateGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <!-- 箭头渐变 -->
+    <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景圆角矩形 -->
+  <rect width="256" height="256" fill="url(#bgGrad)" rx="48" ry="48"/>
+
+  <!-- 网关 / 盾牌轮廓 -->
+  <path d="M68 90 L128 60 L188 90 L188 130 C188 160 160 186 128 200 C96 186 68 160 68 130 Z"
+        fill="none" stroke="url(#gateGrad)" stroke-width="6" stroke-linejoin="round"/>
+
+  <!-- 中心负载均衡器（发光圆环） -->
+  <circle cx="128" cy="128" r="22" fill="none" stroke="#e2e8f0" stroke-width="4"/>
+  <circle cx="128" cy="128" r="12" fill="#0ea5e9" opacity="0.9"/>
+
+  <!-- 均衡符号（三条弧线或短横） -->
+  <line x1="118" y1="128" x2="124" y2="128" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+  <line x1="128" y1="128" x2="134" y2="128" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+  <line x1="140" y1="128" x2="146" y2="128" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- 入口流量箭头（左侧进入） -->
+  <path d="M40 110 L68 110 L68 118 L78 108 L68 98 L68 106 L40 106 Z"
+        fill="url(#arrowGrad)"/>
+
+  <!-- 出口流量箭头（右侧分发） -->
+  <!-- 上箭头 -->
+  <path d="M178 90 L190 78 L190 84 L216 84 L216 76 L228 88 L216 100 L216 92 L190 92 Z"
+        fill="url(#arrowGrad)"/>
+  <!-- 中箭头 -->
+  <path d="M178 122 L190 110 L190 116 L216 116 L216 108 L228 120 L216 132 L216 124 L190 124 Z"
+        fill="url(#arrowGrad)"/>
+  <!-- 下箭头 -->
+  <path d="M178 154 L190 142 L190 148 L216 148 L216 140 L228 152 L216 164 L216 156 L190 156 Z"
+        fill="url(#arrowGrad)"/>
+
+  <!-- 底部文字 -->
+  <text x="128" y="225" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" fill="#e2e8f0" text-anchor="middle" letter-spacing="3">EDGE-LB</text>
+</svg>

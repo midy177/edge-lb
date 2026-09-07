@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package edgelb.control.v1;
+
+service ConfigDiscovery {
+  rpc Watch(stream DiscoveryRequest) returns (stream DiscoveryResponse);
+  rpc PairGateway(PairGatewayRequest) returns (PairGatewayResponse);
+}
+
+service FlowSync {
+  rpc Replicate(stream FlowSyncRequest) returns (stream FlowSyncResponse);
+}
+
+message DiscoveryRequest {
+  string node_name = 1;
+  string node_role = 2;
+  string underlay_ip = 3;
+  string version = 4;
+  string response_nonce = 5;
+  bool ack = 6;
+  string error_detail = 7;
+  string public_ip = 8;
+  string public_ip_mode = 9;
+  string public_ip_source = 10;
+  string underlay_ip_mode = 11;
+  string underlay_ip_source = 12;
+  repeated NodeConflict conflicts = 13;
+}
+
+message NodeConflict {
+  string severity = 1;
+  string kind = 2;
+  string subject = 3;
+  string detail = 4;
+}
+
+message DiscoveryResponse {
+  string version = 1;
+  string nonce = 2;
+  ConfigSnapshot snapshot = 3;
+}
+
+message ConfigSnapshot {
+  string active_gateway = 1;
+  Network network = 2;
+  repeated GatewayNode gateway_nodes = 3;
+  repeated BackendNode backend_nodes = 4;
+  repeated Service services = 5;
+  repeated BackendReturnPort backend_return_ports = 6;
+}
+
+message Network {
+  reserved 3;
+  reserved "underlay_dev";
+
+  string gateway_public_ip = 1;
+  string gateway_ip = 2;
+  string gateway_vxlan_dev = 4;
+  uint32 vni = 5;
+  uint32 vxlan_port = 6;
+  uint32 vxlan_mtu = 7;
+  uint32 dscp = 8;
+  string overlay_cidr = 9;
+}
+
+message GatewayNode {
+  string name = 1;
+  string public_ip = 2;
+  string underlay_ip = 3;
+  string overlay_ip = 4;
+}
+
+message BackendNode {
+  string name = 1;
+  string public_ip = 2;
+  string underlay_ip = 3;
+  string overlay_ip = 4;
+}
+
+message Service {
+  string name = 1;
+  uint32 vip_port = 2;
+  string backend_ip = 3;
+  uint32 backend_port = 4;
+  uint32 backend_weight = 5;
+  repeated string protocols = 6;
+  repeated Endpoint endpoints = 7;
+  string target_group = 8;
+}
+
+message Endpoint {
+  string backend = 1;
+  string address = 2;
+  uint32 port = 3;
+  uint32 weight = 4;
+}
+
+message BackendReturnPort {
+  string backend = 1;
+  string address = 2;
+  string protocol = 3;
+  uint32 port = 4;
+  string gateway = 5;
+  string gateway_underlay_ip = 6;
+  string gateway_overlay_ip = 7;
+  uint32 dscp = 8;
+  uint32 mark = 9;
+  uint32 route_table_id = 10;
+  string backend_overlay_ip = 11;
+}
+
+message GatewayPeerInfo {
+  string node_name = 1;
+  string underlay_ip = 2;
+  string public_ip = 3;
+  string api_addr = 4;
+  string xds_addr = 5;
+  string overlay_cidr = 6;
+  string gateway_overlay_ip = 7;
+  uint32 dscp = 8;
+  uint32 vni = 9;
+  uint32 vxlan_port = 10;
+  uint32 mtu = 11;
+  string version = 12;
+  repeated string capabilities = 13;
+}
+
+message PairGatewayRequest {
+  GatewayPeerInfo caller = 1;
+  string ha_config_json = 2;
+  string session_token = 3;
+}
+
+message PairGatewayResponse {
+  GatewayPeerInfo responder = 1;
+  repeated string warnings = 3;
+}
+
+message FlowSyncRequest {
+  string source = 1;
+  string token = 2;
+  repeated FlowEntry entries = 3;
+  repeated FlowKey deletes = 4;
+}
+
+message FlowSyncResponse {
+  uint64 applied = 1;
+}
+
+message FlowKey {
+  uint32 src = 1;
+  uint32 dst = 2;
+  uint32 sport = 3;
+  uint32 dport = 4;
+  uint32 proto = 5;
+}
+
+message FlowEntry {
+  FlowKey key = 1;
+  FlowValue value = 2;
+}
+
+message FlowValue {
+  uint32 service_id = 1;
+  uint32 endpoint_id = 2;
+  uint32 vip = 3;
+  uint32 endpoint = 4;
+  uint32 vip_port = 5;
+  uint32 endpoint_port = 6;
+  uint32 timeout_secs = 7;
+  uint64 last_seen_ns = 8;
+}

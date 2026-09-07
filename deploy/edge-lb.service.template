@@ -1,0 +1,15 @@
+[Unit]
+Description=Edge LB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=MALLOC_ARENA_MAX=2
+OOMScoreAdjust=-900
+ExecStart=/usr/local/bin/edge-lb --config /etc/edge-lb/config.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

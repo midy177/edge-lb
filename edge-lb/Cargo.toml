@@ -1,0 +1,42 @@
+[package]
+name = "edge-lb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+aya.workspace = true
+base64.workspace = true
+clap.workspace = true
+edge-lb-common = { workspace = true, features = ["user"] }
+futures-util.workspace = true
+hmac.workspace = true
+hex.workspace = true
+libc.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+reqwest.workspace = true
+rtnetlink.workspace = true
+sea-orm.workspace = true
+zbus.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+stunclient.workspace = true
+wren-bfd.workspace = true
+tiny_http = "0.12"
+toml.workspace = true
+tokio-stream.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+urlencoding.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
