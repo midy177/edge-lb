@@ -1,12 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::{
     ActiveSource, BackendNode, ControlPlaneMode, DEFAULT_BACKEND_VXLAN_DEV,
-    DEFAULT_GATEWAY_VXLAN_DEV, FileConfig, GatewayNode, NodeRole, Protocol, Service,
-    TargetEndpoint,
+    DEFAULT_GATEWAY_VXLAN_DEV, FileConfig, GatewayNode, NodeRole,
     defaults::{
         default_auto_ip, default_backend_overlay, default_gateway_ip, default_gateway_overlay,
-        default_gateway_public_ip, is_auto_ip,
+        default_gateway_public_ip,
     },
     overlay::{overlay_host, overlay_needs_assignment, underlay_dev_is_auto},
 };
@@ -37,7 +36,6 @@ pub(super) fn normalize_config(file: &mut FileConfig) {
         });
     }
     assign_overlay_ips(file);
-    synthesize_services_from_listeners(file);
     if let Some(gw) = file
         .gateway_nodes
         .iter()
@@ -55,21 +53,6 @@ pub(super) fn normalize_config(file: &mut FileConfig) {
         {
             file.gateway.overlay_ip = gw.overlay_ip.clone();
         }
-    }
-    let backends = file.backend_nodes_effective();
-    for svc in &mut file.services {
-        if let Some(name) = &svc.backend {
-            if let Some(backend) = backends.iter().find(|b| &b.name == name) {
-                svc.backend_ip = backend.underlay_ip;
-            }
-        } else if is_auto_ip(svc.backend_ip) && backends.len() == 1 {
-            svc.backend = Some(backends[0].name.clone());
-            svc.backend_ip = backends[0].underlay_ip;
-        }
-        if svc.protocols.is_empty() {
-            svc.protocols.push(svc.protocol.unwrap_or(Protocol::Tcp));
-        }
-        svc.protocol = None;
     }
 }
 
@@ -275,94 +258,6 @@ fn apply_top_level_local_ips(file: &mut FileConfig) {
             }
         }
     }
-}
-
-fn synthesize_services_from_listeners(file: &mut FileConfig) {
-    if !matches!(file.node_role, NodeRole::Gateway) {
-        return;
-    }
-    let listener_names = file
-        .listeners
-        .iter()
-        .map(|listener| listener.name.as_str())
-        .collect::<HashSet<_>>();
-    let mut services = file
-        .services
-        .iter()
-        .filter(|svc| svc.target_group.is_none() && !listener_names.contains(svc.name.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if file.listeners.is_empty() {
-        file.services = services;
-        return;
-    }
-    let backends = file.backend_nodes_effective();
-    let groups = file
-        .target_groups
-        .iter()
-        .map(|group| (group.name.as_str(), group))
-        .collect::<HashMap<_, _>>();
-    for listener in &file.listeners {
-        let Some(group) = groups.get(listener.target_group.as_str()) else {
-            continue;
-        };
-        if group.targets.is_empty() {
-            continue;
-        }
-        let first = &group.targets[0];
-        let first_address = file.resolve_backend_target_address(first);
-        let backend = first.backend.clone().or_else(|| {
-            backends
-                .iter()
-                .find(|b| b.underlay_ip == first_address)
-                .map(|b| b.name.clone())
-        });
-        let backend_ip = backend
-            .as_ref()
-            .and_then(|name| backends.iter().find(|b| &b.name == name))
-            .map(|b| b.underlay_ip)
-            .unwrap_or(first_address);
-        services.push(Service {
-            name: listener.name.clone(),
-            vip_port: listener.port,
-            target_group: Some(group.name.clone()),
-            backend,
-            backend_ip,
-            backend_port: listener.target_port,
-            backend_weight: first.weight,
-            select: listener.select,
-            mode: listener.mode,
-            bgp: listener.bgp,
-            monitor: group.monitor,
-            probe_type: group.probe_type.clone(),
-            probe_port: group.probe_port,
-            probe_req: group.probe_req.clone(),
-            probe_resp: group.probe_resp.clone(),
-            probe_status: group.probe_status,
-            probe_skip_tls_verify: group.probe_skip_tls_verify,
-            period_secs: group.period_secs,
-            retries: group.retries,
-            inactive_timeout: listener.inactive_timeout,
-            mark: listener.mark,
-            security: listener.security,
-            host: listener.host.clone(),
-            proxy_protocol_v2: listener.proxy_protocol_v2,
-            egress: listener.egress,
-            protocol: None,
-            protocols: listener.protocols.clone(),
-            endpoints: group
-                .targets
-                .iter()
-                .map(|target| TargetEndpoint {
-                    backend: target.backend.clone(),
-                    address: file.resolve_backend_target_address(target),
-                    port: listener.target_port,
-                    weight: target.weight,
-                })
-                .collect(),
-        });
-    }
-    file.services = services;
 }
 
 fn assign_overlay_ips(file: &mut FileConfig) {

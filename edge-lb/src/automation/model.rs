@@ -182,7 +182,7 @@ pub struct PlannedTargetGroup {
     pub name: String,
     pub monitor: bool,
     pub probe_type: String,
-    pub endpoints: Vec<MatchedNode>,
+    pub targets: Vec<MatchedNode>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2,23 +2,17 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 
-use crate::{
-    config::{Config, Listener, Protocol, Service, TargetEndpoint, TargetGroup},
-    runtime::state::{ManagedRuntimeRule, ManagedTarget},
-};
+use crate::config::{Config, Listener, Protocol, TargetGroup};
 
-use super::{
-    api_model::{
-        HealthProbeConfig, RuntimeRuleSpec, RuntimeRuleStateEntry, RuntimeRuleStateList,
-        RuntimeRuleTarget, TargetHealthEntry, TargetHealthList,
-    },
-    model::RuntimeRuleEntry,
+use super::api_model::{
+    HealthProbeConfig, NativeListenerSpec, NativeListenerStateEntry, NativeListenerStateList,
+    NativeListenerTarget, TargetHealthEntry, TargetHealthList,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct NativeProxyState {
     #[serde(default)]
-    listeners: Vec<RuntimeRuleStateEntry>,
+    listeners: Vec<NativeListenerStateEntry>,
     #[serde(default)]
     target_health: Vec<TargetHealthEntry>,
 }
@@ -59,12 +53,15 @@ fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     f()
 }
 
-pub fn runtime_rules_native(cfg: &Config) -> Result<RuntimeRuleStateList> {
+pub fn native_listeners_state(cfg: &Config) -> Result<NativeListenerStateList> {
     let mut entries = Vec::new();
     for entry in load_state(cfg)?.listeners {
-        if let Some(existing) = entries
-            .iter_mut()
-            .find(|existing: &&mut RuntimeRuleStateEntry| same_listener_identity(existing, &entry))
+        if let Some(existing) =
+            entries
+                .iter_mut()
+                .find(|existing: &&mut NativeListenerStateEntry| {
+                    same_listener_identity(existing, &entry)
+                })
         {
             for ip in &entry.spec.vip_ips {
                 if !existing.spec.vip_ips.contains(ip) {
@@ -76,7 +73,7 @@ pub fn runtime_rules_native(cfg: &Config) -> Result<RuntimeRuleStateList> {
             entries.push(entry);
         }
     }
-    Ok(RuntimeRuleStateList { rules: entries })
+    Ok(NativeListenerStateList { listeners: entries })
 }
 
 pub fn target_health_native(cfg: &Config) -> Result<TargetHealthList> {
@@ -106,9 +103,9 @@ fn target_groups_from_config(cfg: &Config) -> Result<Vec<TargetGroup>> {
     Ok(groups.into_values().collect())
 }
 
-pub fn create_runtime_rule_state(
+fn upsert_native_listener_state(
     cfg: &Config,
-    entry: &RuntimeRuleStateEntry,
+    entry: &NativeListenerStateEntry,
     target_group_probe: Option<&HealthProbeConfig>,
 ) -> Result<()> {
     with_state_lock(|| {
@@ -142,20 +139,10 @@ pub fn create_runtime_rule_state(
     })
 }
 
-pub fn replace_runtime_rule_state_by_name(
+fn expanded_native_listener_entries(
     cfg: &Config,
-    name: &str,
-    entry: &RuntimeRuleStateEntry,
-    target_group_probe: Option<&HealthProbeConfig>,
-) -> Result<()> {
-    let _ = delete_listener(cfg, name)?;
-    create_runtime_rule_state(cfg, entry, target_group_probe)
-}
-
-pub fn expanded_runtime_rule_entries(
-    cfg: &Config,
-    entry: &RuntimeRuleStateEntry,
-) -> Vec<RuntimeRuleStateEntry> {
+    entry: &NativeListenerStateEntry,
+) -> Vec<NativeListenerStateEntry> {
     let ips = if entry.spec.vip_ips.is_empty() {
         default_external_ips(cfg)
     } else {
@@ -197,11 +184,6 @@ pub fn delete_listener(cfg: &Config, name: &str) -> Result<bool> {
         }
         Ok(changed)
     })
-}
-
-pub fn delete_runtime_rule(cfg: &Config, svc: &Service) -> Result<()> {
-    let _ = delete_listener(cfg, &svc.name)?;
-    Ok(())
 }
 
 pub fn upsert_target_group(cfg: &Config, group: &TargetGroup) -> Result<()> {
@@ -265,93 +247,30 @@ pub fn create_or_update_listener(cfg: &Config, listener: &Listener) -> Result<()
         .find(|group| group.name == listener.target_group)
         .with_context(|| format!("target group {} not found", listener.target_group))?;
     for entry in listener_entries(cfg, listener, group)? {
-        create_runtime_rule_state(cfg, &entry, target_group_probe(group).as_ref())?;
+        upsert_native_listener_state(cfg, &entry, target_group_probe(group).as_ref())?;
     }
     Ok(())
 }
 
-pub fn ensure_runtime_rule(cfg: &Config, svc: &Service) -> Result<&'static str> {
-    for entry in service_entries(cfg, svc)? {
-        create_runtime_rule_state(cfg, &entry, service_probe(svc).as_ref())?;
-    }
-    Ok("updated")
-}
-
-pub fn desired_runtime_rules(cfg: &Config, svc: &Service) -> Vec<ManagedRuntimeRule> {
-    let mut out = Vec::new();
-    for protocol in svc.protocols() {
-        for vip_ips in default_external_ips(cfg) {
-            let endpoints = cfg
-                .service_endpoints(svc)
-                .into_iter()
-                .map(|endpoint| ManagedTarget {
-                    backend_ip: cfg.resolve_endpoint_address(&endpoint).to_string(),
-                    backend_port: endpoint.port,
-                    weight: endpoint.weight,
-                    probe_type: svc.probe_type.clone(),
-                    probe_port: svc.probe_port.or(Some(endpoint.port)),
-                    probe_req: svc.probe_req.clone(),
-                    probe_resp: svc.probe_resp.clone(),
-                    period_secs: svc.period_secs,
-                    retries: svc.retries,
-                })
-                .collect::<Vec<_>>();
-            let first = endpoints.first().cloned().unwrap_or_default();
-            out.push(ManagedRuntimeRule {
-                service: svc.name.clone(),
-                vip_ip: vip_ips,
-                protocol: protocol.as_str().to_string(),
-                vip_port: svc.vip_port,
-                backend_port: first.backend_port,
-                backend_ip: first.backend_ip,
-                backend_weight: first.weight,
-                endpoints,
-                select: svc.select.code(),
-                mode: svc.mode.code(),
-                bgp: svc.bgp,
-                monitor: svc.monitor,
-                inactive_timeout: svc.inactive_timeout,
-                mark: svc.mark,
-                security: svc.security.map(|s| s.code()),
-                host: svc.host.clone(),
-                proxy_protocol_v2: svc.proxy_protocol_v2,
-                egress: svc.egress,
-            });
-        }
-    }
-    out
-}
-
-pub fn get_runtime_rules(cfg: &Config) -> Result<Vec<RuntimeRuleEntry>> {
-    Ok(runtime_rules_native(cfg)?
-        .rules
-        .into_iter()
-        .map(runtime_rule_entry_from_native)
-        .collect())
-}
-
 pub fn hydrate_proxy_config_from_api(cfg: &mut Config) -> Result<()> {
-    let native_listeners = runtime_rules_native(cfg)?.rules;
+    let native_listeners = native_listeners_state(cfg)?.listeners;
     let mut target_groups = BTreeMap::new();
     let mut listeners = Vec::new();
-    let mut services = Vec::new();
     for group in target_groups_native(cfg)? {
         target_groups.insert(group.name.clone(), group);
     }
     for lb in native_listeners {
         let args = &lb.spec;
         let name = listener_name(&lb);
-        let endpoints = lb
+        let targets = lb
             .targets
             .iter()
-            .map(|endpoint| TargetEndpoint {
-                backend: None,
-                address: endpoint
-                    .address
-                    .parse()
-                    .unwrap_or_else(|_| "0.0.0.0".parse().unwrap()),
-                port: endpoint.target_port,
-                weight: endpoint.weight.max(1),
+            .map(|target| NativeListenerTarget {
+                address: target.address.clone(),
+                target_port: target.target_port,
+                weight: target.weight.max(1),
+                state: target.state.clone(),
+                counter: target.counter.clone(),
             })
             .collect::<Vec<_>>();
         let generated_target_group = format!("{name}-targets");
@@ -361,7 +280,7 @@ pub fn hydrate_proxy_config_from_api(cfg: &mut Config) -> Result<()> {
             .or_else(|| {
                 target_groups
                     .values()
-                    .find(|group| target_group_matches(group, args, &endpoints))
+                    .find(|group| target_group_matches(group, args, &targets))
                     .map(|group| group.name.clone())
             })
             .unwrap_or_else(|| generated_target_group.clone());
@@ -378,12 +297,15 @@ pub fn hydrate_proxy_config_from_api(cfg: &mut Config) -> Result<()> {
                 probe_skip_tls_verify: false,
                 period_secs: args.probe_timeout,
                 retries: args.probe_retries,
-                targets: endpoints
+                targets: targets
                     .iter()
-                    .map(|endpoint| crate::config::BackendTarget {
+                    .map(|target| crate::config::BackendTarget {
                         backend: None,
-                        address: endpoint.address,
-                        weight: endpoint.weight,
+                        address: target
+                            .address
+                            .parse()
+                            .unwrap_or_else(|_| "0.0.0.0".parse().unwrap()),
+                        weight: target.weight,
                     })
                     .collect(),
             });
@@ -391,7 +313,10 @@ pub fn hydrate_proxy_config_from_api(cfg: &mut Config) -> Result<()> {
         listeners.push(Listener {
             name: name.clone(),
             port: args.port,
-            target_port: endpoints.first().map(|endpoint| endpoint.port).unwrap_or(0),
+            target_port: targets
+                .first()
+                .map(|target| target.target_port)
+                .unwrap_or(0),
             target_group: target_group.clone(),
             vip_ips: args
                 .vip_ips
@@ -401,53 +326,18 @@ pub fn hydrate_proxy_config_from_api(cfg: &mut Config) -> Result<()> {
             protocols: protocols.clone(),
             select: select_from_code(args.sel),
             mode: mode_from_code(args.mode),
-            bgp: args.bgp,
             inactive_timeout: (args.inactive_timeout != 0).then_some(args.inactive_timeout),
-            mark: (args.block != 0).then_some(args.block),
-            security: None,
-            host: args.host.clone(),
-            proxy_protocol_v2: args.proxyprotocolv2,
-            egress: args.egress,
         });
-        if let Some(first) = endpoints.first() {
-            services.push(Service {
-                name,
-                vip_port: args.port,
-                target_group: Some(target_group),
-                backend_ip: first.address,
-                backend_port: first.port,
-                backend_weight: first.weight,
-                select: select_from_code(args.sel),
-                mode: mode_from_code(args.mode),
-                bgp: args.bgp,
-                monitor: args.monitor,
-                probe_type: args.probetype.clone(),
-                probe_port: args.probeport,
-                probe_req: args.probereq.clone(),
-                probe_resp: args.proberesp.clone(),
-                period_secs: args.probe_timeout,
-                retries: args.probe_retries,
-                inactive_timeout: (args.inactive_timeout != 0).then_some(args.inactive_timeout),
-                mark: (args.block != 0).then_some(args.block),
-                host: args.host.clone(),
-                proxy_protocol_v2: args.proxyprotocolv2,
-                egress: args.egress,
-                protocols,
-                endpoints,
-                ..Service::default()
-            });
-        }
     }
     cfg.file.target_groups = target_groups.into_values().collect();
     cfg.file.listeners = listeners;
-    cfg.file.services = services;
     Ok(())
 }
 
 fn target_group_matches(
     group: &TargetGroup,
-    args: &RuntimeRuleSpec,
-    endpoints: &[TargetEndpoint],
+    args: &NativeListenerSpec,
+    targets: &[NativeListenerTarget],
 ) -> bool {
     group.monitor == args.monitor
         && group.probe_type.as_deref() == args.probetype.as_deref()
@@ -457,10 +347,10 @@ fn target_group_matches(
         && group
             .targets
             .iter()
-            .map(|target| (target.address, target.weight))
-            .eq(endpoints
+            .map(|target| (target.address.to_string(), target.weight))
+            .eq(targets
                 .iter()
-                .map(|endpoint| (endpoint.address, endpoint.weight)))
+                .map(|target| (target.address.clone(), target.weight)))
 }
 
 pub fn default_external_ip(cfg: &Config) -> String {
@@ -476,78 +366,27 @@ fn default_external_ips(cfg: &Config) -> Vec<String> {
         .unwrap_or_else(|_| vec![cfg.network().gateway_ip.to_string()])
 }
 
-fn service_entries(cfg: &Config, svc: &Service) -> Result<Vec<RuntimeRuleStateEntry>> {
-    let endpoints = cfg
-        .service_endpoints(svc)
-        .into_iter()
-        .map(|endpoint| RuntimeRuleTarget {
-            address: cfg.resolve_endpoint_address(&endpoint).to_string(),
-            target_port: endpoint.port,
-            weight: endpoint.weight,
-            state: Some("active".to_string()),
-            counter: Some("0:0".to_string()),
-        })
-        .collect::<Vec<_>>();
-    // A business listener is one resource even when it serves both TCP and
-    // UDP. Keep the protocol list on that resource; the native datapath
-    // expands it into protocol-specific lookup keys at attach time. Writing
-    // one entry per protocol here would make the later entry replace the
-    // former one in the canonical state, so a tcp+udp listener would end up
-    // serving only whichever protocol happened to be written last.
-    let protocols = svc.protocols();
-    let first_protocol = protocols
-        .first()
-        .copied()
-        .context("service must select at least one protocol")?;
-    let mut entry = RuntimeRuleStateEntry {
-        spec: spec(
-            &svc.name,
-            svc.vip_port,
-            first_protocol,
-            svc.select.code(),
-            svc.mode.code(),
-            svc.monitor,
-            svc.inactive_timeout.unwrap_or(240),
-        ),
-        targets: endpoints,
-        protocols: protocols
-            .iter()
-            .map(|protocol| protocol.as_str().to_string())
-            .collect(),
-    };
-    entry.spec.vip_ips = default_external_ips(cfg);
-    if let Some(probe) = service_probe(svc) {
-        entry.spec.probetype = probe.probe_type;
-        entry.spec.probeport = probe.probe_port;
-        entry.spec.probereq = probe.probe_req;
-        entry.spec.proberesp = probe.probe_resp;
-        entry.spec.probe_timeout = probe.probe_duration;
-        entry.spec.probe_retries = probe.inactive_retries;
-    }
-    Ok(vec![entry])
-}
-
 fn listener_entries(
     cfg: &Config,
     listener: &Listener,
     group: &TargetGroup,
-) -> Result<Vec<RuntimeRuleStateEntry>> {
+) -> Result<Vec<NativeListenerStateEntry>> {
     if listener.target_port == 0 {
         bail!(
             "listener {} target_port must be in range 1..=65535",
             listener.name
         );
     }
-    let endpoints = group
+    let targets = group
         .targets
         .iter()
-        .map(|endpoint| RuntimeRuleTarget {
-            address: cfg.resolve_backend_target_address(endpoint).to_string(),
+        .map(|target| NativeListenerTarget {
+            address: cfg.resolve_backend_target_address(target).to_string(),
             // Target groups own backend membership and health probing. The
             // listener owns the forwarding port, so a backend target
             // may legitimately have no port of its own.
             target_port: listener.target_port,
-            weight: endpoint.weight,
+            weight: target.weight,
             state: Some("active".to_string()),
             counter: Some("0:0".to_string()),
         })
@@ -575,14 +414,14 @@ fn listener_entries(
     args.proberesp = group.probe_resp.clone();
     args.probe_timeout = group.period_secs;
     args.probe_retries = group.retries;
-    Ok(vec![RuntimeRuleStateEntry {
+    Ok(vec![NativeListenerStateEntry {
         spec: args,
         protocols: listener
             .protocols
             .iter()
             .map(|protocol| protocol.as_str().to_string())
             .collect(),
-        targets: endpoints,
+        targets,
     }])
 }
 
@@ -594,8 +433,8 @@ fn spec(
     mode: u32,
     monitor: bool,
     inactive_timeout: u32,
-) -> RuntimeRuleSpec {
-    RuntimeRuleSpec {
+) -> NativeListenerSpec {
+    NativeListenerSpec {
         vip_ips: Vec::new(),
         port,
         protocol: protocol.as_str().to_string(),
@@ -604,7 +443,7 @@ fn spec(
         monitor,
         inactive_timeout,
         name: Some(name.to_string()),
-        ..RuntimeRuleSpec::default()
+        ..NativeListenerSpec::default()
     }
 }
 
@@ -621,34 +460,21 @@ fn target_group_probe(group: &TargetGroup) -> Option<HealthProbeConfig> {
     })
 }
 
-fn service_probe(svc: &Service) -> Option<HealthProbeConfig> {
-    svc.monitor.then(|| HealthProbeConfig {
-        probe_type: svc.probe_type.clone(),
-        probe_port: svc.probe_port,
-        probe_req: svc.probe_req.clone(),
-        probe_resp: svc.probe_resp.clone(),
-        expected_status: svc.probe_status,
-        skip_tls_verify: svc.probe_skip_tls_verify,
-        probe_duration: svc.period_secs,
-        inactive_retries: svc.retries,
-    })
-}
-
 fn ensure_probe_health_records(
     state: &mut NativeProxyState,
-    lb: &RuntimeRuleStateEntry,
+    lb: &NativeListenerStateEntry,
     probe: &HealthProbeConfig,
 ) {
     let protocols = listener_protocols(lb);
     for protocol in protocols {
-        for endpoint in &lb.targets {
+        for target in &lb.targets {
             let probe_type = probe
                 .probe_type
                 .as_deref()
                 .unwrap_or(&protocol)
                 .to_ascii_lowercase();
-            let probe_port = probe.probe_port.unwrap_or(endpoint.target_port);
-            let name = target_health_key(&endpoint.address, &protocol, endpoint.target_port);
+            let probe_port = probe.probe_port.unwrap_or(target.target_port);
+            let name = target_health_key(&target.address, &protocol, target.target_port);
             // Preserve observed health from the probe worker (see
             // ensure_default_health_records).
             let current_state = state
@@ -660,7 +486,7 @@ fn ensure_probe_health_records(
             upsert_health_entry(
                 &mut state.target_health,
                 TargetHealthEntry {
-                    host_name: endpoint.address.clone(),
+                    host_name: target.address.clone(),
                     name,
                     inactive_retries: probe.inactive_retries,
                     probe_type: Some(probe_type),
@@ -676,11 +502,11 @@ fn ensure_probe_health_records(
     }
 }
 
-fn ensure_default_health_records(state: &mut NativeProxyState, lb: &RuntimeRuleStateEntry) {
+fn ensure_default_health_records(state: &mut NativeProxyState, lb: &NativeListenerStateEntry) {
     let protocols = listener_protocols(lb);
     for protocol in protocols {
-        for endpoint in &lb.targets {
-            let name = target_health_key(&endpoint.address, &protocol, endpoint.target_port);
+        for target in &lb.targets {
+            let name = target_health_key(&target.address, &protocol, target.target_port);
             // Keep observed health from the probe worker; reconcile must not
             // reset it, or state content (and the dirty flag) flaps every tick.
             let current_state = state
@@ -692,12 +518,12 @@ fn ensure_default_health_records(state: &mut NativeProxyState, lb: &RuntimeRuleS
             upsert_health_entry(
                 &mut state.target_health,
                 TargetHealthEntry {
-                    host_name: endpoint.address.clone(),
+                    host_name: target.address.clone(),
                     name,
                     inactive_retries: Some(0),
                     probe_type: Some("none".to_string()),
                     probe_duration: Some(0),
-                    probe_port: Some(endpoint.target_port),
+                    probe_port: Some(target.target_port),
                     current_state: Some(current_state),
                     ..TargetHealthEntry::default()
                 },
@@ -706,7 +532,7 @@ fn ensure_default_health_records(state: &mut NativeProxyState, lb: &RuntimeRuleS
     }
 }
 
-fn listener_protocols(lb: &RuntimeRuleStateEntry) -> Vec<String> {
+fn listener_protocols(lb: &NativeListenerStateEntry) -> Vec<String> {
     if lb.protocols.is_empty() {
         vec![lb.spec.protocol.to_ascii_lowercase()]
     } else {
@@ -717,7 +543,7 @@ fn listener_protocols(lb: &RuntimeRuleStateEntry) -> Vec<String> {
     }
 }
 
-fn normalize_entry(entry: &mut RuntimeRuleStateEntry) {
+fn normalize_entry(entry: &mut NativeListenerStateEntry) {
     entry.spec.protocol = entry.spec.protocol.to_ascii_lowercase();
     if entry.protocols.is_empty() {
         entry.protocols = vec![entry.spec.protocol.clone()];
@@ -739,14 +565,14 @@ fn normalize_entry(entry: &mut RuntimeRuleStateEntry) {
     if entry.spec.inactive_timeout == 0 {
         entry.spec.inactive_timeout = 240;
     }
-    for endpoint in &mut entry.targets {
-        endpoint.weight = endpoint.weight.max(1);
-        endpoint.state.get_or_insert_with(|| "active".to_string());
-        endpoint.counter.get_or_insert_with(|| "0:0".to_string());
+    for target in &mut entry.targets {
+        target.weight = target.weight.max(1);
+        target.state.get_or_insert_with(|| "active".to_string());
+        target.counter.get_or_insert_with(|| "0:0".to_string());
     }
 }
 
-fn merge_protocols(existing: &mut RuntimeRuleStateEntry, incoming: &RuntimeRuleStateEntry) {
+fn merge_protocols(existing: &mut NativeListenerStateEntry, incoming: &NativeListenerStateEntry) {
     let existing_protocols = if existing.protocols.is_empty() {
         vec![existing.spec.protocol.clone()]
     } else {
@@ -787,9 +613,12 @@ fn is_generated_listener_name(name: Option<&str>, port: u16) -> bool {
     })
 }
 
-fn upsert_listener_entry(items: &mut Vec<RuntimeRuleStateEntry>, entry: RuntimeRuleStateEntry) {
+fn upsert_listener_entry(
+    items: &mut Vec<NativeListenerStateEntry>,
+    entry: NativeListenerStateEntry,
+) {
     let name = listener_name(&entry);
-    items.retain(|item| !(listener_name(item) == name && same_service_key(item, &entry)));
+    items.retain(|item| !(listener_name(item) == name && same_listener_key(item, &entry)));
     items.push(entry);
 }
 
@@ -801,7 +630,7 @@ fn upsert_health_entry(items: &mut Vec<TargetHealthEntry>, entry: TargetHealthEn
     }
 }
 
-fn listener_name(lb: &RuntimeRuleStateEntry) -> String {
+fn listener_name(lb: &NativeListenerStateEntry) -> String {
     lb.spec
         .name
         .as_deref()
@@ -827,61 +656,22 @@ fn target_health_key(ip: &str, protocol: &str, port: u16) -> String {
     )
 }
 
-fn same_service_key(a: &RuntimeRuleStateEntry, b: &RuntimeRuleStateEntry) -> bool {
+fn same_listener_key(a: &NativeListenerStateEntry, b: &NativeListenerStateEntry) -> bool {
     let a = &a.spec;
     let b = &b.spec;
-    a.vip_ips == b.vip_ips
-        && a.port == b.port
-        && a.protocol.eq_ignore_ascii_case(&b.protocol)
-        && a.host.as_deref().unwrap_or("").trim() == b.host.as_deref().unwrap_or("").trim()
+    a.vip_ips == b.vip_ips && a.port == b.port && a.protocol.eq_ignore_ascii_case(&b.protocol)
 }
 
-fn same_listener_identity(a: &RuntimeRuleStateEntry, b: &RuntimeRuleStateEntry) -> bool {
+fn same_listener_identity(a: &NativeListenerStateEntry, b: &NativeListenerStateEntry) -> bool {
     let a = &a.spec;
     let b = &b.spec;
     a.vip_ips
         .iter()
         .any(|ip| b.vip_ips.iter().any(|other| ip == other))
         && a.port == b.port
-        && a.host.as_deref().unwrap_or("").trim() == b.host.as_deref().unwrap_or("").trim()
         && (a.name.as_deref().unwrap_or("").trim() == b.name.as_deref().unwrap_or("").trim()
             || (is_generated_listener_name(a.name.as_deref(), a.port)
                 && is_generated_listener_name(b.name.as_deref(), b.port)))
-}
-
-fn runtime_rule_entry_from_native(item: RuntimeRuleStateEntry) -> RuntimeRuleEntry {
-    let args = item.spec;
-    let endpoints = item
-        .targets
-        .iter()
-        .map(|endpoint| ManagedTarget {
-            backend_ip: endpoint.address.clone(),
-            backend_port: endpoint.target_port,
-            weight: endpoint.weight,
-            ..ManagedTarget::default()
-        })
-        .collect::<Vec<_>>();
-    let first = endpoints.first().cloned().unwrap_or_default();
-    RuntimeRuleEntry {
-        name: args.name,
-        vip_ip: args.vip_ips.first().cloned().unwrap_or_default(),
-        protocol: args.protocol,
-        vip_port: args.port,
-        backend_port: first.backend_port,
-        backend_ip: first.backend_ip,
-        backend_weight: first.weight,
-        endpoints,
-        select: args.sel,
-        mode: args.mode,
-        bgp: args.bgp,
-        monitor: args.monitor,
-        inactive_timeout: (args.inactive_timeout != 0).then_some(args.inactive_timeout),
-        mark: (args.block != 0).then_some(args.block),
-        security: args.security,
-        host: args.host,
-        proxy_protocol_v2: args.proxyprotocolv2,
-        egress: args.egress,
-    }
 }
 
 fn select_from_code(value: u32) -> crate::config::LbSelect {
@@ -894,15 +684,8 @@ fn select_from_code(value: u32) -> crate::config::LbSelect {
     }
 }
 
-fn mode_from_code(value: u32) -> crate::config::LbMode {
-    match value {
-        1 => crate::config::LbMode::Onearm,
-        2 => crate::config::LbMode::Fullnat,
-        3 => crate::config::LbMode::Dsr,
-        4 => crate::config::LbMode::Fullproxy,
-        5 => crate::config::LbMode::Hostonearm,
-        _ => crate::config::LbMode::Default,
-    }
+fn mode_from_code(_value: u32) -> crate::config::LbMode {
+    crate::config::LbMode::Default
 }
 
 fn protocol_from_str(value: &str) -> Option<Protocol> {
@@ -913,7 +696,7 @@ fn protocol_from_str(value: &str) -> Option<Protocol> {
     }
 }
 
-fn protocols_from_entry(entry: &RuntimeRuleStateEntry) -> Vec<Protocol> {
+fn protocols_from_entry(entry: &NativeListenerStateEntry) -> Vec<Protocol> {
     let values = if entry.protocols.is_empty() {
         std::slice::from_ref(&entry.spec.protocol)
     } else {
@@ -984,18 +767,18 @@ mod tests {
 
     #[test]
     fn aggregate_listener_expands_to_both_transport_keys() {
-        let entry = RuntimeRuleStateEntry {
-            spec: RuntimeRuleSpec {
+        let entry = NativeListenerStateEntry {
+            spec: NativeListenerSpec {
                 vip_ips: vec!["192.0.2.10".to_string()],
                 port: 9999,
                 protocol: "tcp".to_string(),
-                ..RuntimeRuleSpec::default()
+                ..NativeListenerSpec::default()
             },
             protocols: vec!["tcp".to_string(), "udp".to_string()],
-            ..RuntimeRuleStateEntry::default()
+            ..NativeListenerStateEntry::default()
         };
 
-        let expanded = expanded_runtime_rule_entries(
+        let expanded = expanded_native_listener_entries(
             &Config {
                 file: crate::config::FileConfig::default(),
                 path: crate::config::DEFAULT_CONFIG_PATH.into(),

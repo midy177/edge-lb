@@ -7,12 +7,11 @@
 - 监听配置和目标组是 edge-lb 自有模型，不映射成外部负载均衡器的业务对象。
 - 监听配置只负责对外地址、对外端口、协议、调度策略、转发模式、目标组绑定和连接超时。
 - 目标组只负责后端地址、权重和健康探测配置；监听配置负责目标转发端口。
-- `Config.services` 只是 gateway 本地从监听配置和目标组派生出的运行期投影，
-  只能用于 legacy-free native map 写入、DSCP 端口推导和回程端口推导；不得进入
-  API、SQLite 业务资源或 backend xDS snapshot。
+- `Config.services` 和 `TargetEndpoint` 已删除；监听配置和目标组是唯一业务模型。
+  native map 写入、DSCP 端口推导和回程端口推导都必须直接从
+  `listeners + target_groups` 计算，不能重新引入运行期 service 投影。
 - backend xDS 的 `backend_return_ports` 必须优先直接从 `listeners + target_groups`
-  推导，旧 `Config.services` projection 只能作为无新模型输入时的内部兜底，不能
-  成为 backend 控制面契约。
+  推导，不能下发监听、目标组或任何 gateway 业务配置字段。
 - 自动配置模板只生成或覆盖目标组，字段名必须是 `target_group`；不接受
   `listener` 字段别名。
 - 自动配置目标组在没有匹配节点时可以创建空目标组，方便监听提前绑定；但
@@ -102,7 +101,7 @@ backend binding alive while constructing the VXLAN specification.
 - `matched`：IPv4 TCP/UDP 目标端口命中配置端口的包数。
 - `changed`：命中后实际修改 DSCP 的包数。
 
-不再记录 `seen` 和 `ipv4`。这两个计数需要在每包路径中额外更新，且不能提供必要的运维信号。native DNAT 的 stats 结构也移除了 `seen` 字段，只保留 `service_hit`、`rewritten`、`return_miss`、`target_miss` 等能直接定位转发问题的计数。
+不再记录 `seen` 和 `ipv4`。这两个计数需要在每包路径中额外更新，且不能提供必要的运维信号。native DNAT 的 stats 结构也移除了 `seen` 字段，只保留 `listener_hit`、`rewritten`、`return_miss`、`target_miss` 等能直接定位转发问题的计数。
 
 ## 4. 状态与生命周期
 

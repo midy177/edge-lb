@@ -81,7 +81,6 @@ impl From<ListenerConfigResource> for Listener {
             select: value.select,
             mode: LbMode::Default,
             inactive_timeout: value.inactive_timeout,
-            ..Self::default()
         }
     }
 }
@@ -364,9 +363,6 @@ fn validate_listener_config(
     }
     if listener.protocols.is_empty() {
         bail!("listener must select at least one protocol");
-    }
-    if !listener.mode.preserves_client_ip() {
-        bail!("only default listener mode is supported");
     }
     let groups =
         crate::provider::native::target_groups_native(cfg).context("loading target groups")?;

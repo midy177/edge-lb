@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeRuleStateList {
-    pub rules: Vec<RuntimeRuleStateEntry>,
+pub struct NativeListenerStateList {
+    pub listeners: Vec<NativeListenerStateEntry>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeRuleStateEntry {
-    pub spec: RuntimeRuleSpec,
+pub struct NativeListenerStateEntry {
+    pub spec: NativeListenerSpec,
     #[serde(default)]
-    pub targets: Vec<RuntimeRuleTarget>,
+    pub targets: Vec<NativeListenerTarget>,
     /// Logical listener protocols. The datapath expands this into one
     /// protocol-specific lookup key per selected transport protocol.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -17,7 +17,7 @@ pub struct RuntimeRuleStateEntry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeRuleSpec {
+pub struct NativeListenerSpec {
     pub vip_ips: Vec<String>,
     pub port: u16,
     pub protocol: String,
@@ -25,8 +25,6 @@ pub struct RuntimeRuleSpec {
     pub sel: u32,
     #[serde(default)]
     pub mode: u32,
-    #[serde(default)]
-    pub bgp: bool,
     #[serde(default)]
     pub monitor: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,22 +41,12 @@ pub struct RuntimeRuleSpec {
     pub probe_retries: Option<u32>,
     #[serde(default)]
     pub inactive_timeout: u32,
-    #[serde(default)]
-    pub block: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub security: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(default)]
-    pub proxyprotocolv2: bool,
-    #[serde(default)]
-    pub egress: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeRuleTarget {
+pub struct NativeListenerTarget {
     /// Backend target address.
     pub address: String,
     /// Forwarding port owned by the listener configuration.
@@ -142,32 +130,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_rule_state_uses_native_resource_field_names() {
-        let value = RuntimeRuleStateList {
-            rules: vec![RuntimeRuleStateEntry {
-                spec: RuntimeRuleSpec {
+    fn native_listener_state_uses_native_resource_field_names() {
+        let value = NativeListenerStateList {
+            listeners: vec![NativeListenerStateEntry {
+                spec: NativeListenerSpec {
                     vip_ips: vec!["192.0.2.10".to_string()],
                     port: 8080,
                     protocol: "tcp".to_string(),
-                    ..RuntimeRuleSpec::default()
+                    ..NativeListenerSpec::default()
                 },
-                targets: vec![RuntimeRuleTarget {
+                targets: vec![NativeListenerTarget {
                     address: "192.0.2.20".to_string(),
                     target_port: 10080,
                     weight: 1,
-                    ..RuntimeRuleTarget::default()
+                    ..NativeListenerTarget::default()
                 }],
                 protocols: vec!["tcp".to_string()],
             }],
         };
 
         let json = serde_json::to_value(value).unwrap();
-        assert!(json.get("rules").is_some());
-        assert!(json["rules"][0].get("spec").is_some());
-        assert!(json["rules"][0].get("targets").is_some());
+        assert!(json.get("listeners").is_some());
+        assert!(json["listeners"][0].get("spec").is_some());
+        assert!(json["listeners"][0].get("targets").is_some());
         assert!(json.get("services").is_none());
-        assert!(json["rules"][0].get("service_arguments").is_none());
-        assert!(json["rules"][0].get("endpoints").is_none());
+        assert!(json["listeners"][0].get("service_arguments").is_none());
+        assert!(json["listeners"][0].get("endpoints").is_none());
     }
 }
 

@@ -1,7 +1,7 @@
 //! Native IPv4 default-DNAT TC datapath.
 //!
 //! The daemon owns the Aya object and its maps. The ingress program performs
-//! the forward rewrite and the return program restores the service source on
+//! the forward rewrite and the return program restores the listener source on
 //! packets arriving from the backend overlay.
 
 use std::{
@@ -19,9 +19,9 @@ use aya::{
     },
 };
 use edge_lb_common::{
-    DEFAULT_PERSIST_TIMEOUT_SECS, MAX_ENDPOINTS_PER_SERVICE, NATIVE_DNAT_INGRESS_PROGRAM,
-    NATIVE_DNAT_RETURN_PROGRAM, NativeEndpointKey, NativeEndpointLoadKey, NativeEndpointValue,
-    NativeServiceKey, NativeServiceValue,
+    DEFAULT_PERSIST_TIMEOUT_SECS, MAX_TARGETS_PER_LISTENER, NATIVE_DNAT_INGRESS_PROGRAM,
+    NATIVE_DNAT_RETURN_PROGRAM, NativeListenerLookupKey, NativeListenerLookupValue,
+    NativeTargetKey, NativeTargetLoadKey, NativeTargetValue,
 };
 
 use crate::{
@@ -31,16 +31,16 @@ use crate::{
     },
 };
 
-const SERVICES: &str = "NATIVE_SERVICES";
-const ENDPOINTS: &str = "NATIVE_ENDPOINTS";
+const LISTENERS: &str = "NATIVE_LISTENERS";
+const TARGETS: &str = "NATIVE_TARGETS";
 const FLOWS: &str = "NATIVE_FLOWS";
 const STATS: &str = "NATIVE_STATS";
 const FLOW_EVENTS: &str = "NATIVE_FLOW_EVENTS";
 const RR_COUNTERS: &str = "NATIVE_RR_COUNTERS";
 const ACTIVE_FLOWS: &str = "NATIVE_ACTIVE_FLOWS";
 const MAPS: [&str; 7] = [
-    SERVICES,
-    ENDPOINTS,
+    LISTENERS,
+    TARGETS,
     FLOWS,
     RR_COUNTERS,
     ACTIVE_FLOWS,
@@ -117,7 +117,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
     }
     let n = cfg.network();
     let mut bpf = Ebpf::load(&read_object()?).context("failed to load native DNAT eBPF object")?;
-    let observed_endpoints = target_health_native(cfg).ok();
+    let observed_targets = target_health_native(cfg).ok();
     let pin_dir = pin_dir(cfg);
     fs::create_dir_all(&pin_dir)
         .with_context(|| format!("failed to create {}", pin_dir.display()))?;
@@ -125,40 +125,43 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
         let _ = fs::remove_file(pin_path(cfg, name));
     }
 
-    let mut service_id = 1u32;
+    let mut listener_id = 1u32;
     {
-        let mut services: HashMap<&mut MapData, NativeServiceKey, NativeServiceValue> =
-            HashMap::try_from(
-                bpf.map_mut(SERVICES)
-                    .ok_or_else(|| anyhow!("{SERVICES} map missing"))?,
-            )?;
+        let mut listener_map: HashMap<
+            &mut MapData,
+            NativeListenerLookupKey,
+            NativeListenerLookupValue,
+        > = HashMap::try_from(
+            bpf.map_mut(LISTENERS)
+                .ok_or_else(|| anyhow!("{LISTENERS} map missing"))?,
+        )?;
         for listener in &listeners {
             let weight_total = listener
-                .endpoints
+                .targets
                 .iter()
-                .filter(|endpoint| {
-                    matches!(endpoint.state, NativeTargetState::Active)
-                        && observed_endpoint_is_active(
-                            observed_endpoints.as_ref(),
-                            endpoint.address,
+                .filter(|target| {
+                    matches!(target.state, NativeTargetState::Active)
+                        && observed_target_is_active(
+                            observed_targets.as_ref(),
+                            target.address,
                             listener.key.protocol.ip_proto(),
-                            endpoint.port,
+                            target.port,
                         )
                 })
-                .map(|endpoint| endpoint.weight)
+                .map(|target| target.weight)
                 .filter(|weight| *weight > 0)
                 .sum::<u32>();
-            services.insert(
-                NativeServiceKey {
+            listener_map.insert(
+                NativeListenerLookupKey {
                     vip: u32::from_be_bytes(listener.key.vip_ip.octets()),
                     port: listener.key.vip_port.to_be(),
                     proto: listener.key.protocol.ip_proto(),
                     _pad: 0,
                 },
-                NativeServiceValue {
-                    service_id,
-                    endpoint_base: 0,
-                    endpoint_count: listener.endpoints.len() as u32,
+                NativeListenerLookupValue {
+                    listener_id,
+                    target_base: 0,
+                    target_count: listener.targets.len() as u32,
                     weight_total,
                     select: listener.select,
                     flags: 1,
@@ -171,45 +174,45 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                 },
                 0,
             )?;
-            service_id = service_id
+            listener_id = listener_id
                 .checked_add(1)
-                .context("native service id exhausted")?;
+                .context("native listener id exhausted")?;
         }
     }
     {
-        let mut endpoints: HashMap<&mut MapData, NativeEndpointKey, NativeEndpointValue> =
+        let mut targets: HashMap<&mut MapData, NativeTargetKey, NativeTargetValue> =
             HashMap::try_from(
-                bpf.map_mut(ENDPOINTS)
-                    .ok_or_else(|| anyhow!("{ENDPOINTS} map missing"))?,
+                bpf.map_mut(TARGETS)
+                    .ok_or_else(|| anyhow!("{TARGETS} map missing"))?,
             )?;
-        for (service_index, listener) in listeners.iter().enumerate() {
-            if listener.endpoints.len() > MAX_ENDPOINTS_PER_SERVICE as usize {
+        for (listener_index, listener) in listeners.iter().enumerate() {
+            if listener.targets.len() > MAX_TARGETS_PER_LISTENER as usize {
                 // The eBPF selector scans a compile-time bound; extra
-                // endpoints would be silently unreachable.
+                // targets would be silently unreachable.
                 anyhow::bail!(
-                    "listener {} has {} endpoints; max {}",
+                    "listener {} has {} targets; max {}",
                     listener.key.vip_port,
-                    listener.endpoints.len(),
-                    MAX_ENDPOINTS_PER_SERVICE
+                    listener.targets.len(),
+                    MAX_TARGETS_PER_LISTENER
                 );
             }
-            for (endpoint_id, endpoint) in listener.endpoints.iter().enumerate() {
-                endpoints.insert(
-                    NativeEndpointKey {
-                        service_id: service_index as u32 + 1,
-                        endpoint_id: endpoint_id as u32,
+            for (target_id, target) in listener.targets.iter().enumerate() {
+                targets.insert(
+                    NativeTargetKey {
+                        listener_id: listener_index as u32 + 1,
+                        target_id: target_id as u32,
                     },
-                    NativeEndpointValue {
-                        address: u32::from_be_bytes(endpoint.address.octets()),
-                        port: endpoint.port,
-                        weight: endpoint.weight.min(u16::MAX as u32) as u16,
+                    NativeTargetValue {
+                        address: u32::from_be_bytes(target.address.octets()),
+                        port: target.port,
+                        weight: target.weight.min(u16::MAX as u32) as u16,
                         flags: u32::from(
-                            matches!(endpoint.state, NativeTargetState::Active)
-                                && observed_endpoint_is_active(
-                                    observed_endpoints.as_ref(),
-                                    endpoint.address,
+                            matches!(target.state, NativeTargetState::Active)
+                                && observed_target_is_active(
+                                    observed_targets.as_ref(),
+                                    target.address,
                                     listener.key.protocol.ip_proto(),
-                                    endpoint.port,
+                                    target.port,
                                 ),
                         ),
                     },
@@ -251,7 +254,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
     })
 }
 
-fn observed_endpoint_is_active(
+fn observed_target_is_active(
     observed: Option<&TargetHealthList>,
     address: std::net::Ipv4Addr,
     protocol: u8,
@@ -420,7 +423,7 @@ pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
         return Ok(0);
     };
     let mut expired = Vec::new();
-    let mut loads = StdHashMap::<NativeEndpointLoadKey, u32>::new();
+    let mut loads = StdHashMap::<NativeTargetLoadKey, u32>::new();
     let mut seen_pairs =
         HashSet::<(edge_lb_common::NativeFlowKey, edge_lb_common::NativeFlowKey)>::new();
     for entry in flows.iter() {
@@ -431,9 +434,9 @@ pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
         }
         let pair = canonical_flow_pair(key, value);
         if seen_pairs.insert(pair) {
-            let load_key = NativeEndpointLoadKey {
-                service_id: value.service_id,
-                endpoint_id: value.endpoint_id,
+            let load_key = NativeTargetLoadKey {
+                listener_id: value.listener_id,
+                target_id: value.target_id,
             };
             loads
                 .entry(load_key)
@@ -529,8 +532,8 @@ fn canonical_flow_pair(
     key: edge_lb_common::NativeFlowKey,
     value: edge_lb_common::NativeFlowValue,
 ) -> (edge_lb_common::NativeFlowKey, edge_lb_common::NativeFlowKey) {
-    let endpoint_port = value.endpoint_port.to_be();
-    let (forward, reverse) = if key.src == value.endpoint && key.sport == endpoint_port {
+    let target_port = value.target_port.to_be();
+    let (forward, reverse) = if key.src == value.target && key.sport == target_port {
         let forward = edge_lb_common::NativeFlowKey {
             src: key.dst,
             dst: value.vip,
@@ -542,9 +545,9 @@ fn canonical_flow_pair(
         (forward, key)
     } else {
         let reverse = edge_lb_common::NativeFlowKey {
-            src: value.endpoint,
+            src: value.target,
             dst: key.src,
-            sport: endpoint_port,
+            sport: target_port,
             dport: key.sport,
             proto: key.proto,
             _pad: [0; 3],
@@ -562,10 +565,7 @@ fn flow_key_sort_tuple(key: &edge_lb_common::NativeFlowKey) -> (u32, u32, u16, u
     (key.src, key.dst, key.sport, key.dport, key.proto)
 }
 
-fn replace_active_flows(
-    cfg: &Config,
-    loads: &StdHashMap<NativeEndpointLoadKey, u32>,
-) -> Result<()> {
+fn replace_active_flows(cfg: &Config, loads: &StdHashMap<NativeTargetLoadKey, u32>) -> Result<()> {
     let pin = pin_path(cfg, ACTIVE_FLOWS);
     if !pin.exists() {
         return Ok(());
@@ -574,7 +574,7 @@ fn replace_active_flows(
         MapData::from_pin(&pin).with_context(|| format!("opening pinned {ACTIVE_FLOWS}"))?;
     let map = Map::from_map_data(map_data)
         .with_context(|| format!("{ACTIVE_FLOWS} is not a hash map"))?;
-    let mut active: HashMap<MapData, NativeEndpointLoadKey, u32> = HashMap::try_from(map)
+    let mut active: HashMap<MapData, NativeTargetLoadKey, u32> = HashMap::try_from(map)
         .with_context(|| format!("{ACTIVE_FLOWS} key/value layout mismatch"))?;
     let existing = active
         .iter()
@@ -592,106 +592,106 @@ fn replace_active_flows(
     Ok(())
 }
 
-/// Refresh the active/inactive flag of every endpoint in the pinned
-/// ENDPOINTS map from observed probe state, without touching TC attachment
+/// Refresh the active/inactive flag of every target in the pinned
+/// TARGETS map from observed probe state, without touching TC attachment
 /// or the running programs. Called by the probe worker on health
 /// transitions; safe to run when the datapath is not attached (no-op).
 pub fn refresh_target_health(cfg: &Config) -> Result<()> {
-    let pin = pin_path(cfg, ENDPOINTS);
+    let pin = pin_path(cfg, TARGETS);
     if !pin.exists() {
         return Ok(());
     }
     let listeners = listeners_from_config(cfg)?;
     let observed = target_health_native(cfg).ok();
-    let map_data =
-        MapData::from_pin(&pin).with_context(|| format!("opening pinned {ENDPOINTS}"))?;
+    let map_data = MapData::from_pin(&pin).with_context(|| format!("opening pinned {TARGETS}"))?;
     let map =
-        Map::from_map_data(map_data).with_context(|| format!("{ENDPOINTS} is not a hash map"))?;
-    let mut endpoints: HashMap<MapData, NativeEndpointKey, NativeEndpointValue> =
-        HashMap::try_from(map).with_context(|| format!("{ENDPOINTS} key/value layout mismatch"))?;
+        Map::from_map_data(map_data).with_context(|| format!("{TARGETS} is not a hash map"))?;
+    let mut targets: HashMap<MapData, NativeTargetKey, NativeTargetValue> =
+        HashMap::try_from(map).with_context(|| format!("{TARGETS} key/value layout mismatch"))?;
     let mut changed = 0usize;
-    for (service_index, listener) in listeners.iter().enumerate() {
-        for (endpoint_id, endpoint) in listener.endpoints.iter().enumerate() {
-            let key = NativeEndpointKey {
-                service_id: service_index as u32 + 1,
-                endpoint_id: endpoint_id as u32,
+    for (listener_index, listener) in listeners.iter().enumerate() {
+        for (target_id, target) in listener.targets.iter().enumerate() {
+            let key = NativeTargetKey {
+                listener_id: listener_index as u32 + 1,
+                target_id: target_id as u32,
             };
-            let Some(mut value) = endpoints.get(&key, 0).ok() else {
+            let Some(mut value) = targets.get(&key, 0).ok() else {
                 continue;
             };
-            let active = matches!(endpoint.state, NativeTargetState::Active)
-                && observed_endpoint_is_active(
+            let active = matches!(target.state, NativeTargetState::Active)
+                && observed_target_is_active(
                     observed.as_ref(),
-                    endpoint.address,
+                    target.address,
                     listener.key.protocol.ip_proto(),
-                    endpoint.port,
+                    target.port,
                 );
             let flags = u32::from(active);
             if value.flags != flags {
                 value.flags = flags;
-                endpoints.insert(key, value, 0)?;
+                targets.insert(key, value, 0)?;
                 changed += 1;
                 tracing::info!(
-                    "[native-dnat] endpoint {}:{} {} -> {} (service {})",
-                    endpoint.address,
-                    endpoint.port,
+                    "[native-dnat] target {}:{} {} -> {} (listener {})",
+                    target.address,
+                    target.port,
                     if flags == 1 { "inactive" } else { "active" },
                     if flags == 1 { "active" } else { "inactive" },
-                    service_index + 1
+                    listener_index + 1
                 );
             }
         }
     }
-    refresh_service_weights(cfg, &listeners, observed.as_ref())?;
+    refresh_listener_weights(cfg, &listeners, observed.as_ref())?;
     if changed == 0 {
-        tracing::debug!("[native-dnat] endpoint health refresh: no changes");
+        tracing::debug!("[native-dnat] target health refresh: no changes");
     }
     Ok(())
 }
 
-fn refresh_service_weights(
+fn refresh_listener_weights(
     cfg: &Config,
     listeners: &[crate::provider::native::NativeListener],
     observed: Option<&TargetHealthList>,
 ) -> Result<()> {
-    let pin = pin_path(cfg, SERVICES);
+    let pin = pin_path(cfg, LISTENERS);
     if !pin.exists() {
         return Ok(());
     }
-    let map_data = MapData::from_pin(&pin).with_context(|| format!("opening pinned {SERVICES}"))?;
+    let map_data =
+        MapData::from_pin(&pin).with_context(|| format!("opening pinned {LISTENERS}"))?;
     let map =
-        Map::from_map_data(map_data).with_context(|| format!("{SERVICES} is not a hash map"))?;
-    let mut services: HashMap<MapData, NativeServiceKey, NativeServiceValue> =
-        HashMap::try_from(map).with_context(|| format!("{SERVICES} key/value layout mismatch"))?;
-    for (service_index, listener) in listeners.iter().enumerate() {
-        let key = NativeServiceKey {
+        Map::from_map_data(map_data).with_context(|| format!("{LISTENERS} is not a hash map"))?;
+    let mut listener_map: HashMap<MapData, NativeListenerLookupKey, NativeListenerLookupValue> =
+        HashMap::try_from(map).with_context(|| format!("{LISTENERS} key/value layout mismatch"))?;
+    for (listener_index, listener) in listeners.iter().enumerate() {
+        let key = NativeListenerLookupKey {
             vip: u32::from_be_bytes(listener.key.vip_ip.octets()),
             port: listener.key.vip_port.to_be(),
             proto: listener.key.protocol.ip_proto(),
             _pad: 0,
         };
-        let Some(mut value) = services.get(&key, 0).ok() else {
+        let Some(mut value) = listener_map.get(&key, 0).ok() else {
             continue;
         };
         value.weight_total = listener
-            .endpoints
+            .targets
             .iter()
-            .filter(|endpoint| {
-                matches!(endpoint.state, NativeTargetState::Active)
-                    && observed_endpoint_is_active(
+            .filter(|target| {
+                matches!(target.state, NativeTargetState::Active)
+                    && observed_target_is_active(
                         observed,
-                        endpoint.address,
+                        target.address,
                         listener.key.protocol.ip_proto(),
-                        endpoint.port,
+                        target.port,
                     )
             })
-            .map(|endpoint| endpoint.weight)
+            .map(|target| target.weight)
             .filter(|weight| *weight > 0)
             .sum();
-        services.insert(key, value, 0).with_context(|| {
+        listener_map.insert(key, value, 0).with_context(|| {
             format!(
-                "updating native service weight for service {}",
-                service_index + 1
+                "updating native listener weight for listener {}",
+                listener_index + 1
             )
         })?;
     }
@@ -747,8 +747,8 @@ pub fn stats(cfg: &Config) -> Result<edge_lb_common::NativeDatapathStats> {
     Ok(values.iter().copied().fold(
         edge_lb_common::NativeDatapathStats::default(),
         |mut total, value| {
-            total.service_hit = total.service_hit.saturating_add(value.service_hit);
-            total.service_miss = total.service_miss.saturating_add(value.service_miss);
+            total.listener_hit = total.listener_hit.saturating_add(value.listener_hit);
+            total.listener_miss = total.listener_miss.saturating_add(value.listener_miss);
             total.return_miss = total.return_miss.saturating_add(value.return_miss);
             total.target_miss = total.target_miss.saturating_add(value.target_miss);
             total.rewritten = total.rewritten.saturating_add(value.rewritten);
@@ -787,9 +787,9 @@ mod tests {
         let reverse = flow_key(0xc0a8_000b, 0x0a00_0001, 8080, 40000);
         let value = edge_lb_common::NativeFlowValue {
             vip: 0xc0a8_000a,
-            endpoint: 0xc0a8_000b,
+            target: 0xc0a8_000b,
             vip_port: 80_u16.to_be(),
-            endpoint_port: 8080,
+            target_port: 8080,
             ..edge_lb_common::NativeFlowValue::default()
         };
         assert_eq!(
@@ -806,7 +806,7 @@ mod tests {
 
     #[test]
     fn health_identity_uses_forwarding_port_not_probe_port() {
-        let endpoint = crate::provider::native::TargetHealthEntry {
+        let target = crate::provider::native::TargetHealthEntry {
             host_name: "192.0.2.10".to_string(),
             name: "192.0.2.10_tcp_8080".to_string(),
             probe_type: Some("http".to_string()),
@@ -815,10 +815,10 @@ mod tests {
             ..crate::provider::native::TargetHealthEntry::default()
         };
         let list = super::TargetHealthList {
-            entries: vec![endpoint],
+            entries: vec![target],
         };
 
-        assert!(!super::observed_endpoint_is_active(
+        assert!(!super::observed_target_is_active(
             Some(&list),
             "192.0.2.10".parse().unwrap(),
             6,

@@ -25,7 +25,7 @@ pub fn matched_nodes(template: &AutomationTemplate, nodes: &[MatchedNode]) -> Ve
 }
 
 pub fn plan_template(template: &AutomationTemplate, nodes: &[MatchedNode]) -> PlannedTargetGroup {
-    let endpoints = matched_nodes(template, nodes);
+    let targets = matched_nodes(template, nodes);
     let probe_type = template
         .target_group
         .probe_type
@@ -37,7 +37,7 @@ pub fn plan_template(template: &AutomationTemplate, nodes: &[MatchedNode]) -> Pl
         name: generated_target_group_name(template),
         monitor: template.target_group.monitor,
         probe_type,
-        endpoints,
+        targets,
     }
 }
 
@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_template_creates_one_target_group_with_matched_endpoints() {
+    fn plan_template_creates_one_target_group_with_matched_targets() {
         let template = AutomationTemplate {
             name: "template-targets-a".to_string(),
             node_scope: NodeScope::Filtered,
@@ -156,8 +156,8 @@ mod tests {
         assert_eq!(planned.template, "template-targets-a");
         assert!(planned.monitor);
         assert_eq!(planned.probe_type, "http");
-        assert_eq!(planned.endpoints.len(), 1);
-        assert_eq!(planned.endpoints[0].underlay_ip, "192.168.0.14");
+        assert_eq!(planned.targets.len(), 1);
+        assert_eq!(planned.targets[0].underlay_ip, "192.168.0.14");
     }
 
     #[test]

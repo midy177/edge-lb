@@ -14,21 +14,19 @@ pub mod xsync;
 
 #[allow(unused_imports)]
 pub use api_model::{
-    HealthProbeConfig, RuntimeRuleSpec, RuntimeRuleStateEntry, RuntimeRuleStateList,
-    RuntimeRuleTarget, TargetHealthEntry, TargetHealthList,
+    HealthProbeConfig, NativeListenerSpec, NativeListenerStateEntry, NativeListenerStateList,
+    NativeListenerTarget, TargetHealthEntry, TargetHealthList,
 };
 #[allow(unused_imports)]
 pub use model::{
     NativeListener, NativeListenerKey, NativeProtocol, NativeTarget, NativeTargetState,
-    RuntimeRuleEntry, effective_vip_ips, listeners_from_config,
+    effective_vip_ips, listeners_from_config,
 };
 #[allow(unused_imports)]
 pub use probe::run_worker as run_probe_worker;
 #[allow(unused_imports)]
 pub use store::{
-    create_or_update_listener, create_runtime_rule_state, default_external_ip, delete_listener,
-    delete_runtime_rule, delete_target_group, desired_runtime_rules, ensure_runtime_rule,
-    expanded_runtime_rule_entries, get_runtime_rules, hydrate_proxy_config_from_api,
-    replace_runtime_rule_state_by_name, runtime_rules_native, take_state_dirty,
-    target_groups_native, target_health, target_health_native, upsert_target_group,
+    create_or_update_listener, default_external_ip, delete_listener, delete_target_group,
+    hydrate_proxy_config_from_api, native_listeners_state, take_state_dirty, target_groups_native,
+    target_health, target_health_native, upsert_target_group,
 };

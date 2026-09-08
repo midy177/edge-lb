@@ -71,44 +71,12 @@ impl LbSelect {
 pub enum LbMode {
     #[default]
     Default,
-    Onearm,
-    Fullnat,
-    Dsr,
-    Fullproxy,
-    Hostonearm,
 }
 
 impl LbMode {
     pub fn code(self) -> u32 {
         match self {
             Self::Default => 0,
-            Self::Onearm => 1,
-            Self::Fullnat => 2,
-            Self::Dsr => 3,
-            Self::Fullproxy => 4,
-            Self::Hostonearm => 5,
-        }
-    }
-
-    pub fn preserves_client_ip(self) -> bool {
-        self == Self::Default
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LbSecurity {
-    None,
-    Https,
-    E2ehttps,
-}
-
-impl LbSecurity {
-    pub fn code(self) -> u32 {
-        match self {
-            Self::None => 0,
-            Self::Https => 1,
-            Self::E2ehttps => 2,
         }
     }
 }
@@ -284,33 +252,6 @@ mod return_id_tests {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct TargetEndpoint {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    #[serde(
-        default = "default_auto_ip",
-        deserialize_with = "deserialize_ip_auto",
-        serialize_with = "serialize_ip_auto"
-    )]
-    pub address: IpAddr,
-    pub port: u16,
-    #[serde(default = "default_backend_weight", alias = "backend_weight")]
-    pub weight: u32,
-}
-
-impl Default for TargetEndpoint {
-    fn default() -> Self {
-        Self {
-            backend: None,
-            address: default_auto_ip(),
-            port: 0,
-            weight: 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct BackendTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -366,13 +307,7 @@ pub struct Listener {
     pub protocols: Vec<Protocol>,
     pub select: LbSelect,
     pub mode: LbMode,
-    pub bgp: bool,
     pub inactive_timeout: Option<u32>,
-    pub mark: Option<u32>,
-    pub security: Option<LbSecurity>,
-    pub host: Option<String>,
-    pub proxy_protocol_v2: bool,
-    pub egress: bool,
 }
 
 impl Default for Listener {
@@ -386,132 +321,8 @@ impl Default for Listener {
             protocols: vec![Protocol::Tcp],
             select: LbSelect::Rr,
             mode: LbMode::Default,
-            bgp: false,
             inactive_timeout: None,
-            mark: None,
-            security: None,
-            host: None,
-            proxy_protocol_v2: false,
-            egress: false,
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Service {
-    pub name: String,
-    /// External port exposed by the generated runtime listener.
-    pub vip_port: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_group: Option<String>,
-    /// Preferred backend target: a backend node name learned through xDS.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    /// Backend underlay IP receiving the forward path.
-    #[serde(
-        default = "default_auto_ip",
-        deserialize_with = "deserialize_ip_auto",
-        serialize_with = "serialize_ip_auto"
-    )]
-    pub backend_ip: IpAddr,
-    /// Backend host port after cloud/host DNAT.
-    pub backend_port: u16,
-    /// Target weight used by weighted selection.
-    #[serde(default = "default_backend_weight", alias = "weight")]
-    pub backend_weight: u32,
-    /// Backend target selection algorithm.
-    pub select: LbSelect,
-    /// NAT/proxy mode. `default` preserves the real client IP in this
-    /// VXLAN return-path design.
-    pub mode: LbMode,
-    /// Announce the listener through BGP integration.
-    pub bgp: bool,
-    /// Enable target health monitoring for this runtime projection.
-    pub monitor: bool,
-    pub probe_type: Option<String>,
-    pub probe_port: Option<u16>,
-    pub probe_req: Option<String>,
-    pub probe_resp: Option<String>,
-    pub probe_status: Option<u16>,
-    pub probe_skip_tls_verify: bool,
-    pub period_secs: Option<u32>,
-    pub retries: Option<u32>,
-    /// Inactive timeout for stale flows. `None` keeps the datapath default.
-    pub inactive_timeout: Option<u32>,
-    /// Flow mark value used for traffic isolation.
-    pub mark: Option<u32>,
-    /// Optional security mode for TLS termination variants.
-    pub security: Option<LbSecurity>,
-    /// Optional host match for ingress/L7 modes.
-    pub host: Option<String>,
-    /// Enable proxy protocol v2.
-    pub proxy_protocol_v2: bool,
-    /// Create an egress listener rule.
-    pub egress: bool,
-    /// Single-protocol input used by command/API normalization. Stored
-    /// configuration writes `protocols`.
-    #[serde(default, skip_serializing)]
-    pub protocol: Option<Protocol>,
-    /// One or more protocols exposed by this projection. Use both tcp and udp
-    /// when the same VIP/backend port must serve both transport protocols.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub protocols: Vec<Protocol>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<TargetEndpoint>,
-}
-
-impl Default for Service {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            vip_port: 0,
-            target_group: None,
-            backend: None,
-            backend_ip: "0.0.0.0".parse().unwrap(),
-            backend_port: 0,
-            backend_weight: 1,
-            select: LbSelect::Rr,
-            mode: LbMode::Default,
-            bgp: false,
-            monitor: false,
-            probe_type: None,
-            probe_port: None,
-            probe_req: None,
-            probe_resp: None,
-            probe_status: None,
-            probe_skip_tls_verify: false,
-            period_secs: None,
-            retries: None,
-            inactive_timeout: None,
-            mark: None,
-            security: None,
-            host: None,
-            proxy_protocol_v2: false,
-            egress: false,
-            protocol: None,
-            protocols: Vec::new(),
-            endpoints: Vec::new(),
-        }
-    }
-}
-
-impl Service {
-    pub fn protocols(&self) -> Vec<Protocol> {
-        let source = if self.protocols.is_empty() {
-            self.protocol
-                .map(|p| vec![p])
-                .unwrap_or(vec![Protocol::Tcp])
-        } else {
-            self.protocols.clone()
-        };
-        let mut out = Vec::new();
-        for protocol in source {
-            if !out.contains(&protocol) {
-                out.push(protocol);
-            }
-        }
-        out
     }
 }
 
@@ -936,8 +747,6 @@ pub struct FileConfig {
     pub target_groups: Vec<TargetGroup>,
     pub listeners: Vec<Listener>,
     #[serde(skip)]
-    pub services: Vec<Service>,
-    #[serde(skip)]
     pub backend_return_ports: Vec<BackendReturnPort>,
     #[serde(skip)]
     pub runtime_discovery: RuntimeDiscovery,
@@ -964,7 +773,6 @@ impl Default for FileConfig {
             backend_nodes: Vec::new(),
             target_groups: Vec::new(),
             listeners: Vec::new(),
-            services: Vec::new(),
             backend_return_ports: Vec::new(),
             runtime_discovery: RuntimeDiscovery::default(),
             gateway: GatewayConfig::default(),

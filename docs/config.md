@@ -201,7 +201,7 @@ edge-lb DSCP filter 执行。可以共存，但白名单必须让 edge-lb 相关
 
 至少需要放行：
 
-- 业务监听端口，例如 TCP/UDP `48080`。
+- 业务监听端口，例如 TCP/UDP `80`。
 - VXLAN UDP `4789`。
 - gateway 间 HA/BFD 或控制面使用的端口。
 - backend 到 gateway 的 xDS TCP `22222`。
@@ -372,6 +372,6 @@ sudo journalctl -u edge-lb -f
 
 数据面验证重点：
 
-- `http://203.0.113.10:48080/health` 经过 gateway 正常。
-- `http://203.0.113.12:58080/health` 后端直连正常。
+- `http://203.0.113.10:80/health` 经过 gateway 正常。
+- `http://203.0.113.12:8080/health` 后端直连正常。
 - gateway 入方向 DSCP 打标，backend 回程走 VXLAN，后端应用能看到真实客户端 IP。

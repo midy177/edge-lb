@@ -18,10 +18,10 @@ use aya_ebpf::{
 };
 use aya_ebpf_cty::c_long;
 use edge_lb_common::{
-    DEFAULT_DSCP, DEFAULT_PORT, MAX_ENDPOINTS_PER_SERVICE, MAX_PORTS, NATIVE_SELECT_HASH,
+    DEFAULT_DSCP, DEFAULT_PORT, MAX_PORTS, MAX_TARGETS_PER_LISTENER, NATIVE_SELECT_HASH,
     NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR,
-    NativeEndpointKey, NativeEndpointLoadKey, NativeEndpointValue, NativeFlowEvent, NativeFlowKey,
-    NativeFlowValue, NativeServiceKey, NativeServiceValue, Stats,
+    NativeFlowEvent, NativeFlowKey, NativeFlowValue, NativeListenerLookupKey,
+    NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue, Stats,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -40,19 +40,18 @@ static DSCP_CFG: Array<u32> = Array::with_max_entries(1, 0);
 static STATS: PerCpuArray<Stats> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
-static NATIVE_SERVICES: HashMap<NativeServiceKey, NativeServiceValue> =
+static NATIVE_LISTENERS: HashMap<NativeListenerLookupKey, NativeListenerLookupValue> =
     HashMap::with_max_entries(4096, 0);
 
 #[map]
-static NATIVE_ENDPOINTS: HashMap<NativeEndpointKey, NativeEndpointValue> =
+static NATIVE_TARGETS: HashMap<NativeTargetKey, NativeTargetValue> =
     HashMap::with_max_entries(16384, 0);
 
 #[map]
 static NATIVE_RR_COUNTERS: Array<u32> = Array::with_max_entries(4096, 0);
 
 #[map]
-static NATIVE_ACTIVE_FLOWS: HashMap<NativeEndpointLoadKey, u32> =
-    HashMap::with_max_entries(16384, 0);
+static NATIVE_ACTIVE_FLOWS: HashMap<NativeTargetLoadKey, u32> = HashMap::with_max_entries(16384, 0);
 
 #[map]
 static NATIVE_FLOWS: LruHashMap<NativeFlowKey, NativeFlowValue> =
@@ -113,16 +112,16 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
     };
     let preserve_zero_udp_checksum =
         ip.proto == IpProto::Udp && u16::from_be(ctx.load::<u16>(l4_csum_off)?) == 0;
-    let service_key = NativeServiceKey {
+    let listener_key = NativeListenerLookupKey {
         vip: u32::from_be_bytes(ip.dst_addr),
         port: dport.to_be(),
         proto: ip.proto as u8,
         _pad: 0,
     };
-    let Some(service) = (unsafe { NATIVE_SERVICES.get(&service_key) }) else {
+    let Some(listener) = (unsafe { NATIVE_LISTENERS.get(&listener_key) }) else {
         return Ok(TC_ACT_PIPE);
     };
-    if service.endpoint_count == 0 {
+    if listener.target_count == 0 {
         native_bump(|stats| stats.target_miss += 1);
         return Ok(TC_ACT_PIPE);
     }
@@ -131,9 +130,9 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
     if let Some(existing) = unsafe { NATIVE_FLOWS.get(&flow_key) } {
         let existing = *existing;
         let reverse_key = make_flow_key(
-            existing.endpoint,
+            existing.target,
             existing.vip,
-            existing.endpoint_port,
+            existing.target_port,
             u16::from_be(existing.vip_port),
             ip.proto as u8,
         );
@@ -150,49 +149,49 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
                 // The packet still carries the listener VIP. Reuse the
                 // cached backend selection for every packet in the flow.
                 existing.vip,
-                existing.endpoint,
+                existing.target,
                 dport,
-                existing.endpoint_port,
+                existing.target_port,
             )?;
             if preserve_zero_udp_checksum {
                 ctx.store(l4_csum_off, &0u16, 0)?;
             }
-            native_bump(|stats| stats.service_hit += 1);
+            native_bump(|stats| stats.listener_hit += 1);
             native_bump(|stats| stats.rewritten += 1);
             return Ok(TC_ACT_PIPE);
         }
         let _ = NATIVE_FLOWS.remove(&flow_key);
         let _ = NATIVE_FLOWS.remove(&reverse_key);
-        adjust_active_flows(existing.service_id, existing.endpoint_id, -1);
+        adjust_active_flows(existing.listener_id, existing.target_id, -1);
         emit_flow_event(flow_key, existing, 2);
         emit_flow_event(reverse_key, existing, 2);
     }
-    let packet_hash = if service.select == NATIVE_SELECT_HASH {
+    let packet_hash = if listener.select == NATIVE_SELECT_HASH {
         unsafe { bpf_get_hash_recalc(ctx.as_ptr() as *mut __sk_buff) }
     } else {
         0
     };
-    let endpoint_id = select_endpoint(&flow_key, service, packet_hash);
-    if endpoint_id >= MAX_ENDPOINTS_PER_SERVICE {
+    let target_id = select_target(&flow_key, listener, packet_hash);
+    if target_id >= MAX_TARGETS_PER_LISTENER {
         native_bump(|stats| stats.target_miss += 1);
         return Ok(TC_ACT_PIPE);
     }
-    let endpoint_key = NativeEndpointKey {
-        service_id: service.service_id,
-        endpoint_id,
+    let target_key = NativeTargetKey {
+        listener_id: listener.listener_id,
+        target_id,
     };
-    let Some(endpoint) = (unsafe { NATIVE_ENDPOINTS.get(&endpoint_key) }) else {
+    let Some(target) = (unsafe { NATIVE_TARGETS.get(&target_key) }) else {
         native_bump(|stats| stats.target_miss += 1);
         return Ok(TC_ACT_PIPE);
     };
-    if endpoint.flags & 1 == 0 || endpoint.weight == 0 {
+    if target.flags & 1 == 0 || target.weight == 0 {
         native_bump(|stats| stats.target_miss += 1);
         return Ok(TC_ACT_PIPE);
     }
     let old_dst = u32::from_be_bytes(ip.dst_addr);
     let old_port = dport;
-    let new_dst = endpoint.address;
-    let new_port = endpoint.port;
+    let new_dst = target.address;
+    let new_port = target.port;
     let reverse_key = make_flow_key(
         new_dst,
         u32::from_be_bytes(ip.src_addr),
@@ -201,18 +200,18 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
         ip.proto as u8,
     );
     let value = NativeFlowValue {
-        service_id: service.service_id,
-        endpoint_id,
+        listener_id: listener.listener_id,
+        target_id,
         vip: old_dst,
-        endpoint: new_dst,
+        target: new_dst,
         vip_port: old_port.to_be(),
-        endpoint_port: new_port,
-        timeout_secs: service.timeout_secs,
+        target_port: new_port,
+        timeout_secs: listener.timeout_secs,
         last_seen_ns: now,
     };
     let _ = NATIVE_FLOWS.insert(&flow_key, &value, 0);
     let _ = NATIVE_FLOWS.insert(&reverse_key, &value, 0);
-    adjust_active_flows(service.service_id, endpoint_id, 1);
+    adjust_active_flows(listener.listener_id, target_id, 1);
     emit_flow_event(flow_key, value, 1);
     emit_flow_event(reverse_key, value, 1);
     rewrite_ipv4_destination(
@@ -228,7 +227,7 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
     if preserve_zero_udp_checksum {
         ctx.store(l4_csum_off, &0u16, 0)?;
     }
-    native_bump(|stats| stats.service_hit += 1);
+    native_bump(|stats| stats.listener_hit += 1);
     native_bump(|stats| stats.rewritten += 1);
     Ok(TC_ACT_PIPE)
 }
@@ -310,7 +309,7 @@ fn try_native_dnat_return(mut ctx: TcContext) -> Result<i32, c_long> {
             ip.proto as u8,
         );
         let _ = NATIVE_FLOWS.remove(&forward_key);
-        adjust_active_flows(flow.service_id, flow.endpoint_id, -1);
+        adjust_active_flows(flow.listener_id, flow.target_id, -1);
         emit_flow_event(key, flow, 2);
         emit_flow_event(forward_key, flow, 2);
         native_bump(|stats| stats.return_miss += 1);
@@ -332,7 +331,7 @@ fn try_native_dnat_return(mut ctx: TcContext) -> Result<i32, c_long> {
         ip_off,
         l4_off,
         l4_csum_off,
-        flow.endpoint,
+        flow.target,
         flow.vip,
         sport,
         u16::from_be(flow.vip_port),
@@ -373,96 +372,100 @@ fn flow_expired(last_seen_ns: u64, timeout_secs: u32, now_ns: u64) -> bool {
     now_ns.saturating_sub(last_seen_ns) > timeout_secs as u64 * 1_000_000_000
 }
 
-fn select_endpoint(key: &NativeFlowKey, service: &NativeServiceValue, packet_hash: u32) -> u32 {
-    if service.endpoint_count == 0 {
-        return MAX_ENDPOINTS_PER_SERVICE;
+fn select_target(
+    key: &NativeFlowKey,
+    listener: &NativeListenerLookupValue,
+    packet_hash: u32,
+) -> u32 {
+    if listener.target_count == 0 {
+        return MAX_TARGETS_PER_LISTENER;
     }
-    let count = if service.endpoint_count < MAX_ENDPOINTS_PER_SERVICE {
-        service.endpoint_count
+    let count = if listener.target_count < MAX_TARGETS_PER_LISTENER {
+        listener.target_count
     } else {
-        MAX_ENDPOINTS_PER_SERVICE
+        MAX_TARGETS_PER_LISTENER
     };
-    if service.weight_total == 0 || service.endpoint_count == 0 {
-        return MAX_ENDPOINTS_PER_SERVICE;
+    if listener.weight_total == 0 || listener.target_count == 0 {
+        return MAX_TARGETS_PER_LISTENER;
     }
-    match service.select {
+    match listener.select {
         // rr rotates over healthy target slots and ignores weight. Priority is
         // the weighted mode.
-        NATIVE_SELECT_RR => select_round_robin(service, count),
-        NATIVE_SELECT_PRIORITY => select_weighted_round_robin(service, count),
+        NATIVE_SELECT_RR => select_round_robin(listener, count),
+        NATIVE_SELECT_PRIORITY => select_weighted_round_robin(listener, count),
         // hash uses the kernel skb hash modulo target slots.
-        NATIVE_SELECT_HASH => select_hash_slot(packet_hash, service, count),
+        NATIVE_SELECT_HASH => select_hash_slot(packet_hash, listener, count),
         // persist is stable per client address, unlike hash which includes
         // transport ports and therefore distributes new client connections.
-        NATIVE_SELECT_PERSIST => select_persist_slot(key.src, service, count),
-        // lc chooses the healthy endpoint with the fewest active flows. Ties
-        // rotate through the per-service cursor so an empty service does not
-        // send every first flow to endpoint zero.
-        NATIVE_SELECT_LC => select_least_connections(service, count),
+        NATIVE_SELECT_PERSIST => select_persist_slot(key.src, listener, count),
+        // lc chooses the healthy target with the fewest active flows. Ties
+        // rotate through the per-listener cursor so an empty listener does not
+        // send every first flow to target zero.
+        NATIVE_SELECT_LC => select_least_connections(listener, count),
         // Unknown/default selectors fall back to RR. N2/N3 need metadata
         // outside this pure TCP/UDP DNAT model.
-        _ => select_round_robin(service, count),
+        _ => select_round_robin(listener, count),
     }
 }
 
-fn select_weighted_hash(hash: u32, service: &NativeServiceValue, count: u32) -> u32 {
-    if service.weight_total == 0 {
-        return MAX_ENDPOINTS_PER_SERVICE;
+fn select_weighted_hash(hash: u32, listener: &NativeListenerLookupValue, count: u32) -> u32 {
+    if listener.weight_total == 0 {
+        return MAX_TARGETS_PER_LISTENER;
     }
-    let mut cursor = hash % service.weight_total;
+    let mut cursor = hash % listener.weight_total;
     // Compile-time bound keeps this a bounded loop for the verifier; the
     // runtime-bound while-loop exceeded the kernel's jump-sequence limit.
     let mut index: u32 = 0;
-    while index < MAX_ENDPOINTS_PER_SERVICE {
+    while index < MAX_TARGETS_PER_LISTENER {
         if index >= count {
             break;
         }
-        let endpoint_key = NativeEndpointKey {
-            service_id: service.service_id,
-            endpoint_id: index,
+        let target_key = NativeTargetKey {
+            listener_id: listener.listener_id,
+            target_id: index,
         };
-        if let Some(endpoint) = unsafe { NATIVE_ENDPOINTS.get(&endpoint_key) } {
-            if endpoint.flags & 1 != 0 && endpoint.weight > 0 {
-                if cursor < endpoint.weight as u32 {
+        if let Some(target) = unsafe { NATIVE_TARGETS.get(&target_key) } {
+            if target.flags & 1 != 0 && target.weight > 0 {
+                if cursor < target.weight as u32 {
                     return index;
                 }
-                cursor -= endpoint.weight as u32;
+                cursor -= target.weight as u32;
             }
         }
         index += 1;
     }
-    MAX_ENDPOINTS_PER_SERVICE
+    MAX_TARGETS_PER_LISTENER
 }
 
-fn select_hash_slot(hash: u32, service: &NativeServiceValue, count: u32) -> u32 {
+fn select_hash_slot(hash: u32, listener: &NativeListenerLookupValue, count: u32) -> u32 {
     if count == 0 {
-        return MAX_ENDPOINTS_PER_SERVICE;
+        return MAX_TARGETS_PER_LISTENER;
     }
     let candidate = hash % count;
-    if endpoint_slot_is_usable(service.service_id, candidate) {
+    if target_slot_is_usable(listener.listener_id, candidate) {
         return candidate;
     }
-    first_usable_endpoint(service.service_id, count)
+    first_usable_target(listener.listener_id, count)
 }
 
-fn select_persist_slot(client_ip: u32, service: &NativeServiceValue, count: u32) -> u32 {
+fn select_persist_slot(client_ip: u32, listener: &NativeListenerLookupValue, count: u32) -> u32 {
     if count == 0 {
-        return MAX_ENDPOINTS_PER_SERVICE;
+        return MAX_TARGETS_PER_LISTENER;
     }
     let primary = ((client_ip & 0xff) ^ ((client_ip >> 24) & 0xff)) % count;
-    if endpoint_slot_is_usable(service.service_id, primary) {
+    if target_slot_is_usable(listener.listener_id, primary) {
         return primary;
     }
     let secondary = (((client_ip >> 8) & 0xff) ^ ((client_ip >> 16) & 0xff)) % count;
-    if endpoint_slot_is_usable(service.service_id, secondary) {
+    if target_slot_is_usable(listener.listener_id, secondary) {
         return secondary;
     }
-    first_usable_endpoint(service.service_id, count)
+    first_usable_target(listener.listener_id, count)
 }
 
-fn select_weighted_round_robin(service: &NativeServiceValue, count: u32) -> u32 {
-    // Service IDs start at one, while Array indexes start at zero.
-    let index = service.service_id.saturating_sub(1);
+fn select_weighted_round_robin(listener: &NativeListenerLookupValue, count: u32) -> u32 {
+    // Listener IDs start at one, while Array indexes start at zero.
+    let index = listener.listener_id.saturating_sub(1);
     let cursor = NATIVE_RR_COUNTERS
         .get_ptr_mut(index)
         .map(|ptr| {
@@ -471,11 +474,11 @@ fn select_weighted_round_robin(service: &NativeServiceValue, count: u32) -> u32 
             current
         })
         .unwrap_or(0);
-    select_weighted_hash(cursor, service, count)
+    select_weighted_hash(cursor, listener, count)
 }
 
-fn select_round_robin(service: &NativeServiceValue, count: u32) -> u32 {
-    let index = service.service_id.saturating_sub(1);
+fn select_round_robin(listener: &NativeListenerLookupValue, count: u32) -> u32 {
+    let index = listener.listener_id.saturating_sub(1);
     let cursor = NATIVE_RR_COUNTERS
         .get_ptr_mut(index)
         .map(|ptr| {
@@ -485,50 +488,50 @@ fn select_round_robin(service: &NativeServiceValue, count: u32) -> u32 {
         })
         .unwrap_or(0);
     let mut offset = 0u32;
-    while offset < MAX_ENDPOINTS_PER_SERVICE {
+    while offset < MAX_TARGETS_PER_LISTENER {
         if offset >= count {
             break;
         }
         let candidate = cursor.wrapping_add(offset) % count;
-        if endpoint_slot_is_usable(service.service_id, candidate) {
+        if target_slot_is_usable(listener.listener_id, candidate) {
             return candidate;
         }
         offset += 1;
     }
-    MAX_ENDPOINTS_PER_SERVICE
+    MAX_TARGETS_PER_LISTENER
 }
 
-fn first_usable_endpoint(service_id: u32, count: u32) -> u32 {
+fn first_usable_target(listener_id: u32, count: u32) -> u32 {
     let mut index = 0u32;
-    while index < MAX_ENDPOINTS_PER_SERVICE {
+    while index < MAX_TARGETS_PER_LISTENER {
         if index >= count {
             break;
         }
-        if endpoint_slot_is_usable(service_id, index) {
+        if target_slot_is_usable(listener_id, index) {
             return index;
         }
         index += 1;
     }
-    MAX_ENDPOINTS_PER_SERVICE
+    MAX_TARGETS_PER_LISTENER
 }
 
-fn endpoint_slot_is_usable(service_id: u32, endpoint_id: u32) -> bool {
-    let endpoint_key = NativeEndpointKey {
-        service_id,
-        endpoint_id,
+fn target_slot_is_usable(listener_id: u32, target_id: u32) -> bool {
+    let target_key = NativeTargetKey {
+        listener_id,
+        target_id,
     };
-    if let Some(endpoint) = unsafe { NATIVE_ENDPOINTS.get(&endpoint_key) } {
-        endpoint.flags & 1 != 0 && endpoint.weight > 0
+    if let Some(target) = unsafe { NATIVE_TARGETS.get(&target_key) } {
+        target.flags & 1 != 0 && target.weight > 0
     } else {
         false
     }
 }
 
-fn select_least_connections(service: &NativeServiceValue, count: u32) -> u32 {
-    let mut best = MAX_ENDPOINTS_PER_SERVICE;
+fn select_least_connections(listener: &NativeListenerLookupValue, count: u32) -> u32 {
+    let mut best = MAX_TARGETS_PER_LISTENER;
     let mut best_load = u32::MAX;
     let cursor = NATIVE_RR_COUNTERS
-        .get_ptr_mut(service.service_id.saturating_sub(1))
+        .get_ptr_mut(listener.listener_id.saturating_sub(1))
         .map(|ptr| {
             let current = unsafe { *ptr };
             unsafe { *ptr = current.wrapping_add(1) };
@@ -536,20 +539,20 @@ fn select_least_connections(service: &NativeServiceValue, count: u32) -> u32 {
         })
         .unwrap_or(0);
     let mut index = 0u32;
-    while index < MAX_ENDPOINTS_PER_SERVICE {
+    while index < MAX_TARGETS_PER_LISTENER {
         if index < count {
             let candidate = (cursor.wrapping_add(index)) % count;
-            let key = NativeEndpointKey {
-                service_id: service.service_id,
-                endpoint_id: candidate,
+            let key = NativeTargetKey {
+                listener_id: listener.listener_id,
+                target_id: candidate,
             };
-            if let Some(endpoint) = unsafe { NATIVE_ENDPOINTS.get(&key) }
-                && endpoint.flags & 1 != 0
-                && endpoint.weight > 0
+            if let Some(target) = unsafe { NATIVE_TARGETS.get(&key) }
+                && target.flags & 1 != 0
+                && target.weight > 0
             {
-                let load_key = NativeEndpointLoadKey {
-                    service_id: service.service_id,
-                    endpoint_id: candidate,
+                let load_key = NativeTargetLoadKey {
+                    listener_id: listener.listener_id,
+                    target_id: candidate,
                 };
                 let load = unsafe { NATIVE_ACTIVE_FLOWS.get(&load_key) }
                     .copied()
@@ -565,10 +568,10 @@ fn select_least_connections(service: &NativeServiceValue, count: u32) -> u32 {
     best
 }
 
-fn adjust_active_flows(service_id: u32, endpoint_id: u32, delta: i32) {
-    let key = NativeEndpointLoadKey {
-        service_id,
-        endpoint_id,
+fn adjust_active_flows(listener_id: u32, target_id: u32, delta: i32) {
+    let key = NativeTargetLoadKey {
+        listener_id,
+        target_id,
     };
     let current = unsafe { NATIVE_ACTIVE_FLOWS.get(&key) }
         .copied()

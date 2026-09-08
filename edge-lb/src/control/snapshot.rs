@@ -306,7 +306,6 @@ fn file_from_snapshot(base: &Config, snapshot: &ConfigSnapshot) -> Result<FileCo
     let local = local_backend_for_snapshot(base, &file)?;
     file.listeners.clear();
     file.target_groups.clear();
-    file.services.clear();
     file.backend_return_ports = snapshot
         .backend_return_ports
         .iter()
@@ -457,8 +456,7 @@ fn parse_ip(value: &str, name: &str) -> Result<IpAddr> {
 mod tests {
     use super::*;
     use crate::config::{
-        BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole, Service,
-        TargetEndpoint, TargetGroup,
+        BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole, TargetGroup,
     };
     use std::{fs, path::PathBuf};
 
@@ -527,7 +525,7 @@ mod tests {
                         backend: "backend-1".to_string(),
                         address: "192.0.2.22".to_string(),
                         protocol: "tcp".to_string(),
-                        port: 58080,
+                        port: 8080,
                         gateway: name.to_string(),
                         gateway_underlay_ip: gateway_ip.to_string(),
                         gateway_overlay_ip: if name == "gateway-a" {
@@ -654,7 +652,6 @@ mod tests {
             underlay_ip: "192.0.2.23".parse().unwrap(),
             overlay_ip: "10.255.255.3/24".to_string(),
         }];
-        base_file.services.clear();
         let base = Config {
             path: PathBuf::from("/tmp/edge-lb-test.toml"),
             file: base_file,
@@ -697,21 +694,21 @@ mod tests {
                     backend: "backend-2".to_string(),
                     address: "192.0.2.23".to_string(),
                     protocol: "tcp".to_string(),
-                    port: 58080,
+                    port: 8080,
                     ..Default::default()
                 },
                 pb::BackendReturnPort {
                     backend: "backend-2".to_string(),
                     address: "192.0.2.23".to_string(),
                     protocol: "udp".to_string(),
-                    port: 58080,
+                    port: 8080,
                     ..Default::default()
                 },
                 pb::BackendReturnPort {
                     backend: "backend-1".to_string(),
                     address: "192.0.2.22".to_string(),
                     protocol: "tcp".to_string(),
-                    port: 58081,
+                    port: 8081,
                     ..Default::default()
                 },
             ],
@@ -721,14 +718,13 @@ mod tests {
 
         assert!(file.listeners.is_empty());
         assert!(file.target_groups.is_empty());
-        assert!(file.services.is_empty());
         assert_eq!(file.backend_return_ports.len(), 2);
         assert_eq!(file.backend_return_ports[0].address, local_ip("192.0.2.23"));
-        assert_eq!(file.backend_return_ports[0].port, 58080);
+        assert_eq!(file.backend_return_ports[0].port, 8080);
     }
 
     #[test]
-    fn backend_snapshot_excludes_listener_services() {
+    fn backend_snapshot_excludes_business_listener_resources() {
         let backend_ip = local_ip("192.0.2.23");
         let cfg = Config {
             file: FileConfig {
@@ -744,32 +740,24 @@ mod tests {
                     underlay_ip: backend_ip,
                     overlay_ip: "10.255.255.2/24".to_string(),
                 }],
-                services: vec![
-                    Service {
-                        name: "tcp-48080".to_string(),
-                        vip_port: 48080,
-                        backend_ip,
-                        backend_port: 58080,
-                        protocols: vec![Protocol::Tcp],
-                        mode: LbMode::Default,
-                        ..Service::default()
-                    },
-                    Service {
-                        name: "tcp-48080".to_string(),
-                        vip_port: 48080,
-                        backend_ip,
-                        backend_port: 58080,
-                        protocols: vec![Protocol::Tcp],
-                        mode: LbMode::Default,
-                        endpoints: vec![TargetEndpoint {
-                            backend: Some("backend-1".to_string()),
-                            address: backend_ip,
-                            port: 58080,
-                            weight: 1,
-                        }],
-                        ..Service::default()
-                    },
-                ],
+                target_groups: vec![TargetGroup {
+                    name: "targets".to_string(),
+                    targets: vec![BackendTarget {
+                        backend: Some("backend-1".to_string()),
+                        address: backend_ip,
+                        weight: 1,
+                    }],
+                    ..TargetGroup::default()
+                }],
+                listeners: vec![Listener {
+                    name: "tcp-80".to_string(),
+                    port: 80,
+                    target_port: 8080,
+                    target_group: "targets".to_string(),
+                    protocols: vec![Protocol::Tcp],
+                    mode: LbMode::Default,
+                    ..Listener::default()
+                }],
                 ..FileConfig::default()
             },
             path: PathBuf::from("/tmp/edge-lb-test.toml"),
@@ -781,27 +769,47 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_return_ports_include_only_default_mode_services() {
+    fn snapshot_return_ports_include_all_native_listeners() {
         let cfg = Config {
             file: FileConfig {
-                services: vec![
-                    Service {
+                target_groups: vec![
+                    TargetGroup {
+                        name: "default-targets".to_string(),
+                        targets: vec![BackendTarget {
+                            address: "192.0.2.23".parse().unwrap(),
+                            weight: 1,
+                            ..BackendTarget::default()
+                        }],
+                        ..TargetGroup::default()
+                    },
+                    TargetGroup {
+                        name: "secondary-targets".to_string(),
+                        targets: vec![BackendTarget {
+                            address: "192.0.2.23".parse().unwrap(),
+                            weight: 1,
+                            ..BackendTarget::default()
+                        }],
+                        ..TargetGroup::default()
+                    },
+                ],
+                listeners: vec![
+                    Listener {
                         name: "default".to_string(),
-                        vip_port: 48080,
-                        backend_ip: "192.0.2.23".parse().unwrap(),
-                        backend_port: 58080,
+                        port: 80,
+                        target_port: 8080,
+                        target_group: "default-targets".to_string(),
                         protocols: vec![Protocol::Tcp],
                         mode: LbMode::Default,
-                        ..Service::default()
+                        ..Listener::default()
                     },
-                    Service {
-                        name: "fullnat".to_string(),
-                        vip_port: 48081,
-                        backend_ip: "192.0.2.23".parse().unwrap(),
-                        backend_port: 58081,
+                    Listener {
+                        name: "secondary".to_string(),
+                        port: 81,
+                        target_port: 8081,
+                        target_group: "secondary-targets".to_string(),
                         protocols: vec![Protocol::Tcp],
-                        mode: LbMode::Fullnat,
-                        ..Service::default()
+                        mode: LbMode::Default,
+                        ..Listener::default()
                     },
                 ],
                 ..FileConfig::default()
@@ -811,9 +819,11 @@ mod tests {
 
         let ports = backend_return_ports_from_config(&cfg);
 
-        assert_eq!(ports.len(), 1);
-        assert_eq!(ports[0].port, 58080);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port, 8080);
         assert_eq!(ports[0].address, local_ip("192.0.2.23"));
+        assert_eq!(ports[1].port, 8081);
+        assert_eq!(ports[1].address, local_ip("192.0.2.23"));
     }
 
     #[test]
@@ -858,8 +868,8 @@ mod tests {
                 }],
                 listeners: vec![Listener {
                     name: "multi-backend".to_string(),
-                    port: 48080,
-                    target_port: 58081,
+                    port: 80,
+                    target_port: 8081,
                     target_group: "targets".to_string(),
                     protocols: vec![Protocol::Tcp],
                     mode: LbMode::Default,
@@ -875,11 +885,11 @@ mod tests {
         assert_eq!(snapshot.backend_nodes.len(), 2);
         assert_eq!(snapshot.backend_return_ports.len(), 1);
         assert_eq!(snapshot.backend_return_ports[0].address, "192.0.2.21");
-        assert_eq!(snapshot.backend_return_ports[0].port, 58081);
+        assert_eq!(snapshot.backend_return_ports[0].port, 8081);
     }
 
     #[test]
-    fn snapshot_version_changes_when_default_mode_return_path_changes() {
+    fn snapshot_version_changes_when_return_path_changes() {
         let mut file = FileConfig {
             node_role: NodeRole::Gateway,
             target_groups: vec![TargetGroup {
@@ -893,8 +903,8 @@ mod tests {
             }],
             listeners: vec![Listener {
                 name: "listener".to_string(),
-                port: 48080,
-                target_port: 58080,
+                port: 80,
+                target_port: 8080,
                 target_group: "listener-targets".to_string(),
                 protocols: vec![Protocol::Tcp],
                 mode: LbMode::Default,
@@ -910,15 +920,15 @@ mod tests {
         let default_version = version(&default_cfg).unwrap();
         assert_eq!(backend_return_ports_from_config(&default_cfg).len(), 1);
 
-        file.listeners[0].mode = LbMode::Fullnat;
+        file.listeners[0].target_port = 8081;
         file.normalize();
-        let fullnat_cfg = Config {
+        let changed_cfg = Config {
             file,
             path: PathBuf::from("/tmp/edge-lb-test.toml"),
         };
-        let fullnat_version = version(&fullnat_cfg).unwrap();
-        assert!(backend_return_ports_from_config(&fullnat_cfg).is_empty());
-        assert_ne!(default_version, fullnat_version);
+        let changed_version = version(&changed_cfg).unwrap();
+        assert_eq!(backend_return_ports_from_config(&changed_cfg).len(), 1);
+        assert_ne!(default_version, changed_version);
     }
 
     #[test]

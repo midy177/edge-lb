@@ -14,10 +14,10 @@ edge-lb 将 native default DNAT、DSCP 标记和 VXLAN 回程封装成一个可�
 ```mermaid
 flowchart LR
     client["客户端"]
-    gw_pub["gateway 公网入口<br/>203.0.113.10:48080"]
+    gw_pub["gateway 公网入口<br/>203.0.113.10:80"]
     marker["eth0 ingress<br/>DSCP marker pref 1"]
     lb["edge-lb native DNAT<br/>default mode"]
-    backend["backend underlay<br/>192.168.0.14/192.168.0.16:58080"]
+    backend["backend underlay<br/>192.168.0.14/192.168.0.16:8080"]
     app["后端应用"]
     nft["backend nft<br/>ct mark + fwmark"]
     ret["edge-return<br/>VXLAN 回程"]

@@ -72,7 +72,7 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
         n.vxlan_port,
         n.vxlan_mtu,
         n.dscp,
-        cfg.services.len(),
+        cfg.listeners.len(),
         backend_peers.len(),
     );
     warn_if_underlay_xdp_present(cfg, &[]);
@@ -122,43 +122,52 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
     let mut state = AgentState::load(Path::new(&*cfg.state_dir))?;
     state.created_vxlan = created;
 
-    let mut service_cfg = cfg.clone();
-    let hydrated = match native::hydrate_proxy_config_from_api(&mut service_cfg) {
+    let mut runtime_cfg = cfg.clone();
+    let hydrated = match native::hydrate_proxy_config_from_api(&mut runtime_cfg) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!("[gateway] loading native proxy state failed: {e:#}");
-            service_cfg = cfg.clone();
+            runtime_cfg = cfg.clone();
             false
         }
     };
-    if let Err(error) = restore_business_listeners(&mut service_cfg) {
+    if let Err(error) = restore_business_config(&mut runtime_cfg) {
         tracing::warn!("[gateway] restoring SQLite listeners skipped: {error:#}");
     }
 
-    // 4. Listener runtime rules. DSCP return-path marking is derived later only from
+    // 4. Native listeners. DSCP return-path marking is derived later only from
     // default-mode listeners because they preserve real client IPs.
-    for svc in &service_cfg.services {
-        if service_cfg.service_endpoints(svc).iter().any(|endpoint| {
-            service_cfg
-                .resolve_endpoint_address(endpoint)
+    for listener in &runtime_cfg.listeners {
+        let Some(group) = runtime_cfg
+            .target_groups
+            .iter()
+            .find(|group| group.name == listener.target_group)
+        else {
+            tracing::warn!(
+                "[gateway] listener {} skipped: target group {} not found",
+                listener.name,
+                listener.target_group
+            );
+            continue;
+        };
+        if group.targets.iter().any(|target| {
+            runtime_cfg
+                .resolve_backend_target_address(target)
                 .is_unspecified()
         }) {
             tracing::warn!(
-                "[gateway] service {} skipped: unresolved endpoint (target_group={} vip_port={} protocols={:?})",
-                svc.name,
-                svc.target_group.as_deref().unwrap_or("unbound"),
-                svc.vip_port,
-                svc.protocols()
+                "[gateway] listener {} skipped: unresolved target (target_group={} port={} protocols={:?})",
+                listener.name,
+                listener.target_group,
+                listener.port,
+                listener.protocols
             );
             continue;
         }
-        match native::ensure_runtime_rule(&service_cfg, svc)? {
-            "created" => tracing::info!("[gateway] listener rule created for {}", svc.name),
-            "updated" => tracing::debug!("[gateway] listener rule reconciled for {}", svc.name),
-            _ => tracing::debug!("[gateway] listener rule unchanged for {}", svc.name),
-        }
+        native::create_or_update_listener(&runtime_cfg, listener)?;
+        tracing::debug!("[gateway] listener rule reconciled for {}", listener.name);
     }
-    let mut ports = dscp_ports(&service_cfg);
+    let mut ports = dscp_ports(&runtime_cfg);
     if ports.is_empty() && !hydrated {
         ports = state.dscp_ports.clone();
         ports.sort_unstable();
@@ -175,11 +184,13 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
 
     // 2. Native default-DNAT datapath. It owns the listener and target maps,
     // while the DSCP marker remains a separate classifier in this phase.
-    if service_cfg.services.is_empty() {
-        crate::linux::native_dnat::cleanup(&service_cfg).ok();
+    let native_listeners = native::listeners_from_config(&runtime_cfg)
+        .with_context(|| "building native listener config")?;
+    if native_listeners.is_empty() {
+        crate::linux::native_dnat::cleanup(&runtime_cfg).ok();
         tracing::info!("[gateway] native DNAT detached: no listeners configured");
     } else {
-        crate::linux::native_dnat::apply(&service_cfg)
+        crate::linux::native_dnat::apply(&runtime_cfg)
             .with_context(|| "applying native DNAT datapath")?;
         tracing::debug!("[gateway] native DNAT datapath reconciled and maps refreshed");
     }
@@ -254,68 +265,15 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
     Ok(dscp_update)
 }
 
-fn restore_business_listeners(cfg: &mut Config) -> Result<()> {
+fn restore_business_config(cfg: &mut Config) -> Result<()> {
     let listeners = crate::api::load_persisted_listeners(cfg)?;
-    if listeners.is_empty() {
-        return Ok(());
-    }
     let groups = native::target_groups_native(cfg)?;
-    cfg.file.target_groups = groups.clone();
-    cfg.file.services.clear();
-    for listener in listeners {
-        let Some(group) = groups
-            .iter()
-            .find(|group| group.name == listener.target_group)
-        else {
-            tracing::warn!(
-                "[gateway] listener {} skipped: target group {} not found",
-                listener.name,
-                listener.target_group
-            );
-            continue;
-        };
-        let endpoints = group
-            .targets
-            .iter()
-            .map(|target| crate::config::TargetEndpoint {
-                backend: target.backend.clone(),
-                address: cfg.resolve_backend_target_address(target),
-                port: listener.target_port,
-                weight: target.weight,
-            })
-            .collect::<Vec<_>>();
-        let Some(first) = endpoints.first() else {
-            continue;
-        };
-        cfg.file.services.push(crate::config::Service {
-            name: listener.name,
-            vip_port: listener.port,
-            target_group: Some(group.name.clone()),
-            backend: first.backend.clone(),
-            backend_ip: first.address,
-            backend_port: first.port,
-            backend_weight: first.weight,
-            select: listener.select,
-            mode: listener.mode,
-            monitor: group.monitor,
-            probe_type: group.probe_type.clone(),
-            probe_port: group.probe_port,
-            probe_req: group.probe_req.clone(),
-            probe_resp: group.probe_resp.clone(),
-            probe_status: group.probe_status,
-            probe_skip_tls_verify: group.probe_skip_tls_verify,
-            period_secs: group.period_secs,
-            retries: group.retries,
-            inactive_timeout: listener.inactive_timeout,
-            protocols: listener.protocols.clone(),
-            endpoints,
-            ..crate::config::Service::default()
-        });
-    }
-    if !cfg.file.services.is_empty() {
+    cfg.file.target_groups = groups;
+    cfg.file.listeners = listeners;
+    if !cfg.file.listeners.is_empty() {
         tracing::info!(
             "[gateway] restored {} listener(s) from SQLite business configuration",
-            cfg.file.services.len()
+            cfg.file.listeners.len()
         );
     }
     Ok(())
@@ -362,7 +320,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         cfg.network().vxlan_dev,
         cfg.network().underlay_dev,
         is_active_gateway(&cfg),
-        cfg.services.len(),
+        cfg.listeners.len(),
         control::active_backend_nodes(&cfg)
             .map(|nodes| nodes.len())
             .unwrap_or_default(),
@@ -535,10 +493,9 @@ fn spawn_flow_sync_worker(cfg: &Config) {
 
 fn dscp_ports(cfg: &Config) -> Vec<u32> {
     let mut ports = cfg
-        .services
+        .listeners
         .iter()
-        .filter(|svc| svc.mode.preserves_client_ip())
-        .map(|s| s.vip_port as u32)
+        .map(|listener| listener.port as u32)
         .collect::<Vec<_>>();
     ports.sort_unstable();
     ports.dedup();
@@ -609,19 +566,28 @@ pub fn show(cfg: &Config) -> Result<()> {
     section("native listeners");
     println!(
         "{}",
-        serde_json::to_string_pretty(&native::runtime_rules_native(cfg)?).unwrap_or_default()
+        serde_json::to_string_pretty(&native::native_listeners_state(cfg)?).unwrap_or_default()
     );
     section("dscp marker stats");
     match dscp::stats(cfg) {
         Ok(s) => println!("matched={} changed={}", s.matched, s.changed),
         Err(e) => println!("(unavailable: {e})"),
     }
-    section("desired runtime rules");
-    for svc in &cfg.services {
-        for lb in native::desired_runtime_rules(cfg, svc) {
+    section("desired native listeners");
+    let mut runtime_cfg = cfg.clone();
+    if let Err(error) = native::hydrate_proxy_config_from_api(&mut runtime_cfg)
+        .and_then(|()| restore_business_config(&mut runtime_cfg))
+    {
+        println!("(unavailable: {error:#})");
+    } else {
+        for lb in native::listeners_from_config(&runtime_cfg)? {
             println!(
-                "{}: {} {}:{} -> {}:{}",
-                svc.name, lb.vip_ip, lb.protocol, lb.vip_port, lb.backend_ip, lb.backend_port
+                "{}: {} {:?}:{} -> {} target(s)",
+                lb.name,
+                lb.key.vip_ip,
+                lb.key.protocol,
+                lb.key.vip_port,
+                lb.targets.len()
             );
         }
     }
@@ -650,8 +616,8 @@ pub fn cleanup(cfg: &Config, opts: &CleanupOptions) -> Result<()> {
     }
 
     if opts.rules {
-        for svc in &cfg.services {
-            native::delete_runtime_rule(cfg, svc).ok();
+        for listener in crate::api::load_persisted_listeners(cfg).unwrap_or_default() {
+            native::delete_listener(cfg, &listener.name).ok();
         }
         println!("[gateway] managed listener rules removed");
     }
@@ -665,33 +631,35 @@ fn section(title: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FileConfig, LbMode, Protocol, Service};
+    use crate::config::{BackendTarget, FileConfig, LbMode, Listener, Protocol, TargetGroup};
 
     #[test]
-    fn dscp_ports_include_only_default_mode_listeners() {
+    fn dscp_ports_include_all_native_listeners() {
         let cfg = Config {
             file: FileConfig {
-                services: vec![
-                    Service {
+                target_groups: vec![TargetGroup {
+                    name: "default-targets".to_string(),
+                    targets: vec![BackendTarget::default()],
+                    ..TargetGroup::default()
+                }],
+                listeners: vec![
+                    Listener {
                         name: "default".to_string(),
-                        vip_port: 48080,
+                        port: 80,
+                        target_port: 8080,
+                        target_group: "default-targets".to_string(),
                         protocols: vec![Protocol::Tcp],
                         mode: LbMode::Default,
-                        ..Service::default()
+                        ..Listener::default()
                     },
-                    Service {
-                        name: "onearm".to_string(),
-                        vip_port: 48081,
-                        protocols: vec![Protocol::Tcp],
-                        mode: LbMode::Onearm,
-                        ..Service::default()
-                    },
-                    Service {
-                        name: "fullnat".to_string(),
-                        vip_port: 48082,
+                    Listener {
+                        name: "udp".to_string(),
+                        port: 81,
+                        target_port: 8081,
+                        target_group: "default-targets".to_string(),
                         protocols: vec![Protocol::Udp],
-                        mode: LbMode::Fullnat,
-                        ..Service::default()
+                        mode: LbMode::Default,
+                        ..Listener::default()
                     },
                 ],
                 ..FileConfig::default()
@@ -699,6 +667,6 @@ mod tests {
             path: "/tmp/edge-lb-test.toml".into(),
         };
 
-        assert_eq!(dscp_ports(&cfg), vec![48080]);
+        assert_eq!(dscp_ports(&cfg), vec![80, 81]);
     }
 }

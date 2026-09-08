@@ -244,7 +244,7 @@ pub enum GatewayCommand {
     Show,
     /// Remove only the objects this agent created on the gateway.
     Cleanup {
-        /// Also delete agent-managed listener runtime rules.
+        /// Also delete agent-managed native listener state.
         #[arg(long, default_value_t = true)]
         rules: bool,
         /// Also remove the agent-managed native datapath.

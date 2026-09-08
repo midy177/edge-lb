@@ -526,9 +526,9 @@ fn apply_results(
             updates.push((name.clone(), next_state, failures));
         }
     }
-    let result = crate::provider::native::store::mutate_target_health(cfg, |endpoints| {
+    let result = crate::provider::native::store::mutate_target_health(cfg, |targets| {
         for (name, next_state, failures) in &updates {
-            let Some(entry) = endpoints.iter_mut().find(|entry| &entry.name == name) else {
+            let Some(entry) = targets.iter_mut().find(|entry| &entry.name == name) else {
                 continue;
             };
             if entry.current_state.as_deref() == Some(next_state) {

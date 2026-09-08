@@ -3,8 +3,7 @@ use std::{collections::HashSet, net::IpAddr};
 use anyhow::{Context, Result, bail};
 
 use super::{
-    ActiveSource, BackendNode, ControlPlaneMode, FileConfig, LbMode, LbSelect, NodeRole,
-    TargetEndpoint,
+    ActiveSource, ControlPlaneMode, FileConfig, NodeRole,
     overlay::{parse_prefix, same_subnet, validate_overlay_capacity},
 };
 
@@ -175,6 +174,7 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
         }
 
         let mut listener_names = HashSet::new();
+        let mut listener_keys = HashSet::new();
         for (idx, listener) in file.listeners.iter().enumerate() {
             if listener.name.trim().is_empty() {
                 bail!("listeners[{idx}] has an empty name");
@@ -185,6 +185,10 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
             if listener.port == 0 {
                 bail!("listener {} port must not be 0", listener.name);
             }
+            if listener.target_port == 0 {
+                bail!("listener {} target_port must not be 0", listener.name);
+            }
+            validate_native_listener(listener)?;
             for vip in &listener.vip_ips {
                 if vip.is_unspecified() {
                     bail!(
@@ -207,92 +211,18 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
             if listener.protocols.is_empty() {
                 bail!("listener {} needs at least one protocol", listener.name);
             }
+            for protocol in &listener.protocols {
+                if !listener_keys.insert((listener.port, *protocol)) {
+                    bail!(
+                        "duplicate listener port/protocol {}:{}",
+                        protocol.as_str(),
+                        listener.port
+                    );
+                }
+            }
         }
     }
 
-    let mut names = HashSet::new();
-    let mut lb_keys = HashSet::new();
-    for (idx, svc) in file.services.iter().enumerate() {
-        if svc.name.trim().is_empty() {
-            bail!("services[{idx}] has an empty name");
-        }
-        validate_native_service(svc)?;
-        if !names.insert(svc.name.clone()) {
-            bail!("duplicate service name {}", svc.name);
-        }
-        if svc.vip_port == 0 {
-            bail!("service {} has a zero vip_port", svc.name);
-        }
-        if svc.backend_port == 0 && svc.endpoints.is_empty() {
-            bail!("service {} has a zero backend_port", svc.name);
-        }
-        if svc.backend_weight == 0 {
-            bail!("service {} backend_weight must be at least 1", svc.name);
-        }
-        if svc.mode == LbMode::Dsr {
-            if svc.backend_port != svc.vip_port {
-                bail!(
-                    "service {} uses dsr mode, so backend_port must equal vip_port",
-                    svc.name
-                );
-            }
-            if svc.select != LbSelect::Hash {
-                bail!("service {} uses dsr mode, so select must be hash", svc.name);
-            }
-        }
-        if let Some(timeout) = svc.inactive_timeout
-            && timeout == 0
-        {
-            bail!(
-                "service {} inactive_timeout must be omitted or greater than 0",
-                svc.name
-            );
-        }
-        if let Some(mark) = svc.mark
-            && mark > u16::MAX as u32
-        {
-            bail!("service {} mark must fit uint16", svc.name);
-        }
-        if let Some(host) = &svc.host
-            && host.trim().is_empty()
-        {
-            bail!("service {} host must not be empty", svc.name);
-        }
-        if svc.protocols().is_empty() {
-            bail!("service {} needs at least one protocol", svc.name);
-        }
-        if svc.endpoints.is_empty() {
-            validate_target_endpoint(
-                &format!("service {}", svc.name),
-                &TargetEndpoint {
-                    backend: svc.backend.clone(),
-                    address: svc.backend_ip,
-                    port: svc.backend_port,
-                    weight: svc.backend_weight,
-                },
-                &backends,
-                &backend_underlays,
-            )?;
-        } else {
-            for (ep_idx, endpoint) in svc.endpoints.iter().enumerate() {
-                validate_target_endpoint(
-                    &format!("service {} endpoint {ep_idx}", svc.name),
-                    endpoint,
-                    &backends,
-                    &backend_underlays,
-                )?;
-            }
-        }
-        for proto in svc.protocols() {
-            if !lb_keys.insert((svc.vip_port, proto)) {
-                bail!(
-                    "duplicate service VIP/protocol {}:{}",
-                    proto.as_str(),
-                    svc.vip_port
-                );
-            }
-        }
-    }
     if let Some(token) = &file.api.auth_token
         && token.len() < 16
     {
@@ -373,35 +303,6 @@ fn validate_stun_server(index: usize, server: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_native_service(svc: &super::Service) -> Result<()> {
-    if svc.mode != LbMode::Default {
-        bail!(
-            "native datapath only supports default DNAT mode; service {} uses {:?}",
-            svc.name,
-            svc.mode
-        );
-    }
-    if svc.bgp {
-        bail!("native datapath does not support per-listener BGP yet");
-    }
-    if svc.proxy_protocol_v2 {
-        bail!("native datapath does not support proxy protocol v2 yet");
-    }
-    if svc.egress {
-        bail!("native datapath does not support egress listener mode yet");
-    }
-    if svc.security.is_some() {
-        bail!("native datapath does not support listener security mode yet");
-    }
-    if svc.host.is_some() {
-        bail!("native datapath does not support host matching yet");
-    }
-    if svc.mark.is_some() {
-        bail!("native datapath derives marks internally");
-    }
-    Ok(())
-}
-
 fn effective_backend_xds_gateways(file: &FileConfig) -> Vec<String> {
     let Some(xds) = file.backend.xds.as_ref() else {
         return Vec::new();
@@ -413,28 +314,14 @@ fn effective_backend_xds_gateways(file: &FileConfig) -> Vec<String> {
     gateways
 }
 
-fn validate_target_endpoint(
-    label: &str,
-    endpoint: &TargetEndpoint,
-    backends: &[BackendNode],
-    backend_underlays: &HashSet<IpAddr>,
-) -> Result<()> {
-    if endpoint.port == 0 && !label.starts_with("target group ") {
-        bail!("{label} port must not be 0");
-    }
-    if endpoint.weight == 0 {
-        bail!("{label} weight must be at least 1");
-    }
-    let resolved = if let Some(backend_name) = &endpoint.backend {
-        match backends.iter().find(|b| &b.name == backend_name) {
-            Some(backend) => backend.underlay_ip,
-            None => return Ok(()),
-        }
-    } else {
-        endpoint.address
-    };
-    if !resolved.is_unspecified() && !backend_underlays.contains(&resolved) {
-        bail!("{label} target {resolved} is not a registered backend node");
+fn validate_native_listener(listener: &super::Listener) -> Result<()> {
+    if let Some(timeout) = listener.inactive_timeout
+        && timeout == 0
+    {
+        bail!(
+            "listener {} inactive_timeout must be omitted or greater than 0",
+            listener.name
+        );
     }
     Ok(())
 }

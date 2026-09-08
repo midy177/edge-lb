@@ -8,64 +8,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedTarget {
-    pub backend_ip: String,
-    pub backend_port: u16,
-    #[serde(default = "default_backend_weight")]
-    pub weight: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_req: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_resp: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub period_secs: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retries: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ManagedRuntimeRule {
-    pub service: String,
-    pub vip_ip: String,
-    pub protocol: String,
-    pub vip_port: u16,
-    pub backend_port: u16,
-    pub backend_ip: String,
-    #[serde(default = "default_backend_weight")]
-    pub backend_weight: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<ManagedTarget>,
-    #[serde(default)]
-    pub select: u32,
-    #[serde(default)]
-    pub mode: u32,
-    #[serde(default)]
-    pub bgp: bool,
-    #[serde(default)]
-    pub monitor: bool,
-    #[serde(default)]
-    pub inactive_timeout: Option<u32>,
-    #[serde(default)]
-    pub mark: Option<u32>,
-    #[serde(default)]
-    pub security: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(default)]
-    pub proxy_protocol_v2: bool,
-    #[serde(default)]
-    pub egress: bool,
-}
-
-fn default_backend_weight() -> u32 {
-    1
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentState {

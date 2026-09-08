@@ -89,8 +89,7 @@ fn vip_port(cfg: &Config) -> u16 {
     cfg.listeners
         .first()
         .map(|listener| listener.port)
-        .or_else(|| cfg.services.first().map(|service| service.vip_port))
-        .unwrap_or(48080)
+        .unwrap_or(80)
 }
 
 #[derive(Clone, Copy)]
@@ -115,12 +114,6 @@ fn first_backend_probe_target(cfg: &Config) -> BackendProbeTarget {
             };
         }
     }
-    if let Some(service) = cfg.services.first() {
-        return BackendProbeTarget {
-            address: service.backend_ip,
-            port: service.backend_port,
-        };
-    }
     BackendProbeTarget {
         address: cfg
             .backend_nodes_effective()
@@ -128,7 +121,7 @@ fn first_backend_probe_target(cfg: &Config) -> BackendProbeTarget {
             .map(|b| b.underlay_ip)
             .or(cfg.network().backend_ip)
             .unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
-        port: 58080,
+        port: 8080,
     }
 }
 

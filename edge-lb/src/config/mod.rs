@@ -39,9 +39,8 @@ pub use model::{
     ControlPlaneConfig, ControlPlaneMode, DeviceDiscoveryRuntime, EDGE_CURRENT_MARK_BASE,
     EDGE_CURRENT_TABLE_BASE, EDGE_MARK_BASE, EDGE_MARK_LIMIT, EDGE_TABLE_BASE, EDGE_TABLE_LIMIT,
     FileConfig, GatewayConfig, GatewayNode, GatewayReconcileConfig, GatewayXdsConfig, HaConfig,
-    IpDiscoveryConfig, IpDiscoveryRuntime, LbMode, LbSecurity, LbSelect, Listener, NetworkConfig,
-    NodeRole, Protocol, RuntimeDiscovery, Service, TargetEndpoint, TargetGroup, gateway_slot,
-    return_mark, return_table_id,
+    IpDiscoveryConfig, IpDiscoveryRuntime, LbMode, LbSelect, Listener, NetworkConfig, NodeRole,
+    Protocol, RuntimeDiscovery, TargetGroup, gateway_slot, return_mark, return_table_id,
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/edge-lb/config.toml";
@@ -81,36 +80,6 @@ impl FileConfig {
         normalize::normalize_config(self);
     }
 
-    pub fn service_endpoints(&self, svc: &Service) -> Vec<TargetEndpoint> {
-        if !svc.endpoints.is_empty() {
-            return svc.endpoints.clone();
-        }
-        vec![TargetEndpoint {
-            backend: svc.backend.clone().or_else(|| {
-                self.backend_nodes_effective()
-                    .iter()
-                    .find(|b| b.underlay_ip == svc.backend_ip)
-                    .map(|b| b.name.clone())
-            }),
-            address: svc.backend_ip,
-            port: svc.backend_port,
-            weight: svc.backend_weight,
-        }]
-    }
-
-    pub fn resolve_endpoint_address(&self, endpoint: &TargetEndpoint) -> IpAddr {
-        endpoint
-            .backend
-            .as_ref()
-            .and_then(|name| {
-                self.backend_nodes_effective()
-                    .iter()
-                    .find(|b| &b.name == name)
-                    .map(|b| b.underlay_ip)
-            })
-            .unwrap_or(endpoint.address)
-    }
-
     pub fn resolve_backend_target_address(&self, target: &BackendTarget) -> IpAddr {
         target
             .backend
@@ -127,9 +96,6 @@ impl FileConfig {
     pub fn listener_backend_return_ports(&self) -> Vec<BackendReturnPort> {
         let mut ports = Vec::new();
         for listener in &self.listeners {
-            if !listener.mode.preserves_client_ip() {
-                continue;
-            }
             let Some(group) = self
                 .target_groups
                 .iter()
@@ -169,46 +135,13 @@ impl FileConfig {
             return dedup_backend_return_ports(self.backend_return_ports.clone());
         }
 
-        let listener_ports = self.listener_backend_return_ports();
         let local_underlay = self.local_backend().ok().map(|backend| backend.underlay_ip);
-        if !listener_ports.is_empty() {
-            return dedup_backend_return_ports(
-                listener_ports
-                    .into_iter()
-                    .filter(|port| local_underlay.is_none_or(|local| port.address == local))
-                    .collect(),
-            );
-        }
-
-        let mut ports = Vec::new();
-        for svc in &self.services {
-            if !svc.mode.preserves_client_ip() {
-                continue;
-            }
-            let protocols = svc.protocols();
-            for endpoint in self.service_endpoints(svc) {
-                let address = self.resolve_endpoint_address(&endpoint);
-                if local_underlay.is_some_and(|local| address != local) {
-                    continue;
-                }
-                for protocol in &protocols {
-                    ports.push(BackendReturnPort {
-                        backend: endpoint.backend.clone(),
-                        address,
-                        protocol: *protocol,
-                        port: endpoint.port,
-                        gateway: None,
-                        gateway_underlay_ip: None,
-                        gateway_overlay_ip: None,
-                        backend_overlay_ip: None,
-                        dscp: None,
-                        mark: None,
-                        route_table_id: None,
-                    });
-                }
-            }
-        }
-        dedup_backend_return_ports(ports)
+        dedup_backend_return_ports(
+            self.listener_backend_return_ports()
+                .into_iter()
+                .filter(|port| local_underlay.is_none_or(|local| port.address == local))
+                .collect(),
+        )
     }
 
     /// Effective backend inventory from xDS or local single-node settings.
@@ -500,7 +433,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xds_backend_bootstrap_allows_empty_services() {
+    fn xds_backend_bootstrap_allows_empty_proxy_config() {
         let mut file = FileConfig::default();
         file.node_role = NodeRole::Backend;
         file.ha.active_source = ActiveSource::Xds;
@@ -508,63 +441,50 @@ mod tests {
         file.control_plane.mode = ControlPlaneMode::Xds;
         file.control_plane.listen = "127.0.0.1:22222".to_string();
         file.network.underlay_dev = "eth0".to_string();
-        file.services.clear();
         file.normalize();
 
         file.validate().expect("xDS bootstrap config is valid");
     }
 
     #[test]
-    fn native_datapath_accepts_default_dnat_service() {
+    fn native_datapath_accepts_default_dnat_listener() {
         let mut file = FileConfig::default();
-        file.node_role = NodeRole::Backend;
-        file.public_ip = "198.51.100.20".parse().unwrap();
-        file.underlay_ip = "192.0.2.20".parse().unwrap();
+        file.node_role = NodeRole::Gateway;
+        file.public_ip = "198.51.100.10".parse().unwrap();
+        file.underlay_ip = "192.0.2.10".parse().unwrap();
         file.network.underlay_dev = "eth0".to_string();
         file.network.gateway_ip = "192.0.2.10".parse().unwrap();
         file.network.gateway_public_ip = "198.51.100.10".parse().unwrap();
         file.network.backend_ip = Some("192.0.2.20".parse().unwrap());
         file.network.backend_public_ip = Some("198.51.100.20".parse().unwrap());
-        file.services.push(Service {
+        file.backend_nodes.push(BackendNode {
+            name: "backend-1".to_string(),
+            public_ip: "198.51.100.20".parse().unwrap(),
+            underlay_ip: "192.0.2.20".parse().unwrap(),
+            overlay_ip: "10.255.255.2/24".to_string(),
+        });
+        file.target_groups.push(TargetGroup {
+            name: "tcp-8080-targets".to_string(),
+            targets: vec![BackendTarget {
+                backend: Some("backend-1".to_string()),
+                address: "192.0.2.20".parse().unwrap(),
+                weight: 1,
+            }],
+            ..TargetGroup::default()
+        });
+        file.listeners.push(Listener {
             name: "tcp-8080".to_string(),
-            vip_port: 8080,
-            backend_ip: "192.0.2.20".parse().unwrap(),
-            backend_port: 18080,
+            port: 8080,
+            target_port: 18080,
+            target_group: "tcp-8080-targets".to_string(),
             protocols: vec![Protocol::Tcp],
             mode: LbMode::Default,
-            ..Service::default()
+            ..Listener::default()
         });
         file.normalize();
 
         file.validate()
-            .expect("native default DNAT service should be valid");
-    }
-
-    #[test]
-    fn native_datapath_rejects_non_default_service_mode() {
-        let mut file = FileConfig::default();
-        file.node_role = NodeRole::Backend;
-        file.public_ip = "198.51.100.20".parse().unwrap();
-        file.underlay_ip = "192.0.2.20".parse().unwrap();
-        file.network.underlay_dev = "eth0".to_string();
-        file.network.gateway_ip = "192.0.2.10".parse().unwrap();
-        file.network.gateway_public_ip = "198.51.100.10".parse().unwrap();
-        file.network.backend_ip = Some("192.0.2.20".parse().unwrap());
-        file.network.backend_public_ip = Some("198.51.100.20".parse().unwrap());
-        file.services.push(Service {
-            name: "fullnat".to_string(),
-            vip_port: 8080,
-            backend_ip: "192.0.2.20".parse().unwrap(),
-            backend_port: 18080,
-            protocols: vec![Protocol::Tcp],
-            mode: LbMode::Fullnat,
-            ..Service::default()
-        });
-        file.normalize();
-
-        let err = file.validate().unwrap_err().to_string();
-
-        assert!(err.contains("only supports default DNAT mode"));
+            .expect("native default DNAT listener should be valid");
     }
 
     #[test]
@@ -698,7 +618,7 @@ stun_servers = [" stun.example.test:3478 ", "stun.backup.test:3478"]
                 name: "api-targets".to_string(),
                 monitor: true,
                 probe_type: Some("http".to_string()),
-                probe_port: Some(58080),
+                probe_port: Some(8080),
                 probe_req: Some("/health".to_string()),
                 probe_resp: None,
                 probe_status: None,
@@ -713,16 +633,10 @@ stun_servers = [" stun.example.test:3478 ", "stun.backup.test:3478"]
             }],
             listeners: vec![Listener {
                 name: "api".to_string(),
-                port: 48080,
+                port: 80,
                 target_group: "api-targets".to_string(),
                 protocols: vec![Protocol::Tcp],
                 ..Listener::default()
-            }],
-            services: vec![Service {
-                name: "derived".to_string(),
-                vip_port: 1,
-                backend_port: 1,
-                ..Service::default()
             }],
             ..FileConfig::default()
         };
@@ -742,7 +656,6 @@ stun_servers = [" stun.example.test:3478 ", "stun.backup.test:3478"]
         parsed.normalize();
         assert!(parsed.listeners.is_empty());
         assert!(parsed.target_groups.is_empty());
-        assert!(parsed.services.is_empty());
     }
 
     #[test]
@@ -898,13 +811,6 @@ vxlan_dev = "edge-return"
         let static_file = FileConfig {
             ha: HaConfig::default(),
             control_plane: ControlPlaneConfig::default(),
-            services: vec![Service {
-                name: "tcp-8080".to_string(),
-                vip_port: 8080,
-                backend_ip: "192.168.0.13".parse().unwrap(),
-                backend_port: 8080,
-                ..Service::default()
-            }],
             ..file
         };
         assert!(
@@ -941,26 +847,46 @@ vxlan_dev = "edge-return"
     }
 
     #[test]
-    fn backend_return_ports_skip_non_default_lb_modes() {
+    fn backend_return_ports_include_all_native_listeners() {
         let file = FileConfig {
-            services: vec![
-                Service {
+            target_groups: vec![
+                TargetGroup {
+                    name: "default-targets".to_string(),
+                    targets: vec![BackendTarget {
+                        address: "192.0.2.10".parse().unwrap(),
+                        weight: 1,
+                        ..BackendTarget::default()
+                    }],
+                    ..TargetGroup::default()
+                },
+                TargetGroup {
+                    name: "secondary-targets".to_string(),
+                    targets: vec![BackendTarget {
+                        address: "192.0.2.11".parse().unwrap(),
+                        weight: 1,
+                        ..BackendTarget::default()
+                    }],
+                    ..TargetGroup::default()
+                },
+            ],
+            listeners: vec![
+                Listener {
                     name: "default-tcp".to_string(),
-                    vip_port: 48080,
-                    backend_ip: "192.0.2.10".parse().unwrap(),
-                    backend_port: 58080,
+                    port: 80,
+                    target_port: 8080,
+                    target_group: "default-targets".to_string(),
                     protocols: vec![Protocol::Tcp],
                     mode: LbMode::Default,
-                    ..Service::default()
+                    ..Listener::default()
                 },
-                Service {
-                    name: "fullnat-tcp".to_string(),
-                    vip_port: 48081,
-                    backend_ip: "192.0.2.11".parse().unwrap(),
-                    backend_port: 58081,
+                Listener {
+                    name: "secondary-tcp".to_string(),
+                    port: 81,
+                    target_port: 8081,
+                    target_group: "secondary-targets".to_string(),
                     protocols: vec![Protocol::Tcp],
-                    mode: LbMode::Fullnat,
-                    ..Service::default()
+                    mode: LbMode::Default,
+                    ..Listener::default()
                 },
             ],
             ..FileConfig::default()
@@ -972,9 +898,11 @@ vxlan_dev = "edge-return"
 
         let ports = cfg.backend_return_ports();
 
-        assert_eq!(ports.len(), 1);
+        assert_eq!(ports.len(), 2);
         assert_eq!(ports[0].address, "192.0.2.10".parse::<IpAddr>().unwrap());
-        assert_eq!(ports[0].port, 58080);
+        assert_eq!(ports[0].port, 8080);
+        assert_eq!(ports[1].address, "192.0.2.11".parse::<IpAddr>().unwrap());
+        assert_eq!(ports[1].port, 8081);
     }
 
     #[test]
@@ -984,7 +912,7 @@ vxlan_dev = "edge-return"
                 backend: Some("backend-1".to_string()),
                 address: "192.0.2.10".parse().unwrap(),
                 protocol: Protocol::Tcp,
-                port: 58080,
+                port: 8080,
                 gateway: None,
                 gateway_underlay_ip: None,
                 gateway_overlay_ip: None,
@@ -992,15 +920,6 @@ vxlan_dev = "edge-return"
                 dscp: None,
                 mark: None,
                 route_table_id: None,
-            }],
-            services: vec![Service {
-                name: "fullnat-tcp".to_string(),
-                vip_port: 48081,
-                backend_ip: "192.0.2.11".parse().unwrap(),
-                backend_port: 58081,
-                protocols: vec![Protocol::Tcp],
-                mode: LbMode::Fullnat,
-                ..Service::default()
             }],
             ..FileConfig::default()
         };
@@ -1014,6 +933,6 @@ vxlan_dev = "edge-return"
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].backend.as_deref(), Some("backend-1"));
         assert_eq!(ports[0].address, "192.0.2.10".parse::<IpAddr>().unwrap());
-        assert_eq!(ports[0].port, 58080);
+        assert_eq!(ports[0].port, 8080);
     }
 }

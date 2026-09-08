@@ -206,13 +206,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
                     .unwrap_or(underlay.context("local public IP fallback unavailable")?)
                     .value;
             }
-            if let Some(local_backend) = resolved_backend {
-                for svc in &mut file.services {
-                    if svc.backend_ip.is_unspecified() {
-                        svc.backend_ip = local_backend;
-                    }
-                }
-            }
+            let _ = resolved_backend;
         }
     }
     resolve_auto_vxlan_mtu(file);

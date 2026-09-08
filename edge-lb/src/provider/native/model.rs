@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, Protocol, Service};
+use crate::config::{Config, Protocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeProtocol {
@@ -62,29 +62,7 @@ pub struct NativeListener {
     pub select: u32,
     pub inactive_timeout_secs: u32,
     pub dscp: u32,
-    pub endpoints: Vec<NativeTarget>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeRuleEntry {
-    pub name: Option<String>,
-    pub vip_ip: String,
-    pub protocol: String,
-    pub vip_port: u16,
-    pub backend_port: u16,
-    pub backend_ip: String,
-    pub backend_weight: u32,
-    pub endpoints: Vec<crate::runtime::state::ManagedTarget>,
-    pub select: u32,
-    pub mode: u32,
-    pub bgp: bool,
-    pub monitor: bool,
-    pub inactive_timeout: Option<u32>,
-    pub mark: Option<u32>,
-    pub security: Option<u32>,
-    pub host: Option<String>,
-    pub proxy_protocol_v2: bool,
-    pub egress: bool,
+    pub targets: Vec<NativeTarget>,
 }
 
 pub fn listeners_from_config(cfg: &Config) -> Result<Vec<NativeListener>> {
@@ -106,14 +84,7 @@ pub fn listeners_from_config(cfg: &Config) -> Result<Vec<NativeListener>> {
         return Ok(out);
     }
 
-    // Runtime service entries are an internal projection used by the native
-    // datapath when listener/target-group resources have already been
-    // materialized.
-    let mut out = Vec::new();
-    for service in &cfg.services {
-        out.extend(listener_from_service(cfg, service)?);
-    }
-    Ok(out)
+    Ok(Vec::new())
 }
 
 fn listener_from_target_group(
@@ -121,27 +92,20 @@ fn listener_from_target_group(
     listener: &crate::config::Listener,
     group: &crate::config::TargetGroup,
 ) -> Result<Vec<NativeListener>> {
-    if !listener.mode.preserves_client_ip() {
-        bail!(
-            "native datapath only supports default DNAT mode for listener {}",
-            listener.name
-        );
-    }
-
-    let endpoints = group
+    let targets = group
         .targets
         .iter()
-        .map(|endpoint| {
-            let address = ipv4_addr(cfg.resolve_backend_target_address(endpoint))?;
+        .map(|target| {
+            let address = ipv4_addr(cfg.resolve_backend_target_address(target))?;
             Ok(NativeTarget {
                 address,
                 port: listener.target_port,
-                weight: endpoint.weight,
+                weight: target.weight,
                 state: NativeTargetState::Active,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    if endpoints.is_empty() {
+    if targets.is_empty() {
         // Automatic target groups may legitimately be empty while no backend
         // matches their filter. Keep the control-plane resource, but omit it
         // from the native datapath until a backend appears.
@@ -162,55 +126,7 @@ fn listener_from_target_group(
                 select: listener.select.code(),
                 inactive_timeout_secs: listener.inactive_timeout.unwrap_or(240),
                 dscp: cfg.network().dscp,
-                endpoints: endpoints.clone(),
-            });
-        }
-    }
-    Ok(listeners)
-}
-
-pub fn listener_from_service(cfg: &Config, service: &Service) -> Result<Vec<NativeListener>> {
-    if !service.mode.preserves_client_ip() {
-        bail!(
-            "native datapath only supports default DNAT mode for service {}",
-            service.name
-        );
-    }
-
-    let vip_ips = effective_vip_ips(cfg, &[])?;
-    let endpoints = cfg
-        .service_endpoints(service)
-        .into_iter()
-        .map(|endpoint| {
-            let address = ipv4_addr(cfg.resolve_endpoint_address(&endpoint))?;
-            Ok(NativeTarget {
-                address,
-                port: endpoint.port,
-                weight: endpoint.weight,
-                state: NativeTargetState::Active,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    if endpoints.is_empty() {
-        bail!("service {} needs at least one endpoint", service.name);
-    }
-
-    let mut listeners = Vec::new();
-    for vip_ip in vip_ips {
-        for protocol in service.protocols() {
-            let protocol = NativeProtocol::try_from(protocol)?;
-            listeners.push(NativeListener {
-                name: service.name.clone(),
-                key: NativeListenerKey {
-                    vip_ip,
-                    vip_port: service.vip_port,
-                    protocol,
-                },
-                select: service.select.code(),
-                inactive_timeout_secs: service.inactive_timeout.unwrap_or(240),
-                dscp: cfg.network().dscp,
-                endpoints: endpoints.clone(),
+                targets: targets.clone(),
             });
         }
     }
@@ -259,32 +175,35 @@ fn ipv4_addr(value: IpAddr) -> Result<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-
     use crate::config::{
         BackendTarget, Config, DEFAULT_CONFIG_PATH, FileConfig, LbMode, Listener, Protocol,
-        Service, TargetEndpoint, TargetGroup,
+        TargetGroup,
     };
 
     use super::*;
 
     #[test]
-    fn service_conversion_preserves_default_dnat_shape() {
+    fn listener_conversion_preserves_default_dnat_shape() {
         let mut cfg = FileConfig::default();
         cfg.network.gateway_ip = "192.0.2.10".parse().unwrap();
         cfg.network.dscp = 46;
-        cfg.services.push(Service {
-            name: "tcp-8080".to_string(),
-            vip_port: 8080,
-            protocols: vec![Protocol::Tcp],
-            mode: LbMode::Default,
-            endpoints: vec![TargetEndpoint {
+        cfg.target_groups.push(TargetGroup {
+            name: "tcp-8080-targets".to_string(),
+            targets: vec![BackendTarget {
                 backend: None,
-                address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)),
-                port: 18080,
+                address: Ipv4Addr::new(192, 0, 2, 20).into(),
                 weight: 3,
             }],
-            ..Service::default()
+            ..TargetGroup::default()
+        });
+        cfg.listeners.push(Listener {
+            name: "tcp-8080".to_string(),
+            port: 8080,
+            target_port: 18080,
+            target_group: "tcp-8080-targets".to_string(),
+            protocols: vec![Protocol::Tcp],
+            mode: LbMode::Default,
+            ..Listener::default()
         });
 
         let cfg = Config {
@@ -299,38 +218,11 @@ mod tests {
         assert_eq!(listeners[0].key.protocol, NativeProtocol::Tcp);
         assert_eq!(listeners[0].dscp, 46);
         assert_eq!(
-            listeners[0].endpoints[0].address,
+            listeners[0].targets[0].address,
             Ipv4Addr::new(192, 0, 2, 20)
         );
-        assert_eq!(listeners[0].endpoints[0].port, 18080);
-        assert_eq!(listeners[0].endpoints[0].weight, 3);
-    }
-
-    #[test]
-    fn non_default_mode_is_rejected() {
-        let mut cfg = FileConfig::default();
-        cfg.network.gateway_ip = "192.0.2.10".parse().unwrap();
-        cfg.services.push(Service {
-            name: "fullnat".to_string(),
-            vip_port: 8080,
-            protocols: vec![Protocol::Tcp],
-            mode: LbMode::Fullnat,
-            endpoints: vec![TargetEndpoint {
-                backend: None,
-                address: "192.0.2.20".parse().unwrap(),
-                port: 18080,
-                weight: 1,
-            }],
-            ..Service::default()
-        });
-
-        let cfg = Config {
-            file: cfg,
-            path: DEFAULT_CONFIG_PATH.into(),
-        };
-        let err = listeners_from_config(&cfg).unwrap_err().to_string();
-
-        assert!(err.contains("only supports default DNAT"));
+        assert_eq!(listeners[0].targets[0].port, 18080);
+        assert_eq!(listeners[0].targets[0].weight, 3);
     }
 
     #[test]
@@ -354,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn target_group_endpoints_are_expanded_with_weights() {
+    fn target_group_targets_are_expanded_with_weights() {
         let mut file = FileConfig::default();
         file.network.gateway_ip = "192.0.2.10".parse().unwrap();
         file.target_groups.push(TargetGroup {
@@ -389,55 +281,9 @@ mod tests {
         let listeners = listeners_from_config(&cfg).unwrap();
 
         assert_eq!(listeners.len(), 1);
-        assert_eq!(listeners[0].endpoints.len(), 2);
-        assert_eq!(listeners[0].endpoints[0].weight, 2);
-        assert_eq!(listeners[0].endpoints[1].weight, 5);
-    }
-
-    #[test]
-    fn listener_model_takes_precedence_over_runtime_projection() {
-        let mut file = FileConfig::default();
-        file.network.gateway_ip = "192.0.2.10".parse().unwrap();
-        file.target_groups.push(TargetGroup {
-            name: "api-targets".to_string(),
-            targets: vec![BackendTarget {
-                address: "192.0.2.20".parse().unwrap(),
-                weight: 7,
-                ..BackendTarget::default()
-            }],
-            ..TargetGroup::default()
-        });
-        file.listeners.push(crate::config::Listener {
-            name: "listener-api".to_string(),
-            port: 8080,
-            target_group: "api-targets".to_string(),
-            protocols: vec![Protocol::Tcp],
-            ..crate::config::Listener::default()
-        });
-        file.services.push(Service {
-            name: "runtime-service".to_string(),
-            vip_port: 9090,
-            protocols: vec![Protocol::Tcp],
-            mode: LbMode::Default,
-            endpoints: vec![TargetEndpoint {
-                address: "192.0.2.30".parse().unwrap(),
-                port: 19090,
-                weight: 1,
-                ..TargetEndpoint::default()
-            }],
-            ..Service::default()
-        });
-
-        let cfg = Config {
-            file,
-            path: DEFAULT_CONFIG_PATH.into(),
-        };
-        let listeners = listeners_from_config(&cfg).unwrap();
-
-        assert_eq!(listeners.len(), 1);
-        assert_eq!(listeners[0].name, "listener-api");
-        assert_eq!(listeners[0].key.vip_port, 8080);
-        assert_eq!(listeners[0].endpoints[0].weight, 7);
+        assert_eq!(listeners[0].targets.len(), 2);
+        assert_eq!(listeners[0].targets[0].weight, 2);
+        assert_eq!(listeners[0].targets[1].weight, 5);
     }
 
     #[test]

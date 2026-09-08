@@ -318,7 +318,7 @@ fn test_template(
     let nodes = automation_nodes(cfg);
     let matched = filter::matched_nodes(&template, &nodes);
     let mut planned = filter::plan_template(&template, &nodes);
-    planned.endpoints = matched.clone();
+    planned.targets = matched.clone();
     Ok(AutomationTestResult {
         template: template.name,
         planned: vec![planned],
@@ -422,7 +422,7 @@ fn planned_target_group(
     template: &AutomationTemplate,
 ) -> anyhow::Result<TargetGroup> {
     let nodes = automation_nodes(cfg);
-    let endpoints = filter::matched_nodes(template, &nodes);
+    let targets = filter::matched_nodes(template, &nodes);
     let existing = native::target_groups_native(cfg)?
         .into_iter()
         .find(|group| group.name == validate::generated_target_group_name(template));
@@ -460,7 +460,7 @@ fn planned_target_group(
             && matches!(probe_type.as_deref(), Some("https")),
         period_secs: template.target_group.period_secs,
         retries: template.target_group.retries,
-        targets: endpoints
+        targets: targets
             .into_iter()
             .map(|node| {
                 let address = node.underlay_ip.parse()?;

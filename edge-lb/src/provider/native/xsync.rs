@@ -187,12 +187,12 @@ fn entry_to_proto(entry: &native_dnat::FlowEntry) -> pb::FlowEntry {
     pb::FlowEntry {
         key: Some(key_to_proto(key)),
         value: Some(pb::FlowValue {
-            service_id: value.service_id,
-            endpoint_id: value.endpoint_id,
+            listener_id: value.listener_id,
+            target_id: value.target_id,
             vip: value.vip,
-            endpoint: value.endpoint,
+            target: value.target,
             vip_port: u32::from(value.vip_port),
-            endpoint_port: u32::from(value.endpoint_port),
+            target_port: u32::from(value.target_port),
             timeout_secs: value.timeout_secs,
             last_seen_ns: value.last_seen_ns,
         }),
@@ -208,13 +208,13 @@ fn entry_from_proto(entry: &pb::FlowEntry) -> Result<native_dnat::FlowEntry> {
     Ok((
         key,
         edge_lb_common::NativeFlowValue {
-            service_id: value.service_id,
-            endpoint_id: value.endpoint_id,
+            listener_id: value.listener_id,
+            target_id: value.target_id,
             vip: value.vip,
-            endpoint: value.endpoint,
+            target: value.target,
             vip_port: u16::try_from(value.vip_port).context("flow VIP port out of range")?,
-            endpoint_port: u16::try_from(value.endpoint_port)
-                .context("flow endpoint port out of range")?,
+            target_port: u16::try_from(value.target_port)
+                .context("flow target port out of range")?,
             timeout_secs: value.timeout_secs,
             last_seen_ns: value.last_seen_ns,
         },
