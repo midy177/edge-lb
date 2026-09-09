@@ -252,7 +252,7 @@ export interface AutomationTemplateTestResult {
 
 export type GatewayHaMode = 'active_backup'
 export type GatewayHaFailoverMode = 'manual' | 'bfd_auto'
-export type GatewayHaVipProvider = 'l2' | 'bgp' | 'hook'
+export type GatewayHaVipProvider = 'l2' | 'hook'
 export type GatewayHaVipBindDevice = 'underlay' | 'loopback'
 export type GatewayHaVipOwner = 'edge_lb'
 export type GatewayHaXsyncRpc = 'grpc'

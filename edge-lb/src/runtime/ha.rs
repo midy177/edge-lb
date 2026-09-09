@@ -1,13 +1,12 @@
 //! Runtime-only gateway HA configuration.
 
 use std::{
+    fs,
     net::{IpAddr, Ipv4Addr},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(test)]
-use std::fs;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,9 @@ use crate::config::{Config, FileConfig, GatewayNode, NodeRole};
 #[cfg(test)]
 const DEFAULT_GATEWAY_HA_PATH: &str = "/var/lib/edge-lb/gateway-ha.json";
 const HA_SECRET_RESOURCE: &str = "ha_peer_secret";
+pub const DEFAULT_PROMOTE_HOOK: &str = "/usr/local/bin/edge-lb-promote";
+pub const DEFAULT_DEMOTE_HOOK: &str = "/usr/local/bin/edge-lb-demote";
+pub const DEFAULT_VERIFY_HOOK: &str = "/usr/local/bin/edge-lb-verify-vip";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -192,9 +194,9 @@ impl Default for VipConfig {
             bind_timeout_secs: 15,
             verify_timeout_secs: 10,
             garp: GarpConfig::default(),
-            promote_hook: None,
-            demote_hook: None,
-            verify_hook: None,
+            promote_hook: Some(default_promote_hook()),
+            demote_hook: Some(default_demote_hook()),
+            verify_hook: Some(default_verify_hook()),
         }
     }
 }
@@ -264,6 +266,60 @@ pub enum VipProvider {
 pub enum VipOwner {
     #[default]
     EdgeLb,
+}
+
+pub fn default_promote_hook() -> PathBuf {
+    PathBuf::from(DEFAULT_PROMOTE_HOOK)
+}
+
+pub fn default_demote_hook() -> PathBuf {
+    PathBuf::from(DEFAULT_DEMOTE_HOOK)
+}
+
+pub fn default_verify_hook() -> PathBuf {
+    PathBuf::from(DEFAULT_VERIFY_HOOK)
+}
+
+pub fn ensure_managed_hook_scripts() -> Result<()> {
+    ensure_managed_hook_script(
+        Path::new(DEFAULT_PROMOTE_HOOK),
+        "promote",
+        "Promote this node to own the external VIP.",
+    )?;
+    ensure_managed_hook_script(
+        Path::new(DEFAULT_DEMOTE_HOOK),
+        "demote",
+        "Demote this node and release external VIP ownership.",
+    )?;
+    ensure_managed_hook_script(
+        Path::new(DEFAULT_VERIFY_HOOK),
+        "verify",
+        "Verify the expected VIP ownership state after promote or demote.",
+    )
+}
+
+fn ensure_managed_hook_script(path: &Path, action: &str, description: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if !path.exists() {
+        fs::write(path, managed_hook_template(action, description))
+            .with_context(|| format!("creating {}", path.display()))?;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 {}", path.display()))
+}
+
+fn managed_hook_template(action: &str, description: &str) -> String {
+    format!(
+        "#!/bin/bash\n\
+         # edge-lb managed HA {action} hook.\n\
+         # {description}\n\
+         # Arguments: $1 is the configured VIP when present.\n\
+         # Environment: EDGE_LB_HA_ACTION, EDGE_LB_HA_STATE, EDGE_LB_VIP,\n\
+         # EDGE_LB_NODE, EDGE_LB_UNDERLAY_IP, EDGE_LB_STATE_DIR.\n\
+         exit 0\n"
+    )
 }
 
 #[cfg(test)]
@@ -396,8 +452,7 @@ pub fn delete_secrets_for_state_dir(_state_dir: &Path) -> Result<bool> {
 
 pub fn unpair_for_state_dir(state_dir: &Path) -> Result<(GatewayHaRuntimeConfig, bool, bool)> {
     let mut cfg = load_for_state_dir(state_dir)?;
-    let restart_required =
-        cfg.enabled && (cfg.connection_sync || matches!(cfg.vip.provider, VipProvider::Bgp));
+    let restart_required = cfg.enabled && cfg.connection_sync;
     cfg.enabled = false;
     cfg.preferred_active = None;
     cfg.peers.clear();
@@ -425,7 +480,6 @@ pub fn local_identity(cfg: &Config) -> GatewayIdentity {
             "ha.active_backup".to_string(),
             "ha.peer_token".to_string(),
             "vip.l2".to_string(),
-            "vip.bgp".to_string(),
             "vip.hook".to_string(),
         ],
     }
@@ -755,10 +809,17 @@ pub fn normalize_runtime_config(mut value: GatewayHaRuntimeConfig) -> GatewayHaR
     value.xsync_rpc = XsyncRpc::Grpc;
     value.failover = FailoverMode::BfdAuto;
     value.vip.owner = VipOwner::EdgeLb;
-    if !matches!(value.vip.provider, VipProvider::L2) {
+    if matches!(value.vip.provider, VipProvider::Bgp) {
+        value.vip.provider = VipProvider::Hook;
+    }
+    if !matches!(value.vip.provider, VipProvider::L2 | VipProvider::Hook) {
         value.vip.private_vip = None;
     }
-    if !matches!(value.vip.provider, VipProvider::Hook) {
+    if matches!(value.vip.provider, VipProvider::Hook) {
+        value.vip.promote_hook = Some(default_promote_hook());
+        value.vip.demote_hook = Some(default_demote_hook());
+        value.vip.verify_hook = Some(default_verify_hook());
+    } else {
         value.vip.promote_hook = None;
         value.vip.demote_hook = None;
         value.vip.verify_hook = None;
@@ -806,9 +867,6 @@ pub fn validate(value: &GatewayHaRuntimeConfig) -> Result<()> {
             );
         }
     }
-    if value.enabled && matches!(value.vip.provider, VipProvider::Bgp) {
-        validate_bgp(&value.bgp)?;
-    }
     Ok(())
 }
 
@@ -827,49 +885,6 @@ fn validate_garp(value: &GarpConfig) -> Result<()> {
     }
     if value.repeat_count > 10 {
         bail!("vip.garp.repeat_count must be <= 10");
-    }
-    Ok(())
-}
-
-fn validate_bgp(value: &BgpConfig) -> Result<()> {
-    let local_as = value.local_as.context("bgp.local_as is required")?;
-    if local_as == 0 {
-        bail!("bgp.local_as must be greater than 0");
-    }
-    if value.peers.is_empty() {
-        bail!("bgp.peers requires at least one peer");
-    }
-    for (idx, peer) in value.peers.iter().enumerate() {
-        let peer = peer.trim();
-        if peer.is_empty() {
-            bail!("bgp.peers[{idx}] is empty");
-        }
-        let Some((addr, asn)) = peer.rsplit_once(':') else {
-            bail!("bgp.peers[{idx}] must use <ip>:<asn>");
-        };
-        addr.parse::<IpAddr>()
-            .with_context(|| format!("bad bgp.peers[{idx}] IP"))?;
-        let asn = asn
-            .parse::<u32>()
-            .with_context(|| format!("bad bgp.peers[{idx}] ASN"))?;
-        if asn == 0 {
-            bail!("bgp.peers[{idx}] ASN must be greater than 0");
-        }
-    }
-    if value.router_id.trim() != "auto" {
-        value
-            .router_id
-            .parse::<Ipv4Addr>()
-            .context("bad bgp.router_id")?;
-    }
-    if value.hold_time_secs == 0 {
-        bail!("bgp.hold_time_secs must be greater than 0");
-    }
-    if value.keepalive_secs == 0 {
-        bail!("bgp.keepalive_secs must be greater than 0");
-    }
-    if value.keepalive_secs >= value.hold_time_secs {
-        bail!("bgp.keepalive_secs must be less than bgp.hold_time_secs");
     }
     Ok(())
 }
@@ -897,6 +912,59 @@ mod tests {
 
         assert_eq!(cfg, GatewayHaRuntimeConfig::default());
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hook_provider_uses_fixed_managed_hook_paths() {
+        let cfg = normalize_runtime_config(GatewayHaRuntimeConfig {
+            vip: VipConfig {
+                provider: VipProvider::Hook,
+                private_vip: Some("192.0.2.200".to_string()),
+                promote_hook: Some(PathBuf::from("/tmp/custom-promote")),
+                demote_hook: Some(PathBuf::from("/tmp/custom-demote")),
+                verify_hook: Some(PathBuf::from("/tmp/custom-verify")),
+                ..VipConfig::default()
+            },
+            ..GatewayHaRuntimeConfig::default()
+        });
+
+        assert!(matches!(cfg.vip.provider, VipProvider::Hook));
+        assert_eq!(cfg.vip.private_vip.as_deref(), Some("192.0.2.200"));
+        assert_eq!(cfg.vip.promote_hook, Some(default_promote_hook()));
+        assert_eq!(cfg.vip.demote_hook, Some(default_demote_hook()));
+        assert_eq!(cfg.vip.verify_hook, Some(default_verify_hook()));
+    }
+
+    #[test]
+    fn bgp_provider_is_removed_from_runtime_surface() {
+        let cfg = normalize_runtime_config(GatewayHaRuntimeConfig {
+            vip: VipConfig {
+                provider: VipProvider::Bgp,
+                ..VipConfig::default()
+            },
+            ..GatewayHaRuntimeConfig::default()
+        });
+
+        assert!(matches!(cfg.vip.provider, VipProvider::Hook));
+        assert!(
+            !local_identity(&Config {
+                file: FileConfig {
+                    node_role: NodeRole::Gateway,
+                    node_name: "gateway-a".to_string(),
+                    public_ip: "198.51.100.12".parse().unwrap(),
+                    underlay_ip: "192.0.2.12".parse().unwrap(),
+                    network: NetworkConfig {
+                        overlay_cidr: "10.255.12.0/24".to_string(),
+                        ..NetworkConfig::default()
+                    },
+                    ..FileConfig::default()
+                },
+                path: PathBuf::from("/tmp/config.toml"),
+            })
+            .capabilities
+            .iter()
+            .any(|capability| capability == "vip.bgp")
+        );
     }
 
     #[test]

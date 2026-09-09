@@ -26,6 +26,17 @@ const STREAM_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HA_SNAPSHOT_SETTLE: Duration = Duration::from_millis(500);
 static DATAPATH_APPLY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+struct AppliedSnapshot {
+    version: String,
+    conflicts: Vec<crate::linux::conflict::NodeConflict>,
+}
+
+impl AppliedSnapshot {
+    fn conflicts_for(&self, version: &str) -> Option<&[crate::linux::conflict::NodeConflict]> {
+        (self.version == version).then_some(self.conflicts.as_slice())
+    }
+}
+
 pub fn run(cfg: &Config) -> Result<()> {
     crate::linux::privilege::require_root()?;
     let reconnect_interval_secs = cfg
@@ -49,21 +60,21 @@ pub fn run(cfg: &Config) -> Result<()> {
     tracing::info!("[backend] xDS subscription endpoints={:?}", endpoints);
     let return_path_guard = Arc::new(Mutex::new(None));
     let snapshots = Arc::new(Mutex::new(HashMap::new()));
-    let last_applied_version = Arc::new(Mutex::new(None::<String>));
+    let last_applied = Arc::new(Mutex::new(None::<AppliedSnapshot>));
     let mut threads = Vec::new();
     for gw in &cfg.gateway_nodes {
         let endpoint = gateway_control_addr(cfg, gw)?;
         let cfg = cfg.clone();
         let guard = Arc::clone(&return_path_guard);
         let snapshots = Arc::clone(&snapshots);
-        let last_applied_version = Arc::clone(&last_applied_version);
+        let last_applied = Arc::clone(&last_applied);
         let handle = thread::spawn(move || {
             subscribe_loop(
                 &cfg,
                 endpoint,
                 guard,
                 snapshots,
-                last_applied_version,
+                last_applied,
                 reconnect_interval_secs,
             );
         });
@@ -84,7 +95,7 @@ fn subscribe_loop(
     endpoint: String,
     return_path_guard: Arc<Mutex<Option<crate::linux::return_path::ManagedReturnPath>>>,
     snapshots: Arc<Mutex<HashMap<String, crate::control::pb::DiscoveryResponse>>>,
-    last_applied_version: Arc<Mutex<Option<String>>>,
+    last_applied: Arc<Mutex<Option<AppliedSnapshot>>>,
     reconnect_interval_secs: u64,
 ) {
     while !crate::runtime::shutdown::requested() {
@@ -93,7 +104,7 @@ fn subscribe_loop(
             &endpoint,
             &return_path_guard,
             &snapshots,
-            &last_applied_version,
+            &last_applied,
         ) {
             Ok(()) => tracing::info!("[backend] xDS stream {} ended; reconnecting", endpoint),
             Err(e) => {
@@ -127,21 +138,14 @@ fn subscribe_once(
     endpoint: &str,
     return_path_guard: &Arc<Mutex<Option<crate::linux::return_path::ManagedReturnPath>>>,
     snapshots: &Arc<Mutex<HashMap<String, crate::control::pb::DiscoveryResponse>>>,
-    last_applied_version: &Arc<Mutex<Option<String>>>,
+    last_applied: &Arc<Mutex<Option<AppliedSnapshot>>>,
 ) -> Result<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building backend xDS runtime")?;
     rt.block_on(async move {
-        subscribe_gateway(
-            cfg,
-            endpoint,
-            return_path_guard,
-            snapshots,
-            last_applied_version,
-        )
-        .await
+        subscribe_gateway(cfg, endpoint, return_path_guard, snapshots, last_applied).await
     })
 }
 
@@ -163,7 +167,7 @@ async fn subscribe_gateway(
     endpoint: &str,
     return_path_guard: &Arc<Mutex<Option<crate::linux::return_path::ManagedReturnPath>>>,
     snapshots: &Arc<Mutex<HashMap<String, crate::control::pb::DiscoveryResponse>>>,
-    last_applied_version: &Arc<Mutex<Option<String>>>,
+    last_applied: &Arc<Mutex<Option<AppliedSnapshot>>>,
 ) -> Result<()> {
     tracing::info!(
         "[backend] xDS connecting endpoint={} node={} return_dev={} underlay_ip={}",
@@ -216,94 +220,68 @@ async fn subscribe_gateway(
         }) else {
             bail!("control-plane stream closed");
         };
-        let conflict_response = resp.clone();
         let version = resp.version.clone();
         let nonce = resp.nonce.clone();
         snapshot::log_recv(cfg, &resp);
-        let combined = merge_snapshot(snapshots, endpoint, resp, cfg.gateway_nodes.len())?;
-        let combined_version = combined.version.clone();
-        let already_applied = last_applied_version
-            .lock()
-            .map_err(|_| anyhow::anyhow!("applied snapshot version lock is poisoned"))?
-            .as_deref()
-            == Some(combined_version.as_str());
-        if already_applied {
-            let _ = tx
-                .send(discovery_request(cfg, &version, &nonce, true, Vec::new()))
-                .await;
-            tracing::debug!(
-                "[backend] xDS snapshot version {} unchanged; ACK without datapath apply",
-                combined_version
-            );
-            continue;
-        }
-        let conflict_cfg = cfg.clone();
-        let conflicts = match std::thread::spawn(move || {
-            snapshot::backend_conflicts_for_response(&conflict_cfg, &conflict_response)
-        })
-        .join()
-        .map_err(|_| anyhow::anyhow!("backend conflict inspection thread panicked"))?
-        {
-            Ok(conflicts) => conflicts,
-            Err(e) => {
-                tracing::warn!("[backend] preflight conflict inspection skipped: {e:#}");
-                Vec::new()
-            }
-        };
-        for conflict in &conflicts {
-            tracing::warn!(
-                "[backend] preflight conflict severity={} kind={} subject={} detail={}",
-                conflict.severity,
-                conflict.kind,
-                conflict.subject,
-                conflict.detail
-            );
-        }
-        let existing = return_path_guard
-            .lock()
-            .map_err(|_| anyhow::anyhow!("return path guard lock is poisoned"))?
-            .take();
         let apply_cfg = cfg.clone();
-        // `run_netlink` creates a small synchronous Tokio runtime.  A Tokio
-        // blocking-pool worker still carries the parent runtime context, so
-        // use a plain OS thread to keep the netlink runtime fully isolated.
-        let apply_result = std::thread::spawn(move || {
+        let endpoint = endpoint.to_string();
+        let snapshots = Arc::clone(snapshots);
+        let last_applied = Arc::clone(last_applied);
+        let return_path_guard = Arc::clone(return_path_guard);
+        // Merge, version check, apply and commit share one serialization boundary.
+        // Waiting for netlink must not block the subscription runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            merge_snapshot(&snapshots, &endpoint, resp, apply_cfg.gateway_nodes.len())?;
             let _apply_guard = DATAPATH_APPLY_LOCK
                 .lock()
                 .map_err(|_| anyhow::anyhow!("backend datapath apply lock is poisoned"))?;
-            snapshot::apply_managed_reusing(&apply_cfg, combined, existing)
+            let combined = {
+                let latest = snapshots
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("snapshot store lock is poisoned"))?;
+                snapshot::combine_gateway_responses(latest.values().cloned().collect())?
+            };
+            let combined_version = combined.version.clone();
+            let mut applied = last_applied
+                .lock()
+                .map_err(|_| anyhow::anyhow!("applied version lock is poisoned"))?;
+            if let Some(conflicts) = applied
+                .as_ref()
+                .and_then(|last| last.conflicts_for(&combined_version))
+            {
+                return Ok::<_, anyhow::Error>(conflicts.to_vec());
+            }
+            let conflicts = snapshot::backend_conflicts_for_response(&apply_cfg, &combined)?;
+            let mut guard = return_path_guard
+                .lock()
+                .map_err(|_| anyhow::anyhow!("return path guard lock is poisoned"))?;
+            *guard = Some(snapshot::apply_managed_reusing(
+                &apply_cfg,
+                combined,
+                guard.take(),
+            )?);
+            *applied = Some(AppliedSnapshot {
+                version: combined_version,
+                conflicts: conflicts.clone(),
+            });
+            Ok(conflicts)
         })
-        .join()
-        .map_err(|_| anyhow::anyhow!("backend datapath apply thread panicked"))?;
-        match apply_result {
-            Ok(guard) => {
-                *last_applied_version
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("applied snapshot version lock is poisoned"))? =
-                    Some(combined_version);
-                *return_path_guard
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("return path guard lock is poisoned"))? =
-                    Some(guard);
+        .await
+        .context("backend snapshot task failed")?;
+        match result {
+            Ok(conflicts) => {
                 let _ = tx
-                    .send(discovery_request(
-                        cfg,
-                        &version,
-                        &nonce,
-                        true,
-                        conflicts.clone(),
-                    ))
+                    .send(discovery_request(cfg, &version, &nonce, true, conflicts))
                     .await;
             }
-            Err(e) => {
-                let detail = format!("{e:#}");
+            Err(error) => {
                 let _ = tx
                     .send(
-                        discovery_request(cfg, &version, &nonce, false, conflicts)
-                            .with_error(detail),
+                        discovery_request(cfg, &version, &nonce, false, Vec::new())
+                            .with_error(format!("{error:#}")),
                     )
                     .await;
-                bail!("snapshot rejected: {e:#}");
+                return Err(error.context("snapshot rejected"));
             }
         }
     }
@@ -386,5 +364,48 @@ fn discovery_request(
                 detail: conflict.detail,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_snapshot_ack_preserves_last_conflict_observation() {
+        let applied = AppliedSnapshot {
+            version: "v1".to_string(),
+            conflicts: vec![crate::linux::conflict::NodeConflict {
+                severity: "warning".to_string(),
+                kind: "route_table".to_string(),
+                subject: "table 1104".to_string(),
+                detail: "foreign route".to_string(),
+            }],
+        };
+        let cfg = Config {
+            path: Default::default(),
+            file: Default::default(),
+        };
+        let ack = discovery_request(
+            &cfg,
+            "gateway-version",
+            "new-nonce",
+            true,
+            applied.conflicts_for("v1").unwrap().to_vec(),
+        );
+        assert_eq!(ack.conflicts.len(), 1);
+        assert_eq!(ack.conflicts[0].kind, "route_table");
+        assert_eq!(ack.response_nonce, "new-nonce");
+        assert!(applied.conflicts_for("v2").is_none());
+    }
+
+    #[test]
+    fn clean_snapshot_observation_is_distinct_from_a_cache_miss() {
+        let applied = AppliedSnapshot {
+            version: "v2".to_string(),
+            conflicts: Vec::new(),
+        };
+        assert_eq!(applied.conflicts_for("v2"), Some([].as_slice()));
+        assert!(applied.conflicts_for("v1").is_none());
     }
 }

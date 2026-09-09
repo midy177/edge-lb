@@ -118,6 +118,19 @@ eBPF。这样备机不会错误绑定主机的 underlay 或把共享 VIP 当成�
 - `/var/lib/edge-lb/edge-lb.sqlite3`：gateway 的监听、目标组、自动配置模板、
   HA 配置、通知配置、运行态清理边界和健康观测数据，由 SeaORM SQLite
   repository 统一读写。
+- 监听与目标组由 `storage/proxy_config.rs` 读取同一 SQLite 快照；新增、修改、
+  删除及整批导入校验资源和 HA 状态的预期版本，再在同一事务提交两份文档、
+  `proxy_replication/config` 待复制游标及版本记录。
+  并发版本变化会重新读取并校验引用关系。读取接口不补写配置，空列表也是有效配置。
+- native listener/health 投影不是业务权威，不能用于反向恢复监听或推断目标组。
+  配置提交后才通知数据面收敛；投影重建保留仍有效的健康观测并移除失效记录。
+  SQLite 提交不等于 eBPF 已应用，也不等于 HA 对端已提交。监听/目标组现在由
+  独立 worker 重试最新完整快照；副本校验配对身份、业务版本和当前角色，拒绝乱序。
+  仲裁任期、晋升前追平及客户端操作去重尚未完成。
+- backend 也使用本机 `edge-lb.sqlite3`，但只为策略路由保存
+  `route_ownership/local` 创建记录（当前 boot ID、网络命名空间、规则和路由标识）。
+  该记录不属于 HA 业务副本，不在 gateway 之间同步；部署必须保留本机 state_dir。
+  `route-ownership.lock` 只用于本机 apply/cleanup 互斥，不是配置文件。
 - eBPF map、flow map、TC attachment、VXLAN/FDB 和策略路由是运行时内核状态，
   由 gateway/backend heal 幂等收敛，不作为业务配置文件持久化。
 
@@ -131,7 +144,24 @@ native 模式不把后端目标作为独立的配置资源。目标组中的每�
 ## HA 边界
 
 目标 HA 是带连接同步的 Active/Standby。MASTER gateway 权威维护监听和目标组，
-BACKUP 通过 xDS-like 控制面接收副本；native flow map 通过受信任的 HA 通道同步。
+BACKUP 通过受认证的 peer HTTP API 接收监听/目标组完整快照；native flow map 通过
+受信任的 HA 通道同步。这两类同步的数据源、版本和时效要求不同。
 切换时只有 MASTER 绑定 VIP、发送 GARP 并承担入口流量，BACKUP 保持数据面待命。
 backend 同时维护两个 gateway 的 VXLAN 回程信息，并依据 gateway 独立的 DSCP/mark
 派生值选择正确的回程路径。
+
+HTTP API 的 4 个普通工作线程负责管理请求和 BACKUP 向 MASTER 的同步转发；
+仅本地落盘、不再调用对端的副本写接口由独立工作线程接收，避免回写等待普通线程。
+两类待处理队列各限 32，满载返回 503；请求仍经过同一来源和 token 校验。
+HA HTTP client 使用共享连接池和逐请求认证，直接连接配置的 peer，不跟随重定向。
+监听/目标组的持久化最新状态发送槽负责重试，业务版本负责乱序拒绝；不能仅靠
+工作线程隔离保证一致性。HA 写接口的 202 只表示 MASTER 配置与待复制状态已提交，
+副本可见性需通过 `/api/v1/ha/proxy-config-sync` 校验。通知和模板复制暂未迁移。
+UI 使用 202 响应的可见性版本下限查询本机复制游标，最多等待 30 秒；BACKUP 追平后
+刷新当前列表，MASTER 收到匹配 ACK 后才显示副本确认。超时仅提示同步尚未确认，
+不重发已提交的业务操作。下限可能包含并发后续提交，不是恰好一次的操作回执。
+API/mock 回归已覆盖此流程，浏览器实际交互和真实双机验收仍未完成，不能直接当作可部署版本。
+独立 `ui serve` 在 gateway 角色下也运行配置复制 worker，但不启动 BFD 或数据面；
+必须独占 state_dir，不能与 gateway daemon 共用数据库运行。生产二进制的双进程测试已
+覆盖 HTTP 鉴权、转发、SQLite 落盘、进程重启重试和停机调整角色后的写入限制；
+该控制面测试不替代真实链路的自动选主及无损切换验收。

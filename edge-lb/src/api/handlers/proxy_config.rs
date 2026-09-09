@@ -11,9 +11,25 @@ use crate::{
     },
 };
 
+pub(super) fn mutation_error(error: crate::storage::proxy_config::MutationError) -> Reply {
+    use crate::storage::proxy_config::MutationError;
+    match error {
+        MutationError::Rejected(error) => Reply::error(error.status, error.message),
+        MutationError::Storage(error) => {
+            Reply::error(500, format!("committing proxy configuration: {error:#}"))
+        }
+        MutationError::Contended => Reply::error(
+            409,
+            "proxy configuration changed concurrently; retry the operation",
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(in crate::api) enum ProxyConfigOperation {
+    ListenerImport { body: String },
+    TargetGroupImport { body: String },
     ListenerCreate { body: String },
     ListenerUpdate { name: String, body: String },
     ListenerDelete { name: String },
@@ -43,11 +59,21 @@ pub(in crate::api) fn peer_apply_active(cfg: &Config, body: &str) -> Reply {
 }
 
 pub(in crate::api) fn peer_apply_replica(cfg: &Config, body: &str) -> Reply {
-    let op: ProxyConfigOperation = match serde_json::from_str(body) {
-        Ok(op) => op,
-        Err(e) => return Reply::error(400, format!("bad proxy config operation JSON: {e}")),
+    let snapshot = match serde_json::from_str::<crate::storage::proxy_replication::Snapshot>(body) {
+        Ok(value) => value,
+        Err(error) => return Reply::error(400, format!("bad proxy snapshot JSON: {error}")),
     };
-    invoke_replica(cfg, &op)
+    match crate::storage::proxy_replication::receive(cfg, &snapshot) {
+        Ok(receipt) => Reply::json(200, serde_json::to_value(receipt).unwrap()),
+        Err(error) => mutation_error(error),
+    }
+}
+
+pub(in crate::api) fn sync_status(cfg: &Config) -> Reply {
+    match crate::storage::proxy_replication::status(cfg) {
+        Ok(status) => Reply::json(200, serde_json::to_value(status).unwrap()),
+        Err(error) => Reply::error(500, format!("reading proxy replication status: {error:#}")),
+    }
 }
 
 fn apply_as_master(
@@ -56,35 +82,46 @@ fn apply_as_master(
     peer: Option<ha::GatewayHaPeer>,
 ) -> Reply {
     let reply = invoke_local(cfg, &op);
-    if !(200..300).contains(&reply.status) {
-        return reply;
+    if (200..300).contains(&reply.status) && peer.is_some() {
+        // The mutation has already committed the canonical pair and durable
+        // replication cursor. No peer network operation is needed to accept it.
+        return accepted_reply(
+            reply,
+            &cfg.node_name,
+            crate::storage::proxy_replication::status(cfg).ok(),
+        );
     }
-    let Some(peer) = peer else {
-        return reply;
-    };
-    let replica_op = sanitize_replica_operation(cfg, &op);
-    match ha_write::post_peer_json(
-        cfg,
-        &peer,
-        "/api/v1/ha/peer/proxy-config/replica",
-        &replica_op,
-    ) {
-        Ok(response) if (200..300).contains(&response.status) => reply,
-        Ok(response) => Reply::error(
-            502,
-            format!(
-                "local native proxy write applied but HA replica sync to {} failed with HTTP {}: {}",
-                peer.name, response.status, response.body
-            ),
-        ),
-        Err(e) => Reply::error(
-            502,
-            format!(
-                "local native proxy write applied but HA replica sync to {} failed: {e:#}",
-                peer.name
-            ),
-        ),
+    reply
+}
+
+fn accepted_reply(
+    reply: Reply,
+    authority: &str,
+    cursor: Option<crate::storage::proxy_replication::SyncState>,
+) -> Reply {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&reply.body).expect("local JSON reply");
+    body["sync"] = serde_json::json!({
+        "state": "accepted",
+        "authority": authority,
+        "authority_committed": true,
+        "replica_confirmed": false,
+    });
+    // A post-commit visibility barrier may include a later concurrent write.
+    // Failure to read it must not turn an already committed write into an error.
+    if let Some(cursor) = cursor
+        && cursor.source == authority
+        && cursor.sequence > 0
+        && !cursor.pairing_id.is_empty()
+    {
+        body["sync"]["barrier"] = serde_json::json!({
+            "sequence": cursor.sequence,
+            "source": cursor.source,
+            "pairing_id": cursor.pairing_id,
+            "content_hash": cursor.content_hash,
+        });
     }
+    Reply::json(202, body)
 }
 
 fn forward_to_master(cfg: &Config, peer: &ha::GatewayHaPeer, op: &ProxyConfigOperation) -> Reply {
@@ -93,7 +130,7 @@ fn forward_to_master(cfg: &Config, peer: &ha::GatewayHaPeer, op: &ProxyConfigOpe
         Err(e) => Reply::error(
             502,
             format!(
-                "forwarding native proxy write to MASTER {} failed: {e:#}",
+                "forwarding proxy write to MASTER {} failed; commit outcome is unknown: {e:#}",
                 peer.name
             ),
         ),
@@ -102,6 +139,12 @@ fn forward_to_master(cfg: &Config, peer: &ha::GatewayHaPeer, op: &ProxyConfigOpe
 
 fn invoke_local(cfg: &Config, op: &ProxyConfigOperation) -> Reply {
     match op {
+        ProxyConfigOperation::ListenerImport { body } => {
+            super::listeners::import_configs_local(cfg, body)
+        }
+        ProxyConfigOperation::TargetGroupImport { body } => {
+            super::target_groups::import_target_groups_local(cfg, body)
+        }
         ProxyConfigOperation::ListenerCreate { body } => {
             super::listeners::create_config_local(cfg, body)
         }
@@ -123,50 +166,6 @@ fn invoke_local(cfg: &Config, op: &ProxyConfigOperation) -> Reply {
     }
 }
 
-fn invoke_replica(cfg: &Config, op: &ProxyConfigOperation) -> Reply {
-    match op {
-        ProxyConfigOperation::ListenerCreate { body } => {
-            let body = sanitize_replica_listener_body(cfg, body);
-            super::listeners::create_or_replace_config_local(cfg, &body)
-        }
-        ProxyConfigOperation::ListenerUpdate { name, body } => {
-            let body = sanitize_replica_listener_body(cfg, body);
-            super::listeners::update_config_local(cfg, name, &body)
-        }
-        ProxyConfigOperation::ListenerDelete { name } => ok_if_missing(
-            super::listeners::delete_config_local(cfg, name),
-            "listener",
-            name,
-        ),
-        ProxyConfigOperation::TargetGroupCreate { body } => {
-            super::target_groups::upsert_target_group_local(cfg, body)
-        }
-        ProxyConfigOperation::TargetGroupUpdate { name, body } => {
-            super::target_groups::upsert_target_group_local(cfg, &target_group_body(name, body))
-        }
-        ProxyConfigOperation::TargetGroupDelete { name } => ok_if_missing(
-            super::target_groups::delete_target_group_local(cfg, name),
-            "target group",
-            name,
-        ),
-    }
-}
-
-fn sanitize_replica_operation(cfg: &Config, op: &ProxyConfigOperation) -> ProxyConfigOperation {
-    match op {
-        ProxyConfigOperation::ListenerCreate { body } => ProxyConfigOperation::ListenerCreate {
-            body: sanitize_replica_listener_body(cfg, body),
-        },
-        ProxyConfigOperation::ListenerUpdate { name, body } => {
-            ProxyConfigOperation::ListenerUpdate {
-                name: name.clone(),
-                body: sanitize_replica_listener_body(cfg, body),
-            }
-        }
-        _ => op.clone(),
-    }
-}
-
 fn target_group_body(name: &str, body: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
         return body.to_string();
@@ -180,96 +179,62 @@ fn target_group_body(name: &str, body: &str) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
 }
 
-fn ok_if_missing(reply: Reply, object: &str, name: &str) -> Reply {
-    if reply.status == 404 {
-        Reply::json(
-            200,
-            serde_json::json!({
-                "status": "already_absent",
-                "object": object,
-                "name": name,
-            }),
-        )
-    } else {
-        reply
-    }
-}
-
-fn sanitize_replica_listener_body(cfg: &Config, body: &str) -> String {
-    match sanitize_replica_listener_body_inner(cfg, body) {
-        Ok(Some(next)) => next,
-        Ok(None) => body.to_string(),
-        Err(e) => {
-            tracing::warn!("HA replica listener body sanitize skipped: {e:#}");
-            body.to_string()
-        }
-    }
-}
-
-fn sanitize_replica_listener_body_inner(
-    cfg: &Config,
-    body: &str,
-) -> anyhow::Result<Option<String>> {
-    let ha_cfg = ha::load_for_state_dir(std::path::Path::new(&*cfg.state_dir))?;
-    if ha_cfg.peers.is_empty() {
-        return Ok(None);
-    }
-
-    let mut value: serde_json::Value = serde_json::from_str(body)?;
-    // VIP ownership is local HA state. Do not replicate either gateway
-    // underlay addresses or the shared L2 VIP through listener writes.
-    if clear_replica_listener_vips(&mut value) {
-        return Ok(Some(serde_json::to_string(&value)?));
-    }
-
-    Ok(None)
-}
-
-fn clear_replica_listener_vips(value: &mut serde_json::Value) -> bool {
-    let Some(object) = value.as_object_mut() else {
-        return false;
-    };
-    let has_vips = object
-        .get("vip_ips")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|values| !values.is_empty());
-    if has_vips {
-        object.insert("vip_ips".to_string(), serde_json::Value::Array(Vec::new()));
-    }
-    has_vips
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::proxy_replication::SyncState;
+    use serde_json::json;
 
     #[test]
-    fn replica_listener_vips_are_not_replicated() {
-        let mut listener = serde_json::json!({
-            "name": "tcp-80",
-            "vip_ips": ["192.168.0.12", "192.168.0.6"],
-            "port": 80,
-            "target_port": 8080,
-            "target_group": "web",
-            "protocols": ["tcp"]
-        });
-
-        assert!(clear_replica_listener_vips(&mut listener));
-        assert_eq!(listener.get("vip_ips"), Some(&serde_json::json!([])));
+    fn accepted_write_exposes_visibility_barrier_without_claiming_replica_ack() {
+        let reply = accepted_reply(
+            Reply::json(201, json!({"name": "tcp-80", "port": 80})),
+            "gateway-a",
+            Some(SyncState {
+                sequence: 7,
+                source: "gateway-a".into(),
+                pairing_id: "pair-1".into(),
+                content_hash: "hash-7".into(),
+                pending: false,
+                last_error: None,
+            }),
+        );
+        assert_eq!(reply.status, 202);
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["name"], "tcp-80");
+        assert_eq!(body["sync"]["authority_committed"], true);
+        assert_eq!(body["sync"]["replica_confirmed"], false);
+        assert_eq!(
+            body["sync"]["barrier"],
+            json!({
+                "sequence": 7, "source": "gateway-a", "pairing_id": "pair-1", "content_hash": "hash-7"
+            })
+        );
     }
 
     #[test]
-    fn empty_replica_listener_vips_are_left_unchanged() {
-        let mut listener = serde_json::json!({
-            "name": "tcp-80",
-            "vip_ips": [],
-            "port": 80,
-            "target_port": 8080,
-            "target_group": "web",
-            "protocols": ["tcp"]
-        });
-
-        assert!(!clear_replica_listener_vips(&mut listener));
-        assert_eq!(listener.get("vip_ips"), Some(&serde_json::json!([])));
+    fn missing_or_foreign_cursor_does_not_turn_committed_write_into_failure() {
+        for cursor in [
+            None,
+            Some(SyncState::default()),
+            Some(SyncState {
+                sequence: 8,
+                source: "gateway-b".into(),
+                pairing_id: "pair-1".into(),
+                content_hash: "hash-8".into(),
+                pending: false,
+                last_error: None,
+            }),
+        ] {
+            let reply = accepted_reply(
+                Reply::json(200, json!({"status": "ok"})),
+                "gateway-a",
+                cursor,
+            );
+            assert_eq!(reply.status, 202);
+            let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["sync"]["authority_committed"], true);
+            assert!(body["sync"].get("barrier").is_none());
+        }
     }
 }

@@ -36,8 +36,7 @@ mod validate;
 pub use model::{
     ActiveSource, ApiConfig, BackendConfig, BackendControlConfig, BackendNode,
     BackendReturnPathConfig, BackendReturnPort, BackendTarget, BackendXdsConfig,
-    ControlPlaneConfig, ControlPlaneMode, DeviceDiscoveryRuntime, EDGE_CURRENT_MARK_BASE,
-    EDGE_CURRENT_TABLE_BASE, EDGE_MARK_BASE, EDGE_MARK_LIMIT, EDGE_TABLE_BASE, EDGE_TABLE_LIMIT,
+    ControlPlaneConfig, ControlPlaneMode, DeviceDiscoveryRuntime, EDGE_MARK_BASE, EDGE_TABLE_BASE,
     FileConfig, GatewayConfig, GatewayNode, GatewayReconcileConfig, GatewayXdsConfig, HaConfig,
     IpDiscoveryConfig, IpDiscoveryRuntime, LbMode, LbSelect, Listener, NetworkConfig, NodeRole,
     Protocol, RuntimeDiscovery, TargetGroup, gateway_slot, return_mark, return_table_id,
@@ -434,8 +433,10 @@ mod tests {
 
     #[test]
     fn xds_backend_bootstrap_allows_empty_proxy_config() {
-        let mut file = FileConfig::default();
-        file.node_role = NodeRole::Backend;
+        let mut file = FileConfig {
+            node_role: NodeRole::Backend,
+            ..FileConfig::default()
+        };
         file.ha.active_source = ActiveSource::Xds;
         file.control_plane.enabled = true;
         file.control_plane.mode = ControlPlaneMode::Xds;
@@ -448,10 +449,12 @@ mod tests {
 
     #[test]
     fn native_datapath_accepts_default_dnat_listener() {
-        let mut file = FileConfig::default();
-        file.node_role = NodeRole::Gateway;
-        file.public_ip = "198.51.100.10".parse().unwrap();
-        file.underlay_ip = "192.0.2.10".parse().unwrap();
+        let mut file = FileConfig {
+            node_role: NodeRole::Gateway,
+            public_ip: "198.51.100.10".parse().unwrap(),
+            underlay_ip: "192.0.2.10".parse().unwrap(),
+            ..FileConfig::default()
+        };
         file.network.underlay_dev = "eth0".to_string();
         file.network.gateway_ip = "192.0.2.10".parse().unwrap();
         file.network.gateway_public_ip = "198.51.100.10".parse().unwrap();
@@ -660,8 +663,10 @@ stun_servers = [" stun.example.test:3478 ", "stun.backup.test:3478"]
 
     #[test]
     fn user_toml_omits_derived_backend_return_identifiers() {
-        let mut file = FileConfig::default();
-        file.node_role = NodeRole::Backend;
+        let mut file = FileConfig {
+            node_role: NodeRole::Backend,
+            ..FileConfig::default()
+        };
         file.normalize();
 
         let text = file.render_user_toml();

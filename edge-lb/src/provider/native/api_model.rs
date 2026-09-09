@@ -7,6 +7,8 @@ pub struct NativeListenerStateList {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeListenerStateEntry {
+    #[serde(default)]
+    pub target_group: String,
     pub spec: NativeListenerSpec,
     #[serde(default)]
     pub targets: Vec<NativeListenerTarget>,
@@ -66,6 +68,8 @@ pub struct TargetHealthList {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetHealthEntry {
+    #[serde(default)]
+    pub target_group: String,
     pub host_name: String,
     #[serde(default)]
     pub name: String,
@@ -133,6 +137,7 @@ mod tests {
     fn native_listener_state_uses_native_resource_field_names() {
         let value = NativeListenerStateList {
             listeners: vec![NativeListenerStateEntry {
+                target_group: "web".to_string(),
                 spec: NativeListenerSpec {
                     vip_ips: vec!["192.0.2.10".to_string()],
                     port: 8080,

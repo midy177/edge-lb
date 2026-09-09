@@ -24,7 +24,7 @@ loxilb provider、旧 service 投影或不支持的监听模式字段。监听�
      `egress`。
    - 删除不支持的 `onearm/fullnat/dsr/fullproxy/hostonearm` 监听模式。
    - `mode` 固定为 `default`，UI/API 不再暴露其他转发模式。
-   - HA 的 BGP、L2、hook 接管能力保留在 HA 配置中，不属于单个监听配置。
+   - HA 的 L2、hook 接管能力保留在 HA 配置中，不属于单个监听配置；BGP 接管模式不在当前配置面暴露。
 
 3. 保持 xDS/HA 边界
    - backend xDS 只下发回程所需的 gateway VXLAN、DSCP、mark/table 和端口信息。
@@ -43,5 +43,5 @@ loxilb provider、旧 service 投影或不支持的监听模式字段。监听�
 ## 非目标
 
 - 本轮不新增 `n2/n3`、one-arm、fullnat 或 fullproxy 数据面。
-- 本轮不修改 HA provider 的 BGP/L2/hook 表单能力。
+- HA provider 当前只保留 L2/hook 表单能力；hook 脚本路径固定，不允许在 UI/API 中修改。
 - 本轮不做部署、打 tag 或提交，除非用户明确要求。

@@ -31,7 +31,7 @@ underlay_dev = "auto"
 vxlan_dev = "edge-hub"
 vni = 100
 vxlan_port = 4789
-vxlan_mtu = "auto"             # auto = underlay PMTU 实测后减去 VXLAN 开销；可固定为 1450
+vxlan_mtu = "auto"             # auto = 设备/内核已知路由 MTU 的保守值，非路径实测；IPv4 最大 1450
 dscp = 46
 
 [gateway.api]

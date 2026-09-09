@@ -8,7 +8,7 @@ use crate::{
     config::{Config, NodeRole},
     events::{self, EdgeEvent, Severity},
     role::gateway::{self, ApplyOptions},
-    runtime::ha::{self, GatewayHaPeer, GatewayHaRuntimeConfig, VipProvider},
+    runtime::ha::{self, GatewayHaPeer, GatewayHaRuntimeConfig},
 };
 
 #[derive(Debug, serde::Serialize)]
@@ -360,26 +360,25 @@ pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
     };
     let mut garp_announced = false;
     let mut vip_bound = false;
-    if ha_cfg.enabled
-        && matches!(ha_cfg.vip.provider, VipProvider::L2)
-        && let Some(vip) = ha_cfg.vip.private_vip.as_deref()
-    {
-        let vip = match vip.parse() {
-            Ok(value) => value,
-            Err(e) => return Reply::error(400, format!("bad private VIP {vip}: {e}")),
+    if ha_cfg.enabled {
+        let changed = match crate::provider::native::ha::reconcile_vip(cfg) {
+            Ok(changed) => changed,
+            Err(e) => return Reply::error(500, format!("applying HA takeover state: {e:#}")),
         };
-        let device = match ha_cfg.vip.bind_device {
-            crate::runtime::ha::VipBindDevice::Underlay => cfg.network().underlay_dev.clone(),
-            crate::runtime::ha::VipBindDevice::Loopback => "lo".to_string(),
-        };
-        if let Err(e) = crate::linux::addr::bind_vip_on_device(cfg, vip, &device) {
-            return Reply::error(500, format!("binding private VIP: {e:#}"));
+        if matches!(ha_cfg.vip.provider, ha::VipProvider::L2)
+            && let Some(vip_text) = ha_cfg.vip.private_vip.as_deref()
+        {
+            let vip = match vip_text.parse() {
+                Ok(vip) => vip,
+                Err(e) => return Reply::error(400, format!("bad private VIP {vip_text}: {e}")),
+            };
+            let device = match ha_cfg.vip.bind_device {
+                ha::VipBindDevice::Loopback => "lo".to_string(),
+                ha::VipBindDevice::Underlay => cfg.network().underlay_dev.clone(),
+            };
+            vip_bound = crate::linux::addr::vip_bound_on_device(cfg, vip, &device);
+            garp_announced = changed && vip_bound;
         }
-        vip_bound = true;
-        if let Err(e) = crate::runtime::ka_hook::announce_vip(cfg, vip, &ha_cfg.vip) {
-            return Reply::error(500, format!("announcing private VIP: {e:#}"));
-        }
-        garp_announced = true;
     }
     Reply::json(
         200,
@@ -477,7 +476,7 @@ fn require_gateway(cfg: &Config) -> Option<Reply> {
 }
 
 fn datapath_refresh_required(value: &GatewayHaRuntimeConfig) -> bool {
-    value.enabled && (value.connection_sync || matches!(value.vip.provider, VipProvider::Bgp))
+    value.enabled && value.connection_sync
 }
 
 fn native_ha_state(cfg: &Config) -> crate::provider::native::ha::NativeHaState {

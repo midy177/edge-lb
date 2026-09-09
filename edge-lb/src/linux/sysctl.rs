@@ -124,6 +124,31 @@ fn read_sysctl_u64(path: &str) -> io::Result<u64> {
 mod tests {
     use super::*;
 
+    struct TestSysctl(std::path::PathBuf);
+
+    impl TestSysctl {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("edge-lb-sysctl-{}-{nonce}", std::process::id()));
+            fs::File::create_new(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TestSysctl {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn forwarding_path_is_the_kernel_sysctl() {
         assert_eq!(IPV4_FORWARD, "/proc/sys/net/ipv4/ip_forward");
@@ -136,49 +161,48 @@ mod tests {
 
     #[test]
     fn floor_tuning_never_lowers_existing_values() {
+        let file = TestSysctl::new();
+        for current in [TARGET_NF_CONNTRACK_MAX, TARGET_NF_CONNTRACK_MAX + 1] {
+            let original = format!("{current:020}\n");
+            fs::write(&file.0, &original).unwrap();
+            ensure_sysctl_floor("test", file.path(), TARGET_NF_CONNTRACK_MAX);
+            assert_eq!(fs::read_to_string(&file.0).unwrap(), original);
+        }
+        fs::write(&file.0, "1\n").unwrap();
+        ensure_sysctl_floor("test", file.path(), TARGET_NF_CONNTRACK_MAX);
         assert_eq!(
-            (|current| {
-                if current < TARGET_NF_CONNTRACK_MAX {
-                    Some(TARGET_NF_CONNTRACK_MAX)
-                } else {
-                    None
-                }
-            })(TARGET_NF_CONNTRACK_MAX + 1),
-            None
-        );
-        assert_eq!(
-            (|current| {
-                if current < TARGET_NF_CONNTRACK_MAX {
-                    Some(TARGET_NF_CONNTRACK_MAX)
-                } else {
-                    None
-                }
-            })(1),
-            Some(TARGET_NF_CONNTRACK_MAX)
+            read_sysctl_u64(file.path()).unwrap(),
+            TARGET_NF_CONNTRACK_MAX
         );
     }
 
     #[test]
     fn tcp_fin_timeout_tuning_never_raises_lower_values() {
+        let file = TestSysctl::new();
+        for current in [TARGET_TCP_FIN_TIMEOUT, TARGET_TCP_FIN_TIMEOUT - 1] {
+            let original = format!("{current:020}\n");
+            fs::write(&file.0, &original).unwrap();
+            ensure_sysctl_ceiling("test", file.path(), TARGET_TCP_FIN_TIMEOUT);
+            assert_eq!(fs::read_to_string(&file.0).unwrap(), original);
+        }
+        fs::write(&file.0, "60\n").unwrap();
+        ensure_sysctl_ceiling("test", file.path(), TARGET_TCP_FIN_TIMEOUT);
         assert_eq!(
-            (|current| {
-                if current > TARGET_TCP_FIN_TIMEOUT {
-                    Some(TARGET_TCP_FIN_TIMEOUT)
-                } else {
-                    None
-                }
-            })(TARGET_TCP_FIN_TIMEOUT - 1),
-            None
+            read_sysctl_u64(file.path()).unwrap(),
+            TARGET_TCP_FIN_TIMEOUT
         );
-        assert_eq!(
-            (|current| {
-                if current > TARGET_TCP_FIN_TIMEOUT {
-                    Some(TARGET_TCP_FIN_TIMEOUT)
-                } else {
-                    None
-                }
-            })(60),
-            Some(TARGET_TCP_FIN_TIMEOUT)
-        );
+    }
+
+    #[test]
+    fn invalid_or_missing_sysctl_is_not_overwritten_or_created() {
+        let file = TestSysctl::new();
+        fs::write(&file.0, "invalid\n").unwrap();
+        ensure_sysctl_floor("test", file.path(), TARGET_NF_CONNTRACK_MAX);
+        ensure_sysctl_ceiling("test", file.path(), TARGET_TCP_FIN_TIMEOUT);
+        assert_eq!(fs::read_to_string(&file.0).unwrap(), "invalid\n");
+        fs::remove_file(&file.0).unwrap();
+        ensure_sysctl_floor("test", file.path(), TARGET_NF_CONNTRACK_MAX);
+        ensure_sysctl_ceiling("test", file.path(), TARGET_TCP_FIN_TIMEOUT);
+        assert!(!file.0.exists());
     }
 }

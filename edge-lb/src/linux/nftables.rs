@@ -708,11 +708,13 @@ mod tests {
 
     #[test]
     fn applies_and_deletes_probe_table_when_privileged() {
-        let mut file = FileConfig::default();
-        file.network = NetworkConfig {
-            vxlan_dev: "edge-lb-test-vxlan".to_string(),
-            dscp: 46,
-            ..NetworkConfig::default()
+        let mut file = FileConfig {
+            network: NetworkConfig {
+                vxlan_dev: "edge-lb-test-vxlan".to_string(),
+                dscp: 46,
+                ..NetworkConfig::default()
+            },
+            ..FileConfig::default()
         };
         file.backend.nft_table = format!("edge_lb_test_{}", std::process::id());
         file.backend.ct_mark = 1;

@@ -1,6 +1,6 @@
 //! HA and datapath notification dispatcher.
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::{io::Read, sync::mpsc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
@@ -388,14 +388,32 @@ fn send_lanxin(
     )
 }
 
-fn response(resp: reqwest::blocking::Response) -> Result<Delivery> {
+fn response(mut resp: reqwest::blocking::Response) -> Result<Delivery> {
     let status = resp.status();
-    let text = resp.text().unwrap_or_default();
+    let text = read_limited_text(&mut resp).context("reading notification response")?;
     Ok(Delivery {
         ok: status.is_success(),
         status_code: Some(status.as_u16()),
         response: text,
     })
+}
+
+fn read_limited_text(mut reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::with_capacity(RESPONSE_LIMIT + 1);
+    reader
+        .by_ref()
+        .take((RESPONSE_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .context("reading limited text")?;
+    let truncated = bytes.len() > RESPONSE_LIMIT;
+    if truncated {
+        bytes.truncate(RESPONSE_LIMIT);
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("...");
+    }
+    Ok(text)
 }
 
 fn json_code_delivery(mut delivery: Delivery, field: &str, expected: i64) -> Delivery {
@@ -440,4 +458,31 @@ fn truncate_response(value: &str) -> String {
         end -= 1;
     }
     format!("{}...", &value[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limited_response_reader_keeps_small_text() {
+        let text = read_limited_text("ok".as_bytes()).unwrap();
+        assert_eq!(text, "ok");
+    }
+
+    #[test]
+    fn limited_response_reader_truncates_while_reading() {
+        let input = "x".repeat(RESPONSE_LIMIT + 4096);
+        let text = read_limited_text(input.as_bytes()).unwrap();
+        assert_eq!(text.len(), RESPONSE_LIMIT + 3);
+        assert!(text.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_response_respects_utf8_boundaries() {
+        let input = format!("{}界", "x".repeat(RESPONSE_LIMIT - 1));
+        let text = truncate_response(&input);
+        assert!(text.ends_with("..."));
+        assert!(text.is_char_boundary(text.len()));
+    }
 }

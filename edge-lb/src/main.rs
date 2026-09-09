@@ -123,7 +123,12 @@ fn run(cli: Cli) -> Result<()> {
             BackendCommand::Cleanup => backend::cleanup(&cfg),
         },
         Commands::Ui { command } => match command {
-            UiCommand::Serve { listen } => api::serve(&cfg, listen),
+            UiCommand::Serve { listen } => {
+                if cfg.node_role == crate::config::NodeRole::Gateway {
+                    crate::runtime::proxy_replication::spawn(&cfg)?;
+                }
+                api::serve(&cfg, listen)
+            }
         },
         Commands::Verify(args) => {
             let outcome = verify::run_checks(&cfg, &args)?;
@@ -169,8 +174,9 @@ fn command_needs_runtime_storage(command: &Commands, file: &FileConfig) -> bool 
     matches!(
         (command, file.node_role),
         (Commands::Gateway(_), crate::config::NodeRole::Gateway)
-            | (Commands::Ui { .. }, crate::config::NodeRole::Gateway)
-            | (Commands::Verify(_), crate::config::NodeRole::Gateway)
+            | (Commands::Backend(_), crate::config::NodeRole::Backend)
+            | (Commands::Ui { .. }, _)
+            | (Commands::Verify(_), _)
     )
 }
 
@@ -277,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn config_and_backend_commands_do_not_initialize_gateway_runtime_storage() {
+    fn backend_commands_initialize_local_ownership_storage_but_config_commands_do_not() {
         let backend_file = FileConfig {
             node_role: crate::config::NodeRole::Backend,
             ..FileConfig::default()
@@ -287,13 +293,20 @@ mod tests {
             ..FileConfig::default()
         };
 
-        assert!(!command_needs_runtime_storage(
-            &Commands::Backend(cli::BackendArgs {
-                command: BackendCommand::Run,
-                overrides: Overrides::default(),
-            }),
-            &backend_file
-        ));
+        for command in [
+            BackendCommand::Run,
+            BackendCommand::Apply,
+            BackendCommand::Cleanup,
+            BackendCommand::Show,
+        ] {
+            assert!(command_needs_runtime_storage(
+                &Commands::Backend(cli::BackendArgs {
+                    command,
+                    overrides: Overrides::default()
+                }),
+                &backend_file
+            ));
+        }
         assert!(!command_needs_runtime_storage(
             &Commands::Config {
                 command: ConfigCommand::Validate {

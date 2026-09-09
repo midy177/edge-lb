@@ -23,6 +23,7 @@ pub const DEFAULT_PERIOD_SECS: u64 = 5;
 pub const DEFAULT_RETRIES: u32 = 2;
 /// Probe types supported by the native worker. `none` disables probing.
 const EXECUTABLE_PROBES: [&str; 5] = ["ping", "tcp", "udp", "http", "https"];
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -34,7 +35,7 @@ pub enum ProbeOutcome {
 /// listener protocol that references its group. The probe uses `port`, while
 /// `names` use each listener's forwarding target port because that is the
 /// runtime identity stored by the native datapath.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeTarget {
     pub names: Vec<String>,
     pub address: IpAddr,
@@ -57,49 +58,79 @@ struct ProbeRuntime {
 
 pub fn run_worker(cfg: Config) {
     let mut runtimes: HashMap<String, ProbeRuntime> = HashMap::new();
-    let mut next_due = Instant::now();
+    let mut schedule = HashMap::<String, (ProbeTarget, Instant)>::new();
+    let clients = ProbeClients::new();
     tracing::info!("[probe] native target probe worker started");
-    loop {
-        if crate::runtime::shutdown::requested() {
-            tracing::info!("[probe] shutdown requested");
-            return;
-        }
-        let now = Instant::now();
-        if now < next_due {
-            std::thread::sleep(Duration::from_millis(250).min(next_due - now));
-            continue;
-        }
-        let period = probe_round(&cfg, &mut runtimes);
-        next_due = Instant::now() + period;
+    while !crate::runtime::shutdown::requested() {
+        probe_round(&cfg, &clients, &mut schedule, &mut runtimes);
+        std::thread::sleep(Duration::from_secs(1));
     }
+    tracing::info!("[probe] shutdown requested");
 }
 
-/// Probe every monitored backend target once and apply state transitions.
-/// Returns the shortest configured period (the wait before the next round).
-fn probe_round(cfg: &Config, runtimes: &mut HashMap<String, ProbeRuntime>) -> Duration {
+/// Keep independent deadlines; a short-period group must not accelerate every probe.
+fn probe_round(
+    cfg: &Config,
+    clients: &ProbeClients,
+    schedule: &mut HashMap<String, (ProbeTarget, Instant)>,
+    runtimes: &mut HashMap<String, ProbeRuntime>,
+) {
     let mut effective = cfg.clone();
     if let Err(error) = super::hydrate_proxy_config_from_api(&mut effective) {
         tracing::warn!("[probe] native proxy state refresh failed: {error:#}");
+        return;
     }
     let targets = scheduled_targets(&effective);
-    if targets.is_empty() {
-        return Duration::from_secs(DEFAULT_PERIOD_SECS);
-    }
-    let mut shortest = Duration::from_secs(DEFAULT_PERIOD_SECS);
-    let clients = ProbeClients::new();
-    let mut outcomes: Vec<(&ProbeTarget, ProbeOutcome)> = Vec::new();
+    let keys = targets
+        .iter()
+        .map(|target| names_key(&target.names))
+        .collect::<BTreeSet<_>>();
+    schedule.retain(|key, _| keys.contains(key));
+    runtimes.retain(|key, _| keys.contains(key));
+    let mut outcomes = Vec::new();
     for target in &targets {
-        shortest = shortest.min(target.period);
-        let outcome = probe_target_with_clients(target, &clients);
+        let key = names_key(&target.names);
+        let now = Instant::now();
+        if !probe_is_due(schedule, &key, target, now) {
+            continue;
+        }
+        if schedule
+            .get(&key)
+            .is_some_and(|(previous, _)| previous != target)
+        {
+            runtimes.remove(&key);
+        }
+        let outcome = probe_target_with_clients(target, clients);
+        schedule.insert(key, (target.clone(), Instant::now() + target.period));
         outcomes.push((target, outcome));
     }
+    if outcomes.is_empty() {
+        return;
+    }
+    // Do not publish a result for a probe definition removed or edited during I/O.
+    let mut current = cfg.clone();
+    if super::hydrate_proxy_config_from_api(&mut current).is_err() {
+        return;
+    }
+    let current_targets = scheduled_targets(&current);
+    outcomes.retain(|(target, _)| current_targets.contains(target));
     let transitions = apply_results(cfg, &outcomes, runtimes);
     if transitions > 0
         && let Err(e) = crate::linux::native_dnat::refresh_target_health(cfg)
     {
         tracing::warn!("[probe] native health map refresh failed: {e:#}");
     }
-    shortest
+}
+
+fn probe_is_due(
+    schedule: &HashMap<String, (ProbeTarget, Instant)>,
+    key: &str,
+    target: &ProbeTarget,
+    now: Instant,
+) -> bool {
+    schedule
+        .get(key)
+        .is_none_or(|(previous, due)| previous != target || now >= *due)
 }
 
 /// Expand monitored target groups into probe targets. Backend target addresses are
@@ -142,7 +173,7 @@ pub fn scheduled_targets(cfg: &Config) -> Vec<ProbeTarget> {
             let names = listener_identities
                 .iter()
                 .map(|(protocol, target_port)| {
-                    target_health_identity(address, protocol, *target_port)
+                    target_health_identity(&group.name, address, protocol, *target_port)
                 })
                 .collect::<Vec<_>>();
             out.push(ProbeTarget {
@@ -207,9 +238,15 @@ fn listener_identities(cfg: &Config, group: &str) -> BTreeSet<(String, u16)> {
         .collect()
 }
 
-pub fn target_health_identity(address: IpAddr, protocol: &str, service_port: u16) -> String {
+pub fn target_health_identity(
+    group: &str,
+    address: IpAddr,
+    protocol: &str,
+    service_port: u16,
+) -> String {
     format!(
-        "{}_{}_{}",
+        "{}:{}_{}_{}",
+        group,
         address,
         protocol.trim().to_ascii_lowercase(),
         service_port
@@ -231,6 +268,7 @@ impl ProbeClients {
         let build = |accept_invalid_certs| {
             reqwest::blocking::Client::builder()
                 .pool_idle_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .danger_accept_invalid_certs(accept_invalid_certs)
                 .build()
                 .ok()
@@ -366,22 +404,38 @@ fn icmp_checksum(packet: &[u8]) -> u16 {
 }
 
 fn probe_tcp(target: &ProbeTarget) -> ProbeOutcome {
+    let deadline = Instant::now() + target.timeout;
     match tcp_connect(target.address, target.port, target.timeout) {
         Ok(mut stream) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || stream.set_write_timeout(Some(remaining)).is_err() {
+                return ProbeOutcome::Fail;
+            }
             if let Some(request) = target.probe_req.as_deref().filter(|v| !v.is_empty())
                 && std::io::Write::write_all(&mut stream, request.as_bytes()).is_err()
             {
                 return ProbeOutcome::Fail;
             }
             if let Some(expected) = target.probe_resp.as_deref().filter(|v| !v.is_empty()) {
-                let _ = stream.set_read_timeout(Some(target.timeout));
+                let mut response = Vec::new();
                 let mut buf = [0u8; 1024];
-                return match std::io::Read::read(&mut stream, &mut buf) {
-                    Ok(size) if String::from_utf8_lossy(&buf[..size]).contains(expected) => {
-                        ProbeOutcome::Ok
+                while response.len() < MAX_RESPONSE_BYTES {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+                        break;
                     }
-                    _ => ProbeOutcome::Fail,
-                };
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(size) => response.extend_from_slice(&buf[..size]),
+                    }
+                    if response
+                        .windows(expected.len())
+                        .any(|bytes| bytes == expected.as_bytes())
+                    {
+                        return ProbeOutcome::Ok;
+                    }
+                }
+                return ProbeOutcome::Fail;
             }
             ProbeOutcome::Ok
         }
@@ -407,13 +461,17 @@ fn probe_udp(target: &ProbeTarget) -> ProbeOutcome {
         return ProbeOutcome::Fail;
     }
     let payload = target.probe_req.clone().unwrap_or_default();
-    if socket.send(payload.as_bytes()).is_err() {
+    if socket.set_write_timeout(Some(target.timeout)).is_err()
+        || socket.send(payload.as_bytes()).is_err()
+    {
         return ProbeOutcome::Fail;
     }
     // Best-effort UDP probe: an ICMP port-unreachable surfaces as a read
     // error on the connected socket; silence within the window counts as ok.
-    let _ = socket.set_read_timeout(Some(target.timeout));
-    let mut buf = [0u8; 512];
+    if socket.set_read_timeout(Some(target.timeout)).is_err() {
+        return ProbeOutcome::Fail;
+    }
+    let mut buf = [0u8; 65535];
     match socket.recv(&mut buf) {
         Ok(_size)
             if target
@@ -438,19 +496,27 @@ fn probe_udp(target: &ProbeTarget) -> ProbeOutcome {
         {
             ProbeOutcome::Fail
         }
-        Err(_) => ProbeOutcome::Ok,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) && target.probe_resp.as_deref().is_none_or(str::is_empty) =>
+        {
+            ProbeOutcome::Ok
+        }
+        Err(_) => ProbeOutcome::Fail,
     }
 }
 
 fn probe_http(target: &ProbeTarget, clients: &ProbeClients, tls: bool) -> ProbeOutcome {
     let scheme = if tls { "https" } else { "http" };
-    let host = target.address.to_string();
+    let host = SocketAddr::new(target.address, target.port);
     let path = target
         .probe_req
         .clone()
         .filter(|req| req.starts_with('/'))
         .unwrap_or_else(|| "/".to_string());
-    let url = format!("{scheme}://{host}:{}/{path}", target.port);
+    let url = format!("{scheme}://{host}{path}");
     let client = if tls && target.skip_tls_verify {
         clients.insecure.as_ref()
     } else {
@@ -460,10 +526,34 @@ fn probe_http(target: &ProbeTarget, clients: &ProbeClients, tls: bool) -> ProbeO
         return ProbeOutcome::Fail;
     };
     match client.get(&url).timeout(target.timeout).send() {
-        Ok(response) => {
+        Ok(mut response) => {
             let status = response.status().as_u16();
             if http_status_is_healthy(status, target.expected_status) {
-                ProbeOutcome::Ok
+                // Consume a bounded body to validate matching and permit connection reuse.
+                use std::io::Read;
+                let mut body = Vec::new();
+                if response
+                    .by_ref()
+                    .take((MAX_RESPONSE_BYTES + 1) as u64)
+                    .read_to_end(&mut body)
+                    .is_err()
+                    || body.len() > MAX_RESPONSE_BYTES
+                {
+                    return ProbeOutcome::Fail;
+                }
+                if target
+                    .probe_resp
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|expected| {
+                        body.windows(expected.len())
+                            .any(|bytes| bytes == expected.as_bytes())
+                    })
+                {
+                    ProbeOutcome::Ok
+                } else {
+                    ProbeOutcome::Fail
+                }
             } else {
                 tracing::debug!("[probe] {url} returned status {status}");
                 ProbeOutcome::Fail
@@ -518,29 +608,23 @@ fn apply_results(
                 ("ok", 0)
             }
             ProbeOutcome::Fail => {
-                runtime.consecutive_failures += 1;
+                runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
                 ("nok", runtime.consecutive_failures)
             }
         };
         for name in &target.names {
-            updates.push((name.clone(), next_state, failures));
+            if next_state != "nok" || failures >= target.retries {
+                updates.push((name.clone(), next_state, failures));
+            }
         }
     }
     let result = crate::provider::native::store::mutate_target_health(cfg, |targets| {
-        for (name, next_state, failures) in &updates {
+        for (name, next_state, _) in &updates {
             let Some(entry) = targets.iter_mut().find(|entry| &entry.name == name) else {
                 continue;
             };
             if entry.current_state.as_deref() == Some(next_state) {
                 continue;
-            }
-            // Unhealthy only after the configured retry threshold; recovery
-            // is immediate on the first success.
-            if next_state == &"nok" {
-                let retries = entry.inactive_retries.unwrap_or(DEFAULT_RETRIES).max(1);
-                if *failures < retries {
-                    continue;
-                }
             }
             tracing::info!(
                 "[probe] target {name}: {} -> {next_state}",
@@ -566,6 +650,123 @@ mod tests {
     use super::*;
     use crate::config::{BackendTarget, Config, FileConfig, Listener, Protocol, TargetGroup};
     use std::path::PathBuf;
+
+    fn local_probe(kind: &str, port: u16) -> ProbeTarget {
+        ProbeTarget {
+            names: vec!["test".to_string()],
+            address: "127.0.0.1".parse().unwrap(),
+            port,
+            probe_type: kind.to_string(),
+            probe_req: Some("health".to_string()),
+            probe_resp: Some("healthy".to_string()),
+            expected_status: None,
+            skip_tls_verify: false,
+            timeout: Duration::from_millis(500),
+            period: Duration::from_secs(15),
+            retries: 3,
+        }
+    }
+
+    #[test]
+    fn tcp_matching_spans_multiple_reads() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = local_probe("tcp", server.local_addr().unwrap().port());
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 6];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"health");
+            stream.write_all(b"hea").unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            stream.write_all(b"lthy").unwrap();
+        });
+        assert_eq!(probe_tcp(&target), ProbeOutcome::Ok);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn udp_silence_fails_only_when_a_response_is_required() {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut target = local_probe("udp", server.local_addr().unwrap().port());
+        target.timeout = Duration::from_millis(30);
+        assert_eq!(probe_udp(&target), ProbeOutcome::Fail);
+        target.probe_resp = None;
+        assert_eq!(probe_udp(&target), ProbeOutcome::Ok);
+    }
+
+    #[test]
+    fn http_uses_exact_path_status_and_response_body() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut target = local_probe("http", server.local_addr().unwrap().port());
+        target.timeout = Duration::from_secs(2);
+        target.probe_req = Some("/health?full=1".to_string());
+        target.expected_status = Some(200);
+        let thread = std::thread::spawn(move || {
+            for body in ["healthy", "failure"] {
+                let (mut stream, _) = server.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"GET /health?full=1 HTTP/1.1\r\n"));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{body}"
+                )
+                .unwrap();
+            }
+        });
+        let clients = ProbeClients::new();
+        assert_eq!(probe_http(&target, &clients, false), ProbeOutcome::Ok);
+        assert_eq!(probe_http(&target, &clients, false), ProbeOutcome::Fail);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn independent_probe_periods_and_config_changes_are_respected() {
+        let now = Instant::now();
+        let mut target = local_probe("tcp", 8080);
+        let schedule = HashMap::from([("test".to_string(), (target.clone(), now + target.period))]);
+        assert!(!probe_is_due(
+            &schedule,
+            "test",
+            &target,
+            now + Duration::from_secs(5)
+        ));
+        assert!(probe_is_due(
+            &schedule,
+            "test",
+            &target,
+            now + Duration::from_secs(15)
+        ));
+        target.probe_resp = Some("changed".to_string());
+        assert!(probe_is_due(&schedule, "test", &target, now));
+    }
+
+    #[test]
+    fn different_groups_never_share_runtime_identity() {
+        let mut cfg = cfg_with_group(true, Some("tcp"));
+        let mut group = cfg.file.target_groups[0].clone();
+        group.name = "other".to_string();
+        cfg.file.target_groups.push(group);
+        let mut listener = cfg.file.listeners[0].clone();
+        listener.name = "other".to_string();
+        listener.target_group = "other".to_string();
+        cfg.file.listeners.push(listener);
+        let targets = scheduled_targets(&cfg);
+        assert_eq!(targets.len(), 2);
+        assert_ne!(names_key(&targets[0].names), names_key(&targets[1].names));
+    }
 
     fn cfg_with_group(monitor: bool, probe_type: Option<&str>) -> Config {
         let group = TargetGroup {
@@ -593,9 +794,11 @@ mod tests {
             protocols: vec![Protocol::Tcp],
             ..Listener::default()
         };
-        let mut file = FileConfig::default();
-        file.target_groups = vec![group];
-        file.listeners = vec![listener];
+        let file = FileConfig {
+            target_groups: vec![group],
+            listeners: vec![listener],
+            ..FileConfig::default()
+        };
         Config {
             path: PathBuf::from("/tmp/edge-lb-probe-test.toml"),
             file,
@@ -638,6 +841,7 @@ mod tests {
         assert_eq!(
             target.names,
             vec![target_health_identity(
+                "web",
                 "192.0.2.10".parse().unwrap(),
                 "tcp",
                 8080
@@ -654,6 +858,7 @@ mod tests {
         assert_eq!(
             targets[0].names,
             vec![target_health_identity(
+                "web",
                 "192.0.2.10".parse().unwrap(),
                 "tcp",
                 8080
@@ -681,8 +886,8 @@ mod tests {
     fn target_health_identity_matches_store_convention() {
         let ip: IpAddr = "192.0.2.10".parse().unwrap();
         assert_eq!(
-            target_health_identity(ip, "TCP", 8080),
-            "192.0.2.10_tcp_8080"
+            target_health_identity("web", ip, "TCP", 8080),
+            "web:192.0.2.10_tcp_8080"
         );
     }
 

@@ -3,17 +3,17 @@
 //! maps stay pinned under the agent-owned bpffs dir for stats and live
 //! reconfiguration.
 
-use std::{fs, path::Path, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, fs, path::Path, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use aya::{
     Ebpf,
-    maps::{Array, Map, MapData, PerCpuArray},
+    maps::{Array, HashMap, Map, MapData, PerCpuArray},
     programs::tc::{
         NlOptions, SchedClassifier, TcAttachOptions, TcAttachType, TcHandle, qdisc_detach_program,
     },
 };
-use edge_lb_common::{MAX_PORTS, Stats};
+use edge_lb_common::{DSCP_PORT_MAP_CAPACITY, MAX_PORTS, Stats};
 
 use crate::config::Config;
 
@@ -26,6 +26,7 @@ mod embedded {
 const TARGET_PORTS: &str = "TARGET_PORTS";
 const DSCP_CFG: &str = "DSCP_CFG";
 const STATS: &str = "STATS";
+static MAP_UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct DscpAttachment {
     bpf: Option<Ebpf>,
@@ -69,11 +70,13 @@ pub fn attached(cfg: &Config, dev: &str) -> bool {
         .any(|line| line.contains(&format!("pref {}", pref(cfg))) && line.contains("dscp_mark"))
 }
 
-/// Check that the pinned DSCP statistics map matches the current eBPF ABI.
+/// All marker maps must match before an existing attachment can be reused.
 pub fn maps_match_current_abi(cfg: &Config) -> bool {
-    pinned_per_cpu_array::<Stats>(cfg, STATS)
-        .and_then(|stats| stats.get(&0, 0).map(|_| ()).map_err(Into::into))
-        .is_ok()
+    pinned_ports(cfg).is_ok()
+        && pinned_array::<u32>(cfg, DSCP_CFG).is_ok()
+        && pinned_per_cpu_array::<Stats>(cfg, STATS)
+            .and_then(|stats| stats.get(&0, 0).map(|_| ()).map_err(Into::into))
+            .is_ok()
 }
 
 /// Load, configure and attach the marker. Replaces any previous filter at
@@ -98,6 +101,9 @@ pub fn attach_owned(
     object_override: Option<&Path>,
 ) -> Result<DscpAttachment> {
     validate(dscp, ports)?;
+    let _guard = MAP_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let bytes = read_object(object_override)?;
     let mut bpf = Ebpf::load(&bytes).context("failed to load eBPF object")?;
 
@@ -112,7 +118,7 @@ pub fn attach_owned(
     }
 
     write_ports(
-        &mut Array::<&mut MapData, u32>::try_from(
+        &mut HashMap::<&mut MapData, u32, u32>::try_from(
             bpf.map_mut(TARGET_PORTS)
                 .ok_or_else(|| anyhow!("{TARGET_PORTS} map not found"))?,
         )?,
@@ -174,6 +180,9 @@ fn read_object(object_override: Option<&Path>) -> Result<Vec<u8>> {
 }
 
 pub fn detach(cfg: &Config, dev: &str) -> Result<()> {
+    let _guard = MAP_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     qdisc_detach_program(dev, TcAttachType::Ingress, edge_lb_common::PROGRAM_NAME).ok();
     tc::delete_ingress_pref_best_effort(dev, pref(cfg));
     for name in [TARGET_PORTS, DSCP_CFG, STATS] {
@@ -193,10 +202,15 @@ pub fn pref(cfg: &Config) -> u16 {
 /// Update ports/DSCP on the pinned maps of an already-running marker.
 pub fn set(cfg: &Config, dscp: u32, ports: &[u32]) -> Result<()> {
     validate(dscp, ports)?;
-    let mut ports_map: Array<MapData, u32> = pinned_array(cfg, TARGET_PORTS)?;
+    let _guard = MAP_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut ports_map = pinned_ports(cfg)?;
     let mut cfg_map: Array<MapData, u32> = pinned_array(cfg, DSCP_CFG)?;
     write_ports(&mut ports_map, ports)?;
-    cfg_map.set(0, dscp, 0)?;
+    if cfg_map.get(&0, 0)? != dscp {
+        cfg_map.set(0, dscp, 0)?;
+    }
     Ok(())
 }
 
@@ -214,6 +228,16 @@ fn pinned_array<V: aya::Pod>(cfg: &Config, name: &str) -> Result<Array<MapData, 
         MapData::from_pin(pin_path(cfg, name)).with_context(|| format!("{name} is not pinned"))?;
     let map = Map::from_map_data(data).map_err(|e| anyhow!("opening {name}: {e}"))?;
     Array::try_from(map).map_err(|e| anyhow!("{name} is not an array map: {e}"))
+}
+
+fn pinned_ports(cfg: &Config) -> Result<HashMap<MapData, u32, u32>> {
+    let data = MapData::from_pin(pin_path(cfg, TARGET_PORTS))?;
+    let info = data.info()?;
+    if info.map_type()? != aya::maps::MapType::Hash || info.max_entries() != DSCP_PORT_MAP_CAPACITY
+    {
+        return Err(anyhow!("TARGET_PORTS capacity does not match current ABI"));
+    }
+    HashMap::try_from(Map::from_map_data(data)?).context("TARGET_PORTS is not a port hash map")
 }
 
 /// Open a pinned map file as a typed per-CPU array.
@@ -238,13 +262,11 @@ fn validate(dscp: u32, ports: &[u32]) -> Result<()> {
     if dscp >= 64 {
         return Err(anyhow!("DSCP must be in 0..63, got {dscp}"));
     }
-    if ports.is_empty() {
-        return Err(anyhow!("at least one port is required"));
-    }
-    if ports.len() > MAX_PORTS {
+    let unique: BTreeSet<_> = ports.iter().copied().collect();
+    if unique.len() > MAX_PORTS {
         return Err(anyhow!(
             "too many ports: max {MAX_PORTS}, got {}",
-            ports.len()
+            unique.len()
         ));
     }
     for p in ports {
@@ -256,14 +278,33 @@ fn validate(dscp: u32, ports: &[u32]) -> Result<()> {
 }
 
 fn write_ports<T: std::borrow::BorrowMut<MapData>>(
-    map: &mut Array<T, u32>,
+    map: &mut HashMap<T, u32, u32>,
     ports: &[u32],
 ) -> Result<()> {
-    for idx in 0..MAX_PORTS as u32 {
-        map.set(idx, 0, 0)?;
+    let desired: BTreeSet<_> = ports.iter().copied().collect();
+    let existing = map
+        .iter()
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    // Upsert before pruning. Common ports never disappear, even when all
+    // slots in the configured set change. The map reserves room for both sets.
+    let mut inserted = Vec::new();
+    for port in &desired {
+        if existing.get(port) != Some(&1) {
+            if let Err(error) = map.insert(*port, 1, 0) {
+                for key in inserted {
+                    if let Err(rollback) = map.remove(&key) {
+                        tracing::warn!("[dscp] rolling back port {key} failed: {rollback}");
+                    }
+                }
+                return Err(error.into());
+            }
+            if !existing.contains_key(port) {
+                inserted.push(*port);
+            }
+        }
     }
-    for (idx, port) in ports.iter().enumerate() {
-        map.set(idx as u32, *port, 0)?;
+    for port in existing.keys().filter(|port| !desired.contains(port)) {
+        map.remove(port)?;
     }
     Ok(())
 }
@@ -283,6 +324,58 @@ pub fn wait_for_bpffs(timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_validation_counts_unique_ports_and_accepts_an_empty_set() {
+        assert!(validate(0, &[]).is_ok());
+        assert!(validate(63, &[8080; MAX_PORTS + 1]).is_ok());
+        assert!(validate(64, &[8080]).is_err());
+        assert!(validate(46, &[0]).is_err());
+        assert!(validate(46, &[65536]).is_err());
+        assert!(validate(46, &(1..=MAX_PORTS as u32 + 1).collect::<Vec<_>>()).is_err());
+    }
+
+    #[test]
+    fn port_hash_map_reconciles_full_sets_without_replacing_the_map() {
+        use aya::maps::IterableMap;
+        let bytes =
+            read_object(None).expect("build the eBPF object before running privileged tests");
+        let mut bpf = Ebpf::load(&bytes).unwrap();
+        let mut ports =
+            HashMap::<_, u32, u32>::try_from(bpf.map_mut(TARGET_PORTS).unwrap()).unwrap();
+        let id = ports.map().info().unwrap().id();
+        let first: Vec<u32> = (1..=MAX_PORTS as u32).collect();
+        let second: Vec<u32> = (100..100 + MAX_PORTS as u32).collect();
+        write_ports(&mut ports, &first).unwrap();
+        assert_eq!(ports.keys().count(), MAX_PORTS);
+        write_ports(&mut ports, &second).unwrap();
+        assert_eq!(ports.keys().count(), MAX_PORTS);
+        for port in first {
+            assert!(ports.get(&port, 0).is_err());
+        }
+        for port in second {
+            assert_eq!(ports.get(&port, 0).unwrap(), 1);
+        }
+        write_ports(&mut ports, &[80, 8080, 8080]).unwrap();
+        assert_eq!(ports.keys().count(), 2);
+        write_ports(&mut ports, &[8080]).unwrap();
+        assert!(ports.get(&80, 0).is_err());
+        write_ports(&mut ports, &[]).unwrap();
+        assert_eq!(
+            ports.keys().count(),
+            0,
+            "an empty map must not implicitly mark port 80"
+        );
+        assert_eq!(ports.map().info().unwrap().id(), id);
+        let program: &mut SchedClassifier = bpf
+            .program_mut(edge_lb_common::PROGRAM_NAME)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        program
+            .load()
+            .expect("kernel verifier must accept the hash-map classifier");
+    }
 
     #[test]
     fn stats_sum_adds_per_cpu_values() {

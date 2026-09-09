@@ -356,6 +356,18 @@ async fn load_snapshot(
     fallback: &Config,
     peer_underlay: IpAddr,
 ) -> Result<DiscoveryResponse> {
+    let path = path.to_path_buf();
+    let fallback = fallback.clone();
+    tokio::task::spawn_blocking(move || build_snapshot(&path, &fallback, peer_underlay))
+        .await
+        .context("snapshot build task failed")?
+}
+
+fn build_snapshot(
+    path: &Path,
+    fallback: &Config,
+    peer_underlay: IpAddr,
+) -> Result<DiscoveryResponse> {
     let mut file = FileConfig::load_file(path)?.unwrap_or_else(|| fallback.file.clone());
     crate::runtime::discovery::resolve_auto_ips(&mut file)?;
     crate::runtime::ha::merge_gateway_peers_best_effort(&mut file);

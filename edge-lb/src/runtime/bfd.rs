@@ -574,6 +574,11 @@ fn set_error(error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf, time::SystemTime};
+
+    use crate::config::{
+        ActiveSource, Config, FileConfig, GatewayNode, HaConfig, NetworkConfig, NodeRole,
+    };
 
     #[test]
     fn packet_round_trip() {
@@ -632,6 +637,25 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn bfd_promotion_does_not_mark_native_proxy_dirty() {
+        let (cfg, ha_cfg, dir) = test_gateway_config("bfd-promote");
+        ha::save_for_state_dir(&dir, &ha_cfg).unwrap();
+        fs::write(&cfg.ha.active_state_file, "gateway-a\n").unwrap();
+        set_state(
+            "down",
+            Some("192.0.2.12".to_string()),
+            Some("192.0.2.16".to_string()),
+        );
+        let _ = crate::provider::native::take_state_dirty();
+
+        reconcile_election(&cfg, &ha_cfg, true);
+
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-b");
+        assert!(!crate::provider::native::take_state_dirty());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -752,5 +776,75 @@ mod tests {
         };
         let secret = ha::new_session_token_secret(&peer, "ha-session-token".to_string());
         assert_eq!(secret.session_token, "ha-session-token");
+    }
+
+    fn test_gateway_config(name: &str) -> (Config, ha::GatewayHaRuntimeConfig, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "edge-lb-bfd-datapath-contract-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let active_state_file = dir.join("active-gateway");
+        let file = FileConfig {
+            node_role: NodeRole::Gateway,
+            node_name: "gateway-b".to_string(),
+            public_ip: "198.51.100.16".parse().unwrap(),
+            underlay_ip: "192.0.2.16".parse().unwrap(),
+            state_dir: dir.clone(),
+            ha: HaConfig {
+                active_source: ActiveSource::File,
+                active_state_file,
+                ..HaConfig::default()
+            },
+            network: NetworkConfig {
+                gateway_public_ip: "198.51.100.16".parse().unwrap(),
+                gateway_ip: "192.0.2.16".parse().unwrap(),
+                underlay_dev: "eth0".to_string(),
+                vxlan_dev: "edge-hub".to_string(),
+                overlay_cidr: "10.255.16.0/24".to_string(),
+                dscp: 40,
+                ..NetworkConfig::default()
+            },
+            gateway_nodes: vec![
+                GatewayNode {
+                    name: "gateway-a".to_string(),
+                    public_ip: "198.51.100.12".parse().unwrap(),
+                    underlay_ip: "192.0.2.12".parse().unwrap(),
+                    overlay_ip: "10.255.12.1/24".to_string(),
+                },
+                GatewayNode {
+                    name: "gateway-b".to_string(),
+                    public_ip: "198.51.100.16".parse().unwrap(),
+                    underlay_ip: "192.0.2.16".parse().unwrap(),
+                    overlay_ip: "10.255.16.1/24".to_string(),
+                },
+            ],
+            ..FileConfig::default()
+        };
+        let ha_cfg = ha::GatewayHaRuntimeConfig {
+            enabled: true,
+            peers: vec![ha::GatewayHaPeer {
+                name: "gateway-a".to_string(),
+                underlay_ip: "192.0.2.12".to_string(),
+                ..ha::GatewayHaPeer::default()
+            }],
+            vip: ha::VipConfig {
+                provider: ha::VipProvider::Hook,
+                ..ha::VipConfig::default()
+            },
+            ..ha::GatewayHaRuntimeConfig::default()
+        };
+        (
+            Config {
+                file,
+                path: dir.join("config.toml"),
+            },
+            ha_cfg,
+            dir,
+        )
     }
 }

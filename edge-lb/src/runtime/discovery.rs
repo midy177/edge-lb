@@ -17,7 +17,7 @@ use crate::config::{
 const DEFAULT_VXLAN_MTU: u32 = 1450;
 const MIN_VXLAN_MTU: u32 = 576;
 const VXLAN_IPV4_OVERHEAD: u32 = 50;
-const IPV4_PING_OVERHEAD: u32 = 28;
+const VXLAN_IPV6_OVERHEAD: u32 = 70;
 
 #[derive(Debug, Clone, Copy)]
 struct ResolvedIp {
@@ -209,7 +209,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
             let _ = resolved_backend;
         }
     }
-    resolve_auto_vxlan_mtu(file);
+    resolve_auto_vxlan_mtu(file)?;
     file.normalize();
     Ok(())
 }
@@ -355,9 +355,9 @@ fn local_underlay_dev(file: &FileConfig) -> Result<ResolvedDevice> {
     })
 }
 
-fn resolve_auto_vxlan_mtu(file: &mut FileConfig) {
+fn resolve_auto_vxlan_mtu(file: &mut FileConfig) -> Result<()> {
     if !file.network.vxlan_mtu_auto && file.network.vxlan_mtu != 0 {
-        return;
+        return Ok(());
     }
     let dev = file.network.underlay_dev.clone();
     let dev_mtu = crate::linux::net::link_mtu(&dev).unwrap_or_else(|e| {
@@ -367,37 +367,57 @@ fn resolve_auto_vxlan_mtu(file: &mut FileConfig) {
         DEFAULT_VXLAN_MTU + VXLAN_IPV4_OVERHEAD
     });
     let peers = vxlan_pmtu_peers(file);
-    let mut outer_mtu = dev_mtu;
-    let mut probed = Vec::new();
+    let overhead = if file.underlay_ip.is_ipv6() || peers.iter().any(IpAddr::is_ipv6) {
+        VXLAN_IPV6_OVERHEAD
+    } else {
+        VXLAN_IPV4_OVERHEAD
+    };
+    let mut route_mtus = Vec::new();
     for peer in peers {
         match peer {
-            IpAddr::V4(addr) => match probe_ipv4_pmtu(addr, dev_mtu) {
-                Some(pmtu) => {
-                    outer_mtu = outer_mtu.min(pmtu);
-                    probed.push(format!("{addr}:{pmtu}"));
+            IpAddr::V4(addr) => match cached_ipv4_route_mtu(
+                SocketAddr::new(addr.into(), file.network.vxlan_port),
+                file.underlay_ip,
+                &dev,
+            ) {
+                Ok(mtu) => {
+                    route_mtus.push(mtu);
+                    tracing::debug!(
+                        "[discovery] peer={addr} cached_route_mtu={mtu} path_verified=false"
+                    );
                 }
-                None => tracing::warn!(
-                    "[discovery] PMTU probe to {addr} failed; keeping underlay device MTU fallback"
+                Err(error) => tracing::debug!(
+                    "[discovery] cached route MTU unavailable for {addr}; using conservative device bound: {error:#}"
                 ),
             },
-            IpAddr::V6(addr) => tracing::warn!(
-                "[discovery] PMTU auto currently skips IPv6 underlay peer {addr}; using device MTU fallback"
+            IpAddr::V6(addr) => tracing::debug!(
+                "[discovery] IPv6 peer {addr} path unverified; using conservative device bound"
             ),
         }
     }
-    let candidate = outer_mtu.saturating_sub(VXLAN_IPV4_OVERHEAD);
-    let resolved = if candidate >= MIN_VXLAN_MTU {
-        candidate
-    } else {
-        DEFAULT_VXLAN_MTU
-    };
+    let resolved = conservative_vxlan_mtu(dev_mtu, overhead, &route_mtus)?;
     file.network.vxlan_mtu = resolved;
     file.network.vxlan_mtu_auto = true;
     clamp_backend_mss(file, resolved);
     tracing::info!(
-        "[discovery] resolved vxlan_mtu=auto to {resolved} from underlay_dev={dev} dev_mtu={dev_mtu} peer_pmtu=[{}]",
-        probed.join(",")
+        "[discovery] resolved vxlan_mtu=auto to {resolved} from underlay_dev={dev} dev_mtu={dev_mtu} overhead={overhead} path_verified=false"
     );
+    Ok(())
+}
+
+fn conservative_vxlan_mtu(dev_mtu: u32, overhead: u32, route_mtus: &[u32]) -> Result<u32> {
+    // Neither a device MTU nor a cached route proves end-to-end jumbo support.
+    let outer = route_mtus.iter().copied().fold(
+        dev_mtu.min(DEFAULT_VXLAN_MTU + VXLAN_IPV4_OVERHEAD),
+        u32::min,
+    );
+    let mtu = outer.saturating_sub(overhead);
+    if mtu < MIN_VXLAN_MTU {
+        bail!(
+            "underlay MTU bound {outer} minus VXLAN overhead {overhead} is below minimum {MIN_VXLAN_MTU}; configure a usable underlay path"
+        );
+    }
+    Ok(mtu)
 }
 
 fn clamp_backend_mss(file: &mut FileConfig, vxlan_mtu: u32) {
@@ -437,50 +457,53 @@ fn push_peer(peers: &mut Vec<IpAddr>, seen: &mut HashSet<IpAddr>, local: IpAddr,
     peers.push(peer);
 }
 
-fn probe_ipv4_pmtu(peer: std::net::Ipv4Addr, max_outer_mtu: u32) -> Option<u32> {
-    let mut low = MIN_VXLAN_MTU + VXLAN_IPV4_OVERHEAD;
-    let mut high = max_outer_mtu;
-    let mut best = None;
-    while low <= high {
-        let mid = low + (high - low) / 2;
-        if ping_ipv4_no_fragment(peer, mid.saturating_sub(IPV4_PING_OVERHEAD)) {
-            best = Some(mid);
-            low = mid.saturating_add(1);
-        } else {
-            high = mid.saturating_sub(1);
-        }
-    }
-    best
-}
-
-fn ping_ipv4_no_fragment(peer: std::net::Ipv4Addr, payload_size: u32) -> bool {
+fn cached_ipv4_route_mtu(peer: SocketAddr, source: IpAddr, dev: &str) -> Result<u32> {
     #[cfg(target_os = "linux")]
     {
-        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-            return false;
-        };
-        let value: libc::c_int = libc::IP_PMTUDISC_DO;
+        if !source.is_ipv4() || !peer.is_ipv4() {
+            bail!("IPv4 route MTU requires IPv4 source and peer");
+        }
+        let socket = UdpSocket::bind(SocketAddr::new(source, 0))
+            .context("binding route MTU socket to underlay source")?;
+        let dev = std::ffi::CString::new(dev).context("invalid underlay device")?;
         let result = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
-                libc::IPPROTO_IP,
-                libc::IP_MTU_DISCOVER,
-                (&value as *const libc::c_int).cast(),
-                std::mem::size_of_val(&value) as libc::socklen_t,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                dev.as_ptr().cast(),
+                dev.as_bytes_with_nul().len() as libc::socklen_t,
             )
         };
         if result != 0 {
-            return false;
+            return Err(std::io::Error::last_os_error())
+                .context("binding route MTU socket to device");
         }
-        if socket.connect(SocketAddr::new(peer.into(), 33434)).is_err() {
-            return false;
+        // UDP connect selects a route without sending payload or proving reachability.
+        socket.connect(peer).context("selecting underlay route")?;
+        let mut mtu: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&mtu) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU,
+                (&mut mtu as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("reading cached route MTU");
         }
-        socket.send(&vec![0_u8; payload_size as usize]).is_ok()
+        if len as usize != std::mem::size_of_val(&mtu) || mtu <= 0 {
+            bail!("invalid cached route MTU {mtu}");
+        }
+        Ok(mtu as u32)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (peer, payload_size);
-        false
+        let _ = (peer, source, dev);
+        bail!("cached route MTU requires Linux")
     }
 }
 
@@ -594,4 +617,94 @@ fn stun_public_ip(server: &str) -> Result<IpAddr> {
         .query_external_address(&socket)
         .map_err(|error| anyhow!("STUN binding request failed: {error}"))?;
     Ok(external.ip())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_mtu_does_not_infer_jumbo_support_from_local_mtu() {
+        for routes in [vec![], vec![9000], vec![9000, 1500]] {
+            assert_eq!(conservative_vxlan_mtu(9000, 50, &routes).unwrap(), 1450);
+        }
+        assert_eq!(conservative_vxlan_mtu(1500, 50, &[]).unwrap(), 1450);
+    }
+
+    #[test]
+    fn auto_mtu_respects_smallest_known_bound_and_ipv6_overhead() {
+        assert_eq!(conservative_vxlan_mtu(1400, 50, &[1500]).unwrap(), 1350);
+        assert_eq!(
+            conservative_vxlan_mtu(1500, 50, &[1400, 1300]).unwrap(),
+            1250
+        );
+        assert_eq!(conservative_vxlan_mtu(1500, 70, &[]).unwrap(), 1430);
+        assert_eq!(conservative_vxlan_mtu(9000, 70, &[1300]).unwrap(), 1230);
+    }
+
+    #[test]
+    fn too_small_mtu_is_rejected_instead_of_increased() {
+        for overhead in [50, 70] {
+            assert_eq!(
+                conservative_vxlan_mtu(576 + overhead, overhead, &[]).unwrap(),
+                576
+            );
+            for bound in [0, overhead, 575 + overhead] {
+                assert!(conservative_vxlan_mtu(bound, overhead, &[]).is_err());
+                assert!(conservative_vxlan_mtu(1500, overhead, &[bound]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_mtu_does_not_query_missing_device_or_change_mss() {
+        let mut file = FileConfig::default();
+        file.network.vxlan_mtu = 8950;
+        file.network.vxlan_mtu_auto = false;
+        file.network.underlay_dev = "missing-mtu-dev".into();
+        let mss = file.backend.mss;
+        resolve_auto_vxlan_mtu(&mut file).unwrap();
+        assert_eq!(file.network.vxlan_mtu, 8950);
+        assert_eq!(file.backend.mss, mss);
+    }
+
+    #[test]
+    fn missing_device_fallback_and_mss_are_conservative() {
+        let mut file = FileConfig::default();
+        file.network.vxlan_mtu = 0;
+        file.network.underlay_dev = "missing-mtu-dev".into();
+        file.backend.mss = 8960;
+        resolve_auto_vxlan_mtu(&mut file).unwrap();
+        assert_eq!(file.network.vxlan_mtu, 1450);
+        assert!(file.network.vxlan_mtu_auto);
+        assert_eq!(file.backend.mss, 1410);
+        file.backend.mss = 1200;
+        clamp_backend_mss(&mut file, 1450);
+        assert_eq!(file.backend.mss, 1200);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cached_route_query_is_device_bound_and_sends_no_datagram() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let peer = receiver.local_addr().unwrap();
+        let source = peer.ip();
+        let mtu = cached_ipv4_route_mtu(peer, source, "lo").unwrap();
+        assert_eq!(
+            mtu,
+            crate::linux::net::link_mtu("lo")
+                .unwrap()
+                .min(u16::MAX.into())
+        );
+        assert!(cached_ipv4_route_mtu(peer, source, "missing-mtu-dev").is_err());
+        assert!(cached_ipv4_route_mtu(peer, "::1".parse().unwrap(), "lo").is_err());
+        let error = receiver.recv_from(&mut [0_u8; 1]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    }
 }

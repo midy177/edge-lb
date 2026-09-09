@@ -9,6 +9,9 @@ use super::model::{
 };
 use crate::{config::Config, events};
 
+const DELIVERY_RESOURCE: &str = "notification_deliveries";
+const DELIVERY_HISTORY_LIMIT: usize = 512;
+
 pub fn load(_cfg: &Config) -> Result<NotificationConfig> {
     let repository = crate::storage::repository()?;
     if let Some(payload) = repository.get("notifications", "config")? {
@@ -20,12 +23,13 @@ pub fn load(_cfg: &Config) -> Result<NotificationConfig> {
 pub fn save(_cfg: &Config, value: &NotificationConfig) -> Result<()> {
     validate_config(value)?;
     let payload = serde_json::to_string(value).context("encoding notification config")?;
-    crate::storage::repository()?.put(
+    crate::storage::repository()?.put_if_changed(
         "notifications",
         "config",
         crate::storage::next_revision(),
         payload,
-    )
+    )?;
+    Ok(())
 }
 
 pub fn summaries(cfg: &Config) -> Result<Vec<NotificationChannelSummary>> {
@@ -43,7 +47,10 @@ fn append_delivery_inner(_cfg: &Config, record: &DeliveryRecord) -> Result<()> {
     let channel = record.channel_id.trim().replace('/', "-");
     let resource_name = format!("{revision}-{channel}");
     let payload = serde_json::to_string(record).context("encoding delivery record")?;
-    crate::storage::repository()?.put("notification_deliveries", &resource_name, revision, payload)
+    let repository = crate::storage::repository()?;
+    repository.put(DELIVERY_RESOURCE, &resource_name, revision, payload)?;
+    repository.prune_resource(DELIVERY_RESOURCE, DELIVERY_HISTORY_LIMIT)?;
+    Ok(())
 }
 
 pub fn normalize_config(mut config: NotificationConfig) -> Result<NotificationConfig> {

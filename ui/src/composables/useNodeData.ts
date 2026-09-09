@@ -17,6 +17,7 @@ import type {
   TargetGroup,
 } from '@/api/types'
 import { t } from '@/lib/i18n'
+import { waitForProxySync, writeAcceptance, type ProxyWriteAcceptance, type ProxySyncOutcome } from '@/api/proxySync'
 
 export type Tab =
   | 'overview'
@@ -92,6 +93,57 @@ export const authRequired = ref(false)
 export const authenticated = ref(false)
 export const busy = ref('')
 export const token = ref(getToken())
+export const proxyWriteStatus = ref<{ authority: string; state: ProxySyncOutcome } | null>(null)
+let proxySyncController: AbortController | null = null
+let pendingAcceptance: ProxyWriteAcceptance | null = null
+let dataSession = 0
+
+export function cancelProxySync() {
+  proxySyncController?.abort()
+  proxySyncController = null
+  pendingAcceptance = null
+  proxyWriteStatus.value = null
+}
+
+export function retryProxySync() {
+  const acceptance = pendingAcceptance
+  if (!acceptance) return
+  proxySyncController?.abort()
+  const controller = new AbortController()
+  proxySyncController = controller
+  const localName = status.value?.node_name
+  if (!acceptance.barrier || !localName) {
+    proxyWriteStatus.value = { authority: acceptance.authority, state: 'unconfirmed' }
+    return
+  }
+  proxyWriteStatus.value = { authority: acceptance.authority, state: 'waiting' }
+  const read = async (signal: AbortSignal) => {
+    try {
+      return await api.proxyConfigSync(signal)
+    } catch (e) {
+      if (e instanceof AuthError && !signal.aborted) {
+        authRequired.value = true
+        authenticated.value = false
+        status.value = null
+        cancelProxySync()
+      }
+      throw e
+    }
+  }
+  void waitForProxySync(acceptance.barrier, localName, read, controller.signal)
+    .then(async (state) => {
+      if (controller.signal.aborted) return
+      proxyWriteStatus.value = { authority: acceptance.authority, state }
+      if (state === 'visible' || state === 'confirmed') await refreshForTab(tab.value)
+    })
+}
+
+watch(authenticated, (value) => {
+  if (!value) {
+    dataSession++
+    cancelProxySync()
+  }
+}, { flush: 'sync' })
 
 export const isGateway = computed(() => status.value?.node_role === 'gateway')
 
@@ -165,15 +217,21 @@ export async function refreshGatewayNodes() {
 }
 
 export async function refreshBackendNodes() {
-  backendNodes.value = await api.backendNodes()
+  const session = dataSession
+  const value = await api.backendNodes()
+  if (session === dataSession) backendNodes.value = value
 }
 
 export async function refreshTargetGroups() {
-  targetGroups.value = await api.targetGroups()
+  const session = dataSession
+  const value = await api.targetGroups()
+  if (session === dataSession) targetGroups.value = value
 }
 
 export async function refreshListeners() {
-  listeners.value = await api.listenerConfigs()
+  const session = dataSession
+  const value = await api.listenerConfigs()
+  if (session === dataSession) listeners.value = value
 }
 
 export async function refreshSubscriptions() {
@@ -238,14 +296,23 @@ export async function refreshAutomationData() {
   }
 }
 
-export async function run(label: string, fn: () => Promise<unknown>) {
+export async function run(label: string, fn: () => Promise<unknown>): Promise<boolean> {
+  const session = dataSession
   busy.value = label
   error.value = ''
   try {
-    await fn()
+    const result = await fn()
+    if (session !== dataSession) return true
     await refreshAll(tab.value)
+    const acceptance = writeAcceptance(result)
+    if (acceptance && session === dataSession) {
+      pendingAcceptance = acceptance
+      retryProxySync()
+    }
+    return true
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
+    return false
   } finally {
     busy.value = ''
   }
@@ -260,24 +327,31 @@ export async function login() {
 }
 
 export function logout() {
+  dataSession++
+  cancelProxySync()
   clearToken()
   token.value = ''
   authenticated.value = false
   authRequired.value = true
   status.value = null
+  listeners.value = []
+  targetGroups.value = []
 }
 
 //! 切 tab 时只刷新当前页需要的数据;status 已加载则复用,不重复拉取。
 //! 首次加载(status 为空)或认证失效时退回完整 refreshAll。
 export async function refreshForTab(currentTab: Tab) {
+  const session = dataSession
   if (!status.value) {
     await refreshAll(currentTab)
     return
   }
   try {
     await refreshTabData(currentTab)
+    if (session !== dataSession) return
     error.value = ''
   } catch (e) {
+    if (session !== dataSession) return
     if (e instanceof AuthError) {
       authRequired.value = true
       authenticated.value = false
@@ -292,13 +366,18 @@ export async function refreshForTab(currentTab: Tab) {
 //! 拉取 status 并按当前 tab 刷新;认证/错误状态在此收敛。
 //! 页面局部副作用(表单默认值回填等)由调用方的包装 refresh 处理。
 export async function refreshAll(currentTab: Tab) {
+  const session = dataSession
   try {
-    status.value = await api.status()
+    const currentStatus = await api.status()
+    if (session !== dataSession) return
+    status.value = currentStatus
     await refreshTabData(currentTab)
+    if (session !== dataSession) return
     error.value = ''
     authRequired.value = false
     authenticated.value = true
   } catch (e) {
+    if (session !== dataSession) return
     if (e instanceof AuthError) {
       authRequired.value = true
       authenticated.value = false

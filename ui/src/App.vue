@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
-import { AlertTriangle, Loader2, LogIn } from 'lucide-vue-next'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
+import { AlertTriangle, Loader2, LogIn, RefreshCw, X } from 'lucide-vue-next'
 import faviconUrl from '../favicon.svg?url'
 import {
   Badge,
@@ -28,9 +28,12 @@ import {
   authRequired,
   authenticated,
   busy,
+  cancelProxySync,
   error,
   failoverTarget,
   login,
+  proxyWriteStatus,
+  retryProxySync,
   refreshAll,
   refreshForTab,
   run,
@@ -59,6 +62,7 @@ async function refresh() {
 onMounted(() => {
   refresh()
 })
+onUnmounted(cancelProxySync)
 watch(tab, () => {
   refreshForTab(tab.value)
 })
@@ -147,6 +151,17 @@ watch(tab, () => {
         <AppHeader @refresh="refresh" />
 
         <main class="mx-auto w-full space-y-4 px-6 py-6 md:w-[80vw]">
+          <div v-if="proxyWriteStatus" role="status" aria-live="polite"
+            class="flex flex-wrap items-center gap-2 border-l-2 border-primary bg-muted px-4 py-2 text-sm">
+            <Loader2 v-if="proxyWriteStatus.state === 'waiting'" class="size-4 shrink-0 animate-spin" />
+            <span class="min-w-0 flex-1 break-words">
+              {{ text('proxyWriteSaved') }} {{ proxyWriteStatus.authority }}.
+              {{ text(`proxySync_${proxyWriteStatus.state}`) }}
+            </span>
+            <Button v-if="proxyWriteStatus.state === 'unconfirmed'" variant="ghost" size="icon"
+              :title="text('proxySyncCheck')" @click="retryProxySync"><RefreshCw /></Button>
+            <Button variant="ghost" size="icon" :title="text('close')" @click="cancelProxySync"><X /></Button>
+          </div>
           <div
             v-if="error"
             class="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive"

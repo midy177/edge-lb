@@ -20,8 +20,8 @@ use aya::{
 };
 use edge_lb_common::{
     DEFAULT_PERSIST_TIMEOUT_SECS, MAX_TARGETS_PER_LISTENER, NATIVE_DNAT_INGRESS_PROGRAM,
-    NATIVE_DNAT_RETURN_PROGRAM, NativeListenerLookupKey, NativeListenerLookupValue,
-    NativeTargetKey, NativeTargetLoadKey, NativeTargetValue,
+    NATIVE_DNAT_RETURN_PROGRAM, NATIVE_LISTENER_ID_CAPACITY, NativeListenerLookupKey,
+    NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue,
 };
 
 use crate::{
@@ -94,6 +94,15 @@ impl Drop for NativeDnatAttachment {
     }
 }
 
+impl NativeDnatAttachment {
+    fn matches_config(&self, cfg: &Config) -> bool {
+        let n = cfg.network();
+        self.underlay == n.underlay_dev
+            && self.overlay == n.vxlan_dev
+            && self.pref == cfg.gateway_cfg().dscp_pref
+    }
+}
+
 fn pin_dir(cfg: &Config) -> PathBuf {
     cfg.pin_dir().join("native-dnat")
 }
@@ -125,7 +134,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
         let _ = fs::remove_file(pin_path(cfg, name));
     }
 
-    let mut listener_id = 1u32;
+    let listener_ids = stable_listener_assignments(&listeners)?;
     {
         let mut listener_map: HashMap<
             &mut MapData,
@@ -135,7 +144,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
             bpf.map_mut(LISTENERS)
                 .ok_or_else(|| anyhow!("{LISTENERS} map missing"))?,
         )?;
-        for listener in &listeners {
+        for (listener_id, listener) in &listener_ids {
             let weight_total = listener
                 .targets
                 .iter()
@@ -143,6 +152,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                     matches!(target.state, NativeTargetState::Active)
                         && observed_target_is_active(
                             observed_targets.as_ref(),
+                            &listener.target_group,
                             target.address,
                             listener.key.protocol.ip_proto(),
                             target.port,
@@ -159,7 +169,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                     _pad: 0,
                 },
                 NativeListenerLookupValue {
-                    listener_id,
+                    listener_id: *listener_id,
                     target_base: 0,
                     target_count: listener.targets.len() as u32,
                     weight_total,
@@ -174,9 +184,6 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                 },
                 0,
             )?;
-            listener_id = listener_id
-                .checked_add(1)
-                .context("native listener id exhausted")?;
         }
     }
     {
@@ -185,7 +192,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                 bpf.map_mut(TARGETS)
                     .ok_or_else(|| anyhow!("{TARGETS} map missing"))?,
             )?;
-        for (listener_index, listener) in listeners.iter().enumerate() {
+        for (listener_id, listener) in &listener_ids {
             if listener.targets.len() > MAX_TARGETS_PER_LISTENER as usize {
                 // The eBPF selector scans a compile-time bound; extra
                 // targets would be silently unreachable.
@@ -199,7 +206,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
             for (target_id, target) in listener.targets.iter().enumerate() {
                 targets.insert(
                     NativeTargetKey {
-                        listener_id: listener_index as u32 + 1,
+                        listener_id: *listener_id,
                         target_id: target_id as u32,
                     },
                     NativeTargetValue {
@@ -210,6 +217,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                             matches!(target.state, NativeTargetState::Active)
                                 && observed_target_is_active(
                                     observed_targets.as_ref(),
+                                    &listener.target_group,
                                     target.address,
                                     listener.key.protocol.ip_proto(),
                                     target.port,
@@ -256,6 +264,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
 
 fn observed_target_is_active(
     observed: Option<&TargetHealthList>,
+    group: &str,
     address: std::net::Ipv4Addr,
     protocol: u8,
     port: u16,
@@ -275,7 +284,10 @@ fn observed_target_is_active(
         // the native health identity, which is keyed by the forwarding
         // port; filtering on probe_port would miss valid observations when a
         // group probes a different port from the listener target port.
-        .filter(|entry| entry.name == format!("{address}_{protocol}_{port}"))
+        .filter(|entry| {
+            entry.target_group == group
+                && entry.name == format!("{group}:{address}_{protocol}_{port}")
+        })
         .all(|entry| {
             !matches!(
                 entry.current_state.as_deref(),
@@ -319,22 +331,166 @@ pub fn apply(cfg: &Config) -> Result<()> {
     let signature = format!("{listeners:?}");
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     let mut current_signature = CURRENT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner());
-    // Probe state is refreshed directly in the pinned maps. Keep the TC
-    // programs and flow map in place when the listener definition itself did
-    // not change; rebuilding here would create a needless packet gap and
-    // discard active flow state on every reconcile.
-    if current.is_some()
-        && current_signature.as_deref() == Some(signature.as_str())
+    // Keep the running programs and flow map in place while only listener,
+    // target or health state changes. Rebuilding the object would create a
+    // packet gap and discard active NAT flow state.
+    if let Some(active) = current.as_ref()
+        && active.matches_config(cfg)
         && attached(cfg)
     {
-        refresh_target_health(cfg)?;
-        return Ok(());
+        if let Err(error) = sync_pinned_datapath(cfg, &listeners) {
+            tracing::warn!(
+                "[native-dnat] pinned map refresh failed, reattaching datapath: {error:#}"
+            );
+        } else {
+            *current_signature = Some(signature);
+            return Ok(());
+        }
     }
     if let Some(old) = current.take() {
         drop(old);
     }
     *current = Some(attach_owned(cfg)?);
     *current_signature = Some(signature);
+    Ok(())
+}
+
+fn sync_pinned_datapath(
+    cfg: &Config,
+    listeners: &[crate::provider::native::NativeListener],
+) -> Result<()> {
+    let listener_ids = stable_listener_assignments(listeners)?;
+    sync_listener_map(cfg, &listener_ids)?;
+    sync_target_map(cfg, &listener_ids)?;
+    Ok(())
+}
+
+fn sync_listener_map(
+    cfg: &Config,
+    listener_ids: &[(u32, &crate::provider::native::NativeListener)],
+) -> Result<()> {
+    let map_data = MapData::from_pin(pin_path(cfg, LISTENERS))
+        .with_context(|| format!("opening {LISTENERS}"))?;
+    let map =
+        Map::from_map_data(map_data).with_context(|| format!("{LISTENERS} is not a hash map"))?;
+    let mut listener_map: HashMap<MapData, NativeListenerLookupKey, NativeListenerLookupValue> =
+        HashMap::try_from(map).with_context(|| format!("{LISTENERS} key/value layout mismatch"))?;
+    let observed_targets = target_health_native(cfg).ok();
+    let mut desired = HashSet::new();
+    for (listener_id, listener) in listener_ids {
+        let key = NativeListenerLookupKey {
+            vip: u32::from_be_bytes(listener.key.vip_ip.octets()),
+            port: listener.key.vip_port.to_be(),
+            proto: listener.key.protocol.ip_proto(),
+            _pad: 0,
+        };
+        desired.insert(key);
+        let weight_total = listener
+            .targets
+            .iter()
+            .filter(|target| {
+                matches!(target.state, NativeTargetState::Active)
+                    && observed_target_is_active(
+                        observed_targets.as_ref(),
+                        &listener.target_group,
+                        target.address,
+                        listener.key.protocol.ip_proto(),
+                        target.port,
+                    )
+            })
+            .map(|target| target.weight)
+            .filter(|weight| *weight > 0)
+            .sum::<u32>();
+        listener_map.insert(
+            key,
+            NativeListenerLookupValue {
+                listener_id: *listener_id,
+                target_base: 0,
+                target_count: listener.targets.len() as u32,
+                weight_total,
+                select: listener.select,
+                flags: 1,
+                timeout_secs: if listener.select == crate::config::LbSelect::Persist.code() {
+                    DEFAULT_PERSIST_TIMEOUT_SECS
+                } else {
+                    listener.inactive_timeout_secs
+                },
+                dscp: listener.dscp,
+            },
+            0,
+        )?;
+    }
+    let existing = listener_map
+        .iter()
+        .map(|entry| entry.map(|(key, _)| key))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("iterating {LISTENERS}"))?;
+    for key in existing {
+        if !desired.contains(&key) {
+            let _ = listener_map.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+fn sync_target_map(
+    cfg: &Config,
+    listener_ids: &[(u32, &crate::provider::native::NativeListener)],
+) -> Result<()> {
+    let map_data =
+        MapData::from_pin(pin_path(cfg, TARGETS)).with_context(|| format!("opening {TARGETS}"))?;
+    let map =
+        Map::from_map_data(map_data).with_context(|| format!("{TARGETS} is not a hash map"))?;
+    let mut targets: HashMap<MapData, NativeTargetKey, NativeTargetValue> =
+        HashMap::try_from(map).with_context(|| format!("{TARGETS} key/value layout mismatch"))?;
+    let observed_targets = target_health_native(cfg).ok();
+    let mut desired = HashSet::new();
+    for (listener_id, listener) in listener_ids {
+        if listener.targets.len() > MAX_TARGETS_PER_LISTENER as usize {
+            bail!(
+                "listener {} has {} targets; max {}",
+                listener.key.vip_port,
+                listener.targets.len(),
+                MAX_TARGETS_PER_LISTENER
+            );
+        }
+        for (target_id, target) in listener.targets.iter().enumerate() {
+            let key = NativeTargetKey {
+                listener_id: *listener_id,
+                target_id: target_id as u32,
+            };
+            desired.insert(key);
+            targets.insert(
+                key,
+                NativeTargetValue {
+                    address: u32::from_be_bytes(target.address.octets()),
+                    port: target.port,
+                    weight: target.weight.min(u16::MAX as u32) as u16,
+                    flags: u32::from(
+                        matches!(target.state, NativeTargetState::Active)
+                            && observed_target_is_active(
+                                observed_targets.as_ref(),
+                                &listener.target_group,
+                                target.address,
+                                listener.key.protocol.ip_proto(),
+                                target.port,
+                            ),
+                    ),
+                },
+                0,
+            )?;
+        }
+    }
+    let existing = targets
+        .iter()
+        .map(|entry| entry.map(|(key, _)| key))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("iterating {TARGETS}"))?;
+    for key in existing {
+        if !desired.contains(&key) {
+            let _ = targets.remove(&key);
+        }
+    }
     Ok(())
 }
 
@@ -405,6 +561,62 @@ fn open_pinned_flows(
     Ok(Some(flows))
 }
 
+fn stable_listener_assignments(
+    listeners: &[crate::provider::native::NativeListener],
+) -> Result<Vec<(u32, &crate::provider::native::NativeListener)>> {
+    if listeners.len() > NATIVE_LISTENER_ID_CAPACITY as usize {
+        bail!(
+            "native listener count {} exceeds id capacity {}",
+            listeners.len(),
+            NATIVE_LISTENER_ID_CAPACITY
+        );
+    }
+    let mut ordered = listeners.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|listener| listener_sort_key(listener));
+    let mut used = HashSet::new();
+    let mut out = Vec::with_capacity(ordered.len());
+    for listener in ordered {
+        let mut id = stable_listener_id(listener);
+        for _ in 0..NATIVE_LISTENER_ID_CAPACITY {
+            if used.insert(id) {
+                out.push((id, listener));
+                break;
+            }
+            id += 1;
+            if id > NATIVE_LISTENER_ID_CAPACITY {
+                id = 1;
+            }
+        }
+    }
+    if out.len() != listeners.len() {
+        bail!("native listener id space exhausted");
+    }
+    Ok(out)
+}
+
+fn listener_sort_key(listener: &crate::provider::native::NativeListener) -> (u32, u16, u8) {
+    (
+        u32::from_be_bytes(listener.key.vip_ip.octets()),
+        listener.key.vip_port,
+        listener.key.protocol.ip_proto(),
+    )
+}
+
+fn stable_listener_id(listener: &crate::provider::native::NativeListener) -> u32 {
+    let (vip, port, proto) = listener_sort_key(listener);
+    let mut hash = 0x811c_9dc5u32;
+    for byte in vip
+        .to_be_bytes()
+        .into_iter()
+        .chain(port.to_be_bytes())
+        .chain([proto])
+    {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    (hash % NATIVE_LISTENER_ID_CAPACITY) + 1
+}
+
 /// Dump the pinned flow table. Empty when the datapath is not attached.
 pub fn dump_flows(cfg: &Config) -> Result<Vec<FlowEntry>> {
     let Some(flows) = open_pinned_flows(cfg)? else {
@@ -452,9 +664,10 @@ pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
 }
 
 /// Upsert replicated flow entries into the pinned flow table. An entry is
-/// only applied when it is new or strictly fresher than the local copy, so
+/// only mutated when it is new or strictly fresher than the local copy, so
 /// a lagging MASTER replica never regresses a flow's last-seen timestamp.
-/// Returns how many entries were applied.
+/// Returns how many entries were accepted by an attached datapath. Idempotent
+/// no-ops count as accepted; a missing flow map accepts nothing.
 pub fn upsert_flows(cfg: &Config, entries: &[FlowEntry]) -> Result<usize> {
     let pin = pin_path(cfg, FLOWS);
     if !pin.exists() {
@@ -465,15 +678,14 @@ pub fn upsert_flows(cfg: &Config, entries: &[FlowEntry]) -> Result<usize> {
     let Some(mut flows) = open_pinned_flows(cfg)? else {
         return Ok(0);
     };
-    let mut applied = 0usize;
+    let mut accepted = 0usize;
     for (key, value) in entries {
-        if !flow_apply_applies(flows.get(key, 0).ok().as_ref(), value) {
-            continue;
+        if flow_apply_applies(flows.get(key, 0).ok().as_ref(), value) {
+            flows.insert(*key, *value, 0)?;
         }
-        flows.insert(*key, *value, 0)?;
-        applied += 1;
+        accepted += 1;
     }
-    Ok(applied)
+    Ok(accepted)
 }
 
 /// Delete replicated flow-map records. Missing keys are treated as already
@@ -486,13 +698,12 @@ pub fn delete_flows(cfg: &Config, keys: &[edge_lb_common::NativeFlowKey]) -> Res
     let Some(mut flows) = open_pinned_flows(cfg)? else {
         return Ok(0);
     };
-    let mut deleted = 0usize;
+    let mut accepted = 0usize;
     for key in keys {
-        if flows.remove(key).is_ok() {
-            deleted += 1;
-        }
+        let _ = flows.remove(key);
+        accepted += 1;
     }
-    Ok(deleted)
+    Ok(accepted)
 }
 
 /// Apply decision, extracted for tests: apply when absent or when the
@@ -514,7 +725,7 @@ fn flow_expired(last_seen_ns: u64, timeout_secs: u32, now_ns: u64) -> bool {
     now_ns.saturating_sub(last_seen_ns) > timeout_secs as u64 * 1_000_000_000
 }
 
-fn monotonic_now_ns() -> u64 {
+pub(crate) fn monotonic_now_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -534,24 +745,10 @@ fn canonical_flow_pair(
 ) -> (edge_lb_common::NativeFlowKey, edge_lb_common::NativeFlowKey) {
     let target_port = value.target_port.to_be();
     let (forward, reverse) = if key.src == value.target && key.sport == target_port {
-        let forward = edge_lb_common::NativeFlowKey {
-            src: key.dst,
-            dst: value.vip,
-            sport: key.dport,
-            dport: value.vip_port,
-            proto: key.proto,
-            _pad: [0; 3],
-        };
+        let forward = key.forward_for(value);
         (forward, key)
     } else {
-        let reverse = edge_lb_common::NativeFlowKey {
-            src: value.target,
-            dst: key.src,
-            sport: target_port,
-            dport: key.sport,
-            proto: key.proto,
-            _pad: [0; 3],
-        };
+        let reverse = key.reverse_for(value);
         (key, reverse)
     };
     if flow_key_sort_tuple(&forward) <= flow_key_sort_tuple(&reverse) {
@@ -609,10 +806,10 @@ pub fn refresh_target_health(cfg: &Config) -> Result<()> {
     let mut targets: HashMap<MapData, NativeTargetKey, NativeTargetValue> =
         HashMap::try_from(map).with_context(|| format!("{TARGETS} key/value layout mismatch"))?;
     let mut changed = 0usize;
-    for (listener_index, listener) in listeners.iter().enumerate() {
+    for (listener_id, listener) in stable_listener_assignments(&listeners)? {
         for (target_id, target) in listener.targets.iter().enumerate() {
             let key = NativeTargetKey {
-                listener_id: listener_index as u32 + 1,
+                listener_id,
                 target_id: target_id as u32,
             };
             let Some(mut value) = targets.get(&key, 0).ok() else {
@@ -621,6 +818,7 @@ pub fn refresh_target_health(cfg: &Config) -> Result<()> {
             let active = matches!(target.state, NativeTargetState::Active)
                 && observed_target_is_active(
                     observed.as_ref(),
+                    &listener.target_group,
                     target.address,
                     listener.key.protocol.ip_proto(),
                     target.port,
@@ -636,7 +834,7 @@ pub fn refresh_target_health(cfg: &Config) -> Result<()> {
                     target.port,
                     if flags == 1 { "inactive" } else { "active" },
                     if flags == 1 { "active" } else { "inactive" },
-                    listener_index + 1
+                    listener_id
                 );
             }
         }
@@ -663,7 +861,7 @@ fn refresh_listener_weights(
         Map::from_map_data(map_data).with_context(|| format!("{LISTENERS} is not a hash map"))?;
     let mut listener_map: HashMap<MapData, NativeListenerLookupKey, NativeListenerLookupValue> =
         HashMap::try_from(map).with_context(|| format!("{LISTENERS} key/value layout mismatch"))?;
-    for (listener_index, listener) in listeners.iter().enumerate() {
+    for (listener_id, listener) in stable_listener_assignments(listeners)? {
         let key = NativeListenerLookupKey {
             vip: u32::from_be_bytes(listener.key.vip_ip.octets()),
             port: listener.key.vip_port.to_be(),
@@ -673,6 +871,7 @@ fn refresh_listener_weights(
         let Some(mut value) = listener_map.get(&key, 0).ok() else {
             continue;
         };
+        value.listener_id = listener_id;
         value.weight_total = listener
             .targets
             .iter()
@@ -680,6 +879,7 @@ fn refresh_listener_weights(
                 matches!(target.state, NativeTargetState::Active)
                     && observed_target_is_active(
                         observed,
+                        &listener.target_group,
                         target.address,
                         listener.key.protocol.ip_proto(),
                         target.port,
@@ -691,7 +891,7 @@ fn refresh_listener_weights(
         listener_map.insert(key, value, 0).with_context(|| {
             format!(
                 "updating native listener weight for listener {}",
-                listener_index + 1
+                listener_id
             )
         })?;
     }
@@ -761,6 +961,7 @@ pub fn stats(cfg: &Config) -> Result<edge_lb_common::NativeDatapathStats> {
 #[cfg(test)]
 mod tests {
     use aya::programs::SchedClassifier;
+    use std::net::Ipv4Addr;
 
     fn flow_key(src: u32, dst: u32, sport: u16, dport: u16) -> edge_lb_common::NativeFlowKey {
         edge_lb_common::NativeFlowKey {
@@ -808,7 +1009,8 @@ mod tests {
     fn health_identity_uses_forwarding_port_not_probe_port() {
         let target = crate::provider::native::TargetHealthEntry {
             host_name: "192.0.2.10".to_string(),
-            name: "192.0.2.10_tcp_8080".to_string(),
+            name: "web:192.0.2.10_tcp_8080".to_string(),
+            target_group: "web".to_string(),
             probe_type: Some("http".to_string()),
             probe_port: Some(9090),
             current_state: Some("nok".to_string()),
@@ -820,10 +1022,77 @@ mod tests {
 
         assert!(!super::observed_target_is_active(
             Some(&list),
+            "web",
             "192.0.2.10".parse().unwrap(),
             6,
             8080,
         ));
+    }
+
+    fn listener(
+        ip: [u8; 4],
+        port: u16,
+        protocol: crate::provider::native::NativeProtocol,
+    ) -> crate::provider::native::NativeListener {
+        crate::provider::native::NativeListener {
+            name: format!("{protocol:?}-{port}"),
+            target_group: "targets".to_string(),
+            key: crate::provider::native::NativeListenerKey {
+                vip_ip: Ipv4Addr::from(ip),
+                vip_port: port,
+                protocol,
+            },
+            select: 0,
+            inactive_timeout_secs: 60,
+            dscp: 46,
+            targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stable_listener_ids_do_not_depend_on_config_order() {
+        let first = vec![
+            listener(
+                [192, 0, 2, 10],
+                80,
+                crate::provider::native::NativeProtocol::Tcp,
+            ),
+            listener(
+                [192, 0, 2, 10],
+                80,
+                crate::provider::native::NativeProtocol::Udp,
+            ),
+            listener(
+                [192, 0, 2, 11],
+                443,
+                crate::provider::native::NativeProtocol::Tcp,
+            ),
+        ];
+        let mut second = first.clone();
+        second.reverse();
+
+        let mut first_ids = super::stable_listener_assignments(&first)
+            .expect("assign first")
+            .into_iter()
+            .map(|(id, listener)| (super::listener_sort_key(listener), id))
+            .collect::<Vec<_>>();
+        let mut second_ids = super::stable_listener_assignments(&second)
+            .expect("assign second")
+            .into_iter()
+            .map(|(id, listener)| (super::listener_sort_key(listener), id))
+            .collect::<Vec<_>>();
+        first_ids.sort();
+        second_ids.sort();
+
+        assert_eq!(first_ids, second_ids);
+        assert_eq!(
+            first_ids
+                .iter()
+                .map(|(_, id)| *id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            first_ids.len()
+        );
     }
 
     /// Load the ingress classifier without attaching. Privileged only; on

@@ -103,6 +103,10 @@ node status, listener configuration, target groups, automatic target groups,
 notifications, manual failover, and one-click verification. Destructive actions
 always show a summary of what will change before running.
 
+Standalone `ui serve` also delivers pending HA configuration snapshots for the
+gateway role, but does not start BFD or the datapath. It must own its `state_dir`
+exclusively; do not run it alongside a gateway daemon using the same database.
+
 ```text
 GET/PUT /api/v1/config
 GET     /api/v1/status

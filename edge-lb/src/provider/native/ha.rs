@@ -1,4 +1,10 @@
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
+
+#[cfg(not(test))]
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -10,6 +16,14 @@ use crate::{
         ka_hook::KaHookEvent,
     },
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedHookState {
+    state: &'static str,
+    vip: String,
+}
+
+static LAST_MANAGED_HOOK_STATE: OnceLock<Mutex<Option<ManagedHookState>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeHaState {
@@ -62,6 +76,14 @@ pub fn state(cfg: &Config) -> Result<NativeHaState> {
 /// gateway binds first and then announces the VIP on the underlay device.
 pub fn reconcile_vip(cfg: &Config) -> Result<bool> {
     let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
+    if ha_cfg.enabled && matches!(ha_cfg.vip.provider, VipProvider::Hook) {
+        let role = if local_gateway_is_active(cfg) {
+            "MASTER"
+        } else {
+            "BACKUP"
+        };
+        return apply_managed_hook_state_once(cfg, &ha_cfg, role, None);
+    }
     let Some(vip_text) = ha_cfg.vip.private_vip.as_deref() else {
         return Ok(false);
     };
@@ -72,10 +94,7 @@ pub fn reconcile_vip(cfg: &Config) -> Result<bool> {
     let bound = crate::linux::addr::vip_bound_on_device(cfg, vip, &device);
     let should_bind = ha_cfg.enabled
         && matches!(ha_cfg.vip.provider, VipProvider::L2)
-        && cfg
-            .active_gateway()
-            .map(|gateway| gateway.name == cfg.node_name || gateway.underlay_ip == cfg.underlay_ip)
-            .unwrap_or(false);
+        && local_gateway_is_active(cfg);
     if should_bind && !bound {
         crate::linux::addr::bind_vip_on_device(cfg, vip, &device)?;
         crate::runtime::ka_hook::announce_vip(cfg, vip, &ha_cfg.vip)?;
@@ -96,7 +115,13 @@ pub fn reconcile_vip(cfg: &Config) -> Result<bool> {
 
 pub fn release_local_vip(cfg: &Config) -> Result<bool> {
     let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
-    if !ha_cfg.enabled || !matches!(ha_cfg.vip.provider, VipProvider::L2) {
+    if !ha_cfg.enabled {
+        return Ok(false);
+    }
+    if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
+        return apply_managed_hook_state_once(cfg, &ha_cfg, "BACKUP", None);
+    }
+    if !matches!(ha_cfg.vip.provider, VipProvider::L2) {
         return Ok(false);
     }
     let Some(vip_text) = ha_cfg.vip.private_vip.as_deref() else {
@@ -116,7 +141,7 @@ pub fn release_local_vip(cfg: &Config) -> Result<bool> {
 
 pub fn handoff_or_release_on_shutdown(cfg: &Config) -> Result<()> {
     let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
-    if !ha_cfg.enabled || !matches!(ha_cfg.vip.provider, VipProvider::L2) {
+    if !ha_cfg.enabled || !matches!(ha_cfg.vip.provider, VipProvider::L2 | VipProvider::Hook) {
         return Ok(());
     }
     let local_master = state(cfg)?.state == "MASTER";
@@ -219,6 +244,14 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
             crate::linux::addr::release_vip_on_device(cfg, vip, &device)?;
         }
     }
+    if ha_cfg.enabled && matches!(ha_cfg.vip.provider, VipProvider::Hook) {
+        let role = if target.name == cfg.node_name {
+            "MASTER"
+        } else {
+            "BACKUP"
+        };
+        apply_managed_hook_state_once(cfg, &ha_cfg, role, None)?;
+    }
 
     Ok(SwitchActiveResult {
         gateway: target.name.clone(),
@@ -232,8 +265,12 @@ pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
     match event.state.trim().to_ascii_uppercase().as_str() {
         "MASTER" => {
             cfg.write_active_gateway(&cfg.node_name)?;
+            let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
+            if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
+                apply_managed_hook_state_once(cfg, &ha_cfg, "MASTER", non_empty(&event.vip))?;
+                return Ok(());
+            }
             if !event.vip.trim().is_empty() {
-                let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
                 let vip = event
                     .vip
                     .parse()
@@ -247,8 +284,12 @@ pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
             Ok(())
         }
         "BACKUP" | "STOP" => {
+            let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
+            if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
+                apply_managed_hook_state_once(cfg, &ha_cfg, "BACKUP", non_empty(&event.vip))?;
+                return Ok(());
+            }
             if !event.vip.trim().is_empty() {
-                let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
                 let vip = event
                     .vip
                     .parse()
@@ -262,9 +303,329 @@ pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
     }
 }
 
+fn local_gateway_is_active(cfg: &Config) -> bool {
+    cfg.active_gateway()
+        .map(|gateway| gateway.name == cfg.node_name || gateway.underlay_ip == cfg.underlay_ip)
+        .unwrap_or(false)
+}
+
+fn apply_managed_hook_state_once(
+    cfg: &Config,
+    ha_cfg: &ha::GatewayHaRuntimeConfig,
+    state: &'static str,
+    vip_override: Option<String>,
+) -> Result<bool> {
+    let vip = vip_override
+        .or_else(|| ha_cfg.vip.private_vip.clone())
+        .unwrap_or_default();
+    let desired = ManagedHookState {
+        state,
+        vip: vip.clone(),
+    };
+    let lock = LAST_MANAGED_HOOK_STATE.get_or_init(|| Mutex::new(None));
+    if lock
+        .lock()
+        .map(|last| last.as_ref() == Some(&desired))
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    run_managed_hook_state(cfg, ha_cfg, state, &vip)?;
+    if let Ok(mut last) = lock.lock() {
+        *last = Some(desired);
+    }
+    Ok(true)
+}
+
+fn run_managed_hook_state(
+    cfg: &Config,
+    ha_cfg: &ha::GatewayHaRuntimeConfig,
+    state: &'static str,
+    vip: &str,
+) -> Result<()> {
+    #[cfg(not(test))]
+    ha::ensure_managed_hook_scripts()?;
+    let (action, path) = match state {
+        "MASTER" => (
+            "promote",
+            ha_cfg
+                .vip
+                .promote_hook
+                .clone()
+                .unwrap_or_else(ha::default_promote_hook),
+        ),
+        "BACKUP" => (
+            "demote",
+            ha_cfg
+                .vip
+                .demote_hook
+                .clone()
+                .unwrap_or_else(ha::default_demote_hook),
+        ),
+        other => bail!("unsupported managed HA hook state {other:?}"),
+    };
+    run_hook_program(cfg, &path, action, state, vip)?;
+    let verify_hook = ha_cfg
+        .vip
+        .verify_hook
+        .clone()
+        .unwrap_or_else(ha::default_verify_hook);
+    run_hook_program(cfg, &verify_hook, "verify", state, vip)?;
+    tracing::info!(
+        "[ha] managed hook state={} action={} vip={}",
+        state,
+        action,
+        if vip.is_empty() { "-" } else { vip }
+    );
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn run_hook_program(
+    cfg: &Config,
+    path: &PathBuf,
+    action: &str,
+    state: &str,
+    vip: &str,
+) -> Result<()> {
+    let status = Command::new(path)
+        .arg(vip)
+        .env("EDGE_LB_HA_ACTION", action)
+        .env("EDGE_LB_HA_STATE", state)
+        .env("EDGE_LB_VIP", vip)
+        .env("EDGE_LB_NODE", &cfg.node_name)
+        .env("EDGE_LB_UNDERLAY_IP", cfg.underlay_ip.to_string())
+        .env("EDGE_LB_STATE_DIR", cfg.state_dir.as_os_str())
+        .status()
+        .with_context(|| format!("executing managed HA {action} hook {}", path.display()))?;
+    if !status.success() {
+        bail!(
+            "managed HA {action} hook {} failed with {status}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_hook_program(
+    cfg: &Config,
+    path: &PathBuf,
+    action: &str,
+    state: &str,
+    vip: &str,
+) -> Result<()> {
+    let _ = cfg;
+    test_hook_events().lock().unwrap().push(format!(
+        "{}:{}:{}:{}",
+        path.display(),
+        action,
+        state,
+        vip
+    ));
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_hook_events() -> &'static Mutex<Vec<String>> {
+    static EVENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn vip_device(cfg: &Config, bind_device: VipBindDevice) -> String {
     match bind_device {
         VipBindDevice::Underlay => cfg.network().underlay_dev.clone(),
         VipBindDevice::Loopback => "lo".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf, time::SystemTime};
+
+    use crate::{
+        config::{
+            ActiveSource, Config, FileConfig, GatewayNode, HaConfig, NetworkConfig, NodeRole,
+        },
+        provider::native::take_state_dirty,
+        runtime::{
+            ha::{GatewayHaPeer, GatewayHaRuntimeConfig, VipConfig, VipProvider},
+            ka_hook::KaHookEvent,
+        },
+    };
+
+    use super::*;
+
+    fn reset_test_hooks() {
+        if let Some(lock) = LAST_MANAGED_HOOK_STATE.get() {
+            *lock.lock().unwrap() = None;
+        }
+        test_hook_events().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn switch_active_gateway_does_not_mark_native_proxy_dirty() {
+        let (cfg, dir) = test_gateway_config("switch");
+        save_hook_ha_config(&dir);
+        fs::write(&cfg.ha.active_state_file, "gateway-b\n").unwrap();
+        let _ = take_state_dirty();
+
+        let result = switch_active_gateway(&cfg, "gateway-a").unwrap();
+
+        assert_eq!(result.gateway, "gateway-a");
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-a");
+        assert!(!take_state_dirty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hook_reconcile_runs_role_hook_then_verify_only_on_state_change() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("hook-reconcile");
+        save_hook_ha_config_with_vip(&dir, "192.0.2.200");
+        fs::write(&cfg.ha.active_state_file, "gateway-a\n").unwrap();
+        let _ = take_state_dirty();
+
+        assert!(reconcile_vip(&cfg).unwrap());
+        assert!(!reconcile_vip(&cfg).unwrap());
+        fs::write(&cfg.ha.active_state_file, "gateway-b\n").unwrap();
+        assert!(reconcile_vip(&cfg).unwrap());
+
+        let events: Vec<_> = test_hook_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.ends_with(":192.0.2.200"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-demote:demote:BACKUP:192.0.2.200",
+                "/usr/local/bin/edge-lb-verify-vip:verify:BACKUP:192.0.2.200",
+            ]
+        );
+        assert!(!take_state_dirty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ka_hook_active_events_do_not_mark_native_proxy_dirty() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("ka-hook");
+        save_hook_ha_config(&dir);
+        fs::write(&cfg.ha.active_state_file, "gateway-b\n").unwrap();
+        let _ = take_state_dirty();
+
+        handle_ka_hook_event(
+            &cfg,
+            &KaHookEvent {
+                instance: "edge-lb".to_string(),
+                state: "MASTER".to_string(),
+                vip: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-a");
+        assert!(!take_state_dirty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    fn save_hook_ha_config(dir: &std::path::Path) {
+        save_hook_ha_config_with_vip(dir, "");
+    }
+
+    fn save_hook_ha_config_with_vip(dir: &std::path::Path, private_vip: &str) {
+        ha::save_for_state_dir(
+            dir,
+            &GatewayHaRuntimeConfig {
+                enabled: true,
+                peers: vec![GatewayHaPeer {
+                    name: "gateway-b".to_string(),
+                    underlay_ip: "192.0.2.16".to_string(),
+                    ..GatewayHaPeer::default()
+                }],
+                vip: VipConfig {
+                    provider: VipProvider::Hook,
+                    private_vip: if private_vip.is_empty() {
+                        None
+                    } else {
+                        Some(private_vip.to_string())
+                    },
+                    ..VipConfig::default()
+                },
+                ..GatewayHaRuntimeConfig::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn test_gateway_config(name: &str) -> (Config, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "edge-lb-ha-datapath-contract-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let active_state_file = dir.join("active-gateway");
+        let file = FileConfig {
+            node_role: NodeRole::Gateway,
+            node_name: "gateway-a".to_string(),
+            public_ip: "198.51.100.12".parse().unwrap(),
+            underlay_ip: "192.0.2.12".parse().unwrap(),
+            state_dir: dir.clone(),
+            ha: HaConfig {
+                active_source: ActiveSource::File,
+                active_state_file,
+                ..HaConfig::default()
+            },
+            network: NetworkConfig {
+                gateway_public_ip: "198.51.100.12".parse().unwrap(),
+                gateway_ip: "192.0.2.12".parse().unwrap(),
+                underlay_dev: "eth0".to_string(),
+                vxlan_dev: "edge-hub".to_string(),
+                overlay_cidr: "10.255.12.0/24".to_string(),
+                dscp: 46,
+                ..NetworkConfig::default()
+            },
+            gateway_nodes: vec![
+                GatewayNode {
+                    name: "gateway-a".to_string(),
+                    public_ip: "198.51.100.12".parse().unwrap(),
+                    underlay_ip: "192.0.2.12".parse().unwrap(),
+                    overlay_ip: "10.255.12.1/24".to_string(),
+                },
+                GatewayNode {
+                    name: "gateway-b".to_string(),
+                    public_ip: "198.51.100.16".parse().unwrap(),
+                    underlay_ip: "192.0.2.16".parse().unwrap(),
+                    overlay_ip: "10.255.16.1/24".to_string(),
+                },
+            ],
+            ..FileConfig::default()
+        };
+        (
+            Config {
+                file,
+                path: dir.join("config.toml"),
+            },
+            dir,
+        )
     }
 }

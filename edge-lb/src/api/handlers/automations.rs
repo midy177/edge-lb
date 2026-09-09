@@ -358,16 +358,9 @@ fn reconcile_templates(cfg: &Config, config: &AutomationConfig) -> anyhow::Resul
     let current_groups = crate::provider::native::target_groups_native(cfg).unwrap_or_default();
     let mut applied = false;
     for template in config.templates.iter().filter(|template| template.enabled) {
-        let mut group = planned_target_group(cfg, template)
+        let group = planned_target_group(cfg, template)
             .with_context(|| format!("building target group payload for {}", template.name))?;
         if group.targets.is_empty() {
-            if preserve_existing_targets_if_subscription_settling(&mut group, &current_groups) {
-                tracing::debug!(
-                    "[automation] template {} matched no backend nodes; preserving existing non-empty target group {} during subscription settle",
-                    template.name,
-                    group.name
-                );
-            }
             tracing::info!(
                 "[automation] template {} matched no backend nodes; keeping target group {}",
                 template.name,
@@ -403,29 +396,23 @@ fn reconcile_templates(cfg: &Config, config: &AutomationConfig) -> anyhow::Resul
     Ok(applied)
 }
 
-fn preserve_existing_targets_if_subscription_settling(
-    group: &mut TargetGroup,
-    current_groups: &[TargetGroup],
-) -> bool {
-    let Some(current) = current_groups
-        .iter()
-        .find(|current| current.name == group.name && !current.targets.is_empty())
-    else {
-        return false;
-    };
-    group.targets = current.targets.clone();
-    true
-}
-
 fn planned_target_group(
     cfg: &Config,
     template: &AutomationTemplate,
 ) -> anyhow::Result<TargetGroup> {
     let nodes = automation_nodes(cfg);
-    let targets = filter::matched_nodes(template, &nodes);
     let existing = native::target_groups_native(cfg)?
         .into_iter()
         .find(|group| group.name == validate::generated_target_group_name(template));
+    planned_target_group_for_nodes(template, &nodes, existing.as_ref())
+}
+
+fn planned_target_group_for_nodes(
+    template: &AutomationTemplate,
+    nodes: &[crate::automation::model::MatchedNode],
+    existing: Option<&TargetGroup>,
+) -> anyhow::Result<TargetGroup> {
+    let targets = filter::matched_nodes(template, nodes);
     let probe_type = template
         .target_group
         .probe_type
@@ -526,53 +513,36 @@ fn merge_import(
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-
-    use crate::config::{BackendTarget, TargetGroup};
+    use crate::{
+        automation::model::AutomationTemplate,
+        config::{BackendTarget, TargetGroup},
+    };
 
     #[test]
-    fn empty_automation_match_preserves_existing_targets_during_subscription_settle() {
-        let mut planned = TargetGroup {
-            name: "tcp-udp-9999-targets".to_string(),
-            monitor: true,
-            probe_type: Some("tcp".to_string()),
-            probe_port: Some(9999),
-            targets: Vec::new(),
-            ..TargetGroup::default()
-        };
+    fn empty_match_removes_offline_targets_but_keeps_the_group() {
+        let mut template = AutomationTemplate::default();
+        template.target_group.name = "service-targets".to_string();
         let current = TargetGroup {
-            name: planned.name.clone(),
-            monitor: true,
-            probe_type: Some("tcp".to_string()),
-            probe_port: Some(9999),
+            name: "service-targets".to_string(),
             targets: vec![BackendTarget {
                 backend: None,
-                address: "192.168.0.13".parse::<IpAddr>().unwrap(),
-                weight: 1,
+                address: "192.0.2.13".parse().unwrap(),
+                weight: 2,
             }],
             ..TargetGroup::default()
         };
-
-        assert!(super::preserve_existing_targets_if_subscription_settling(
-            &mut planned,
-            &[current]
-        ));
-        assert_eq!(planned.targets.len(), 1);
-        assert_eq!(planned.targets[0].address.to_string(), "192.168.0.13");
+        let planned =
+            super::planned_target_group_for_nodes(&template, &[], Some(&current)).unwrap();
+        assert_eq!(planned.name, current.name);
+        assert!(planned.targets.is_empty());
     }
 
     #[test]
-    fn empty_automation_match_stays_empty_when_group_is_new() {
-        let mut planned = TargetGroup {
-            name: "new-targets".to_string(),
-            targets: Vec::new(),
-            ..TargetGroup::default()
-        };
-
-        assert!(!super::preserve_existing_targets_if_subscription_settling(
-            &mut planned,
-            &[]
-        ));
+    fn empty_match_creates_a_bindable_empty_group() {
+        let mut template = AutomationTemplate::default();
+        template.target_group.name = "new-targets".to_string();
+        let planned = super::planned_target_group_for_nodes(&template, &[], None).unwrap();
+        assert_eq!(planned.name, "new-targets");
         assert!(planned.targets.is_empty());
     }
 }

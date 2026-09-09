@@ -123,58 +123,12 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
     state.created_vxlan = created;
 
     let mut runtime_cfg = cfg.clone();
-    let hydrated = match native::hydrate_proxy_config_from_api(&mut runtime_cfg) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!("[gateway] loading native proxy state failed: {e:#}");
-            runtime_cfg = cfg.clone();
-            false
-        }
-    };
-    if let Err(error) = restore_business_config(&mut runtime_cfg) {
-        tracing::warn!("[gateway] restoring SQLite listeners skipped: {error:#}");
-    }
+    native::hydrate_proxy_config_from_api(&mut runtime_cfg)
+        .context("loading canonical proxy configuration")?;
 
-    // 4. Native listeners. DSCP return-path marking is derived later only from
-    // default-mode listeners because they preserve real client IPs.
-    for listener in &runtime_cfg.listeners {
-        let Some(group) = runtime_cfg
-            .target_groups
-            .iter()
-            .find(|group| group.name == listener.target_group)
-        else {
-            tracing::warn!(
-                "[gateway] listener {} skipped: target group {} not found",
-                listener.name,
-                listener.target_group
-            );
-            continue;
-        };
-        if group.targets.iter().any(|target| {
-            runtime_cfg
-                .resolve_backend_target_address(target)
-                .is_unspecified()
-        }) {
-            tracing::warn!(
-                "[gateway] listener {} skipped: unresolved target (target_group={} port={} protocols={:?})",
-                listener.name,
-                listener.target_group,
-                listener.port,
-                listener.protocols
-            );
-            continue;
-        }
-        native::create_or_update_listener(&runtime_cfg, listener)?;
-        tracing::debug!("[gateway] listener rule reconciled for {}", listener.name);
-    }
-    let mut ports = dscp_ports(&runtime_cfg);
-    if ports.is_empty() && !hydrated {
-        ports = state.dscp_ports.clone();
-        ports.sort_unstable();
-        ports.dedup();
-    } else {
-        state.dscp_ports = ports.clone();
-    }
+    native::reconcile_listener_state(&runtime_cfg)?;
+    let ports = dscp_ports(&runtime_cfg);
+    state.dscp_ports = ports.clone();
 
     state.vxlan_ifindex = net::ifindex(&n.vxlan_dev).ok();
 
@@ -265,20 +219,6 @@ fn apply_inner(cfg: &Config, opts: &ApplyOptions, mode: DscpAttachMode) -> Resul
     Ok(dscp_update)
 }
 
-fn restore_business_config(cfg: &mut Config) -> Result<()> {
-    let listeners = crate::api::load_persisted_listeners(cfg)?;
-    let groups = native::target_groups_native(cfg)?;
-    cfg.file.target_groups = groups;
-    cfg.file.listeners = listeners;
-    if !cfg.file.listeners.is_empty() {
-        tracing::info!(
-            "[gateway] restored {} listener(s) from SQLite business configuration",
-            cfg.file.listeners.len()
-        );
-    }
-    Ok(())
-}
-
 pub fn run(cfg: &Config) -> Result<()> {
     privilege::require_root()?;
     shutdown::install();
@@ -292,23 +232,11 @@ pub fn run(cfg: &Config) -> Result<()> {
             DscpUpdate::Replace(attachment) => Some(attachment),
             DscpUpdate::Keep | DscpUpdate::Clear => None,
         };
-    match api::reconcile_automations(&cfg) {
-        Ok(true) => {
-            tracing::info!(
-                "[gateway] automation templates changed native proxy state during startup; refreshing datapath"
-            );
-            drop(dscp_attachment.take());
-            dscp_attachment =
-                match apply_inner(&cfg, &ApplyOptions::default(), DscpAttachMode::Managed)? {
-                    DscpUpdate::Replace(attachment) => Some(attachment),
-                    DscpUpdate::Keep | DscpUpdate::Clear => None,
-                };
-        }
-        Ok(false) => {}
-        Err(e) => tracing::warn!("[gateway] startup automation reconcile skipped: {e:#}"),
-    }
+    // Reconcile startup templates after the same bounded subscription settle
+    // window as node changes, not before the xDS server has started.
     let mut cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
     spawn_ui(&cfg);
+    crate::runtime::proxy_replication::spawn(&cfg)?;
     spawn_probe_worker(&cfg);
     spawn_flow_sync_worker(&cfg);
     crate::runtime::bfd::spawn(&cfg);
@@ -332,7 +260,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         }
     );
     let mut last_config_mtime = config_mtime(&cfg);
-    let mut pending_node_change: Option<Instant> = None;
+    let mut pending_node_change = Some(Instant::now());
     while !shutdown::requested() {
         let mut needs_full = false;
         if let Err(error) = native::ha::reconcile_vip(&cfg) {
@@ -407,37 +335,39 @@ pub fn run(cfg: &Config) -> Result<()> {
                 }
                 Err(e) => tracing::error!("[gateway] apply failed: {e:#}"),
             }
-            match api::reconcile_automations(&cfg) {
-                Ok(true) => {
-                    tracing::info!(
-                        "[gateway] automation templates changed native proxy state; refreshing datapath"
-                    );
-                    if dscp_attachment.is_some()
-                        && !dscp::attached(&cfg, &cfg.network().underlay_dev)
-                    {
-                        drop(dscp_attachment.take());
+            if pending_node_change.is_none() {
+                match api::reconcile_automations(&cfg) {
+                    Ok(true) => {
+                        tracing::info!(
+                            "[gateway] automation templates changed native proxy state; refreshing datapath"
+                        );
+                        if dscp_attachment.is_some()
+                            && !dscp::attached(&cfg, &cfg.network().underlay_dev)
+                        {
+                            drop(dscp_attachment.take());
+                        }
+                        match apply_inner(&cfg, &ApplyOptions::default(), DscpAttachMode::Managed) {
+                            Ok(DscpUpdate::Replace(attachment)) => {
+                                dscp_attachment = Some(attachment);
+                                cached_dscp_ports =
+                                    AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
+                            }
+                            Ok(DscpUpdate::Clear) => {
+                                dscp_attachment = None;
+                                cached_dscp_ports.clear();
+                            }
+                            Ok(DscpUpdate::Keep) => {
+                                cached_dscp_ports =
+                                    AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
+                            }
+                            Err(e) => {
+                                tracing::error!("[gateway] apply after automation failed: {e:#}")
+                            }
+                        }
                     }
-                    match apply_inner(&cfg, &ApplyOptions::default(), DscpAttachMode::Managed) {
-                        Ok(DscpUpdate::Replace(attachment)) => {
-                            dscp_attachment = Some(attachment);
-                            cached_dscp_ports =
-                                AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
-                        }
-                        Ok(DscpUpdate::Clear) => {
-                            dscp_attachment = None;
-                            cached_dscp_ports.clear();
-                        }
-                        Ok(DscpUpdate::Keep) => {
-                            cached_dscp_ports =
-                                AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
-                        }
-                        Err(e) => {
-                            tracing::error!("[gateway] apply after automation failed: {e:#}")
-                        }
-                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("[gateway] automation reconcile skipped: {e:#}"),
                 }
-                Ok(false) => {}
-                Err(e) => tracing::warn!("[gateway] automation reconcile skipped: {e:#}"),
             }
         }
         sleep(Duration::from_secs(cfg.ha.watch_interval_secs));
@@ -575,9 +505,7 @@ pub fn show(cfg: &Config) -> Result<()> {
     }
     section("desired native listeners");
     let mut runtime_cfg = cfg.clone();
-    if let Err(error) = native::hydrate_proxy_config_from_api(&mut runtime_cfg)
-        .and_then(|()| restore_business_config(&mut runtime_cfg))
-    {
+    if let Err(error) = native::hydrate_proxy_config_from_api(&mut runtime_cfg) {
         println!("(unavailable: {error:#})");
     } else {
         for lb in native::listeners_from_config(&runtime_cfg)? {

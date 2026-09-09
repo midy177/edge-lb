@@ -71,6 +71,7 @@ pub(in crate::api) fn route(
         (Method::Get, "/api/ha/config") => handlers::ha::get_config(cfg),
         (Method::Put, "/api/ha/config") => handlers::ha::put_config(cfg, body),
         (Method::Get, "/api/ha/status") => handlers::ha::status(cfg),
+        (Method::Get, "/api/ha/proxy-config-sync") => handlers::proxy_config::sync_status(cfg),
         (Method::Get, "/api/ha/peer/status") => handlers::ha::peer_status(cfg),
         (Method::Post, "/api/ha/peer/activate") => handlers::ha::peer_activate(cfg, body),
         (Method::Put, "/api/ha/peer/notifications/active") => {
@@ -173,6 +174,7 @@ fn canonical_path(path: &str) -> Option<String> {
         "/operations/verify" => "/api/verify",
         "/ha/config" => "/api/ha/config",
         "/ha/status" => "/api/ha/status",
+        "/ha/proxy-config-sync" => "/api/ha/proxy-config-sync",
         "/ha/peer/status" => "/api/ha/peer/status",
         "/ha/peer/activate" => "/api/ha/peer/activate",
         "/ha/peer/notifications/active" => "/api/ha/peer/notifications/active",

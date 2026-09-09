@@ -26,7 +26,7 @@ pub use model::{
 pub use probe::run_worker as run_probe_worker;
 #[allow(unused_imports)]
 pub use store::{
-    create_or_update_listener, default_external_ip, delete_listener, delete_target_group,
-    hydrate_proxy_config_from_api, native_listeners_state, take_state_dirty, target_groups_native,
-    target_health, target_health_native, upsert_target_group,
+    default_external_ip, delete_listener, hydrate_proxy_config_from_api, mark_state_dirty,
+    native_listeners_state, reconcile_listener_state, take_state_dirty, target_groups_native,
+    target_health, target_health_native,
 };

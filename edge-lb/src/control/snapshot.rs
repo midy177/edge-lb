@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -16,11 +17,12 @@ use crate::{
 };
 
 pub fn response_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<DiscoveryResponse> {
-    let version = version(cfg)?;
+    let snapshot = from_config_for_backend(cfg, backend_underlay)?;
+    let version = snapshot_version(&snapshot);
     Ok(DiscoveryResponse {
         nonce: nonce(),
         version,
-        snapshot: Some(from_config_for_backend(cfg, backend_underlay)?),
+        snapshot: Some(snapshot),
     })
 }
 
@@ -194,8 +196,13 @@ fn snapshot_gateway_key(resp: &DiscoveryResponse) -> Option<String> {
 
 fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<ConfigSnapshot> {
     let n = cfg.network();
-    let active = cfg.active_gateway()?;
-    let source_gateway = source_gateway(cfg, &active);
+    let fallback = GatewayNode {
+        name: cfg.node_name.clone(),
+        public_ip: cfg.public_ip,
+        underlay_ip: cfg.underlay_ip,
+        overlay_ip: cfg.gateway_cfg().overlay_ip.clone(),
+    };
+    let source_gateway = source_gateway(cfg, &fallback);
     let gateway_overlay_ip = overlay_addr(&source_gateway.overlay_ip, "gateway overlay_ip")?;
     // Marks/tables are gateway-slotted so two HA gateways never share one
     // return table.
@@ -217,8 +224,8 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
             backend_overlay_ip: p.backend_overlay_ip.unwrap_or_default(),
         })
         .collect();
-    Ok(ConfigSnapshot {
-        active_gateway: active.name.clone(),
+    let mut snapshot = ConfigSnapshot {
+        active_gateway: String::new(),
         network: Some(pb::Network {
             gateway_public_ip: source_gateway.public_ip.to_string(),
             gateway_ip: source_gateway.underlay_ip.to_string(),
@@ -250,7 +257,14 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
             })
             .collect(),
         backend_return_ports,
-    })
+    };
+    snapshot
+        .gateway_nodes
+        .sort_by(|a, b| a.underlay_ip.cmp(&b.underlay_ip).then(a.name.cmp(&b.name)));
+    snapshot
+        .backend_nodes
+        .sort_by(|a, b| a.underlay_ip.cmp(&b.underlay_ip).then(a.name.cmp(&b.name)));
+    Ok(snapshot)
 }
 
 fn file_from_snapshot(base: &Config, snapshot: &ConfigSnapshot) -> Result<FileConfig> {
@@ -425,17 +439,8 @@ fn local_backend_for_snapshot(base: &Config, file: &FileConfig) -> Result<Backen
     )
 }
 
-fn version(cfg: &Config) -> Result<String> {
-    let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&cfg.file)?);
-    if let Ok(active) = cfg.active_gateway() {
-        hasher.update(active.name.as_bytes());
-        hasher.update(active.underlay_ip.to_string().as_bytes());
-        hasher.update(active.public_ip.to_string().as_bytes());
-        hasher.update(active.overlay_ip.as_bytes());
-    }
-    let digest = hasher.finalize();
-    Ok(format!("{digest:x}"))
+fn snapshot_version(snapshot: &ConfigSnapshot) -> String {
+    format!("{:x}", Sha256::digest(snapshot.encode_to_vec()))
 }
 
 fn nonce() -> String {
@@ -544,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_snapshot_uses_active_gateway_network_as_base() {
+    fn combined_snapshot_uses_deterministic_gateway_network_as_base() {
         let combined = combine_gateway_responses(vec![
             gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46, "gateway-a"),
             gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40, "gateway-a"),
@@ -611,9 +616,11 @@ mod tests {
         ])
         .expect("snapshots combine");
         let snapshot = combined.snapshot.expect("combined snapshot");
-        let mut base_file = FileConfig::default();
-        base_file.node_role = crate::config::NodeRole::Backend;
-        base_file.node_name = "backend-1".to_string();
+        let mut base_file = FileConfig {
+            node_role: crate::config::NodeRole::Backend,
+            node_name: "backend-1".to_string(),
+            ..FileConfig::default()
+        };
         base_file.ha.active_source = ActiveSource::Xds;
         base_file.control_plane.enabled = true;
         base_file.control_plane.mode = crate::config::ControlPlaneMode::Xds;
@@ -637,11 +644,13 @@ mod tests {
 
     #[test]
     fn snapshot_to_backend_config_keeps_only_return_path_contract() {
-        let mut base_file = FileConfig::default();
-        base_file.node_name = "backend-2".to_string();
-        base_file.ha = HaConfig {
-            active_source: ActiveSource::Xds,
-            ..HaConfig::default()
+        let mut base_file = FileConfig {
+            node_name: "backend-2".to_string(),
+            ha: HaConfig {
+                active_source: ActiveSource::Xds,
+                ..HaConfig::default()
+            },
+            ..FileConfig::default()
         };
         base_file.control_plane.enabled = true;
         base_file.control_plane.mode = ControlPlaneMode::Xds;
@@ -917,7 +926,9 @@ mod tests {
             file: file.clone(),
             path: PathBuf::from("/tmp/edge-lb-test.toml"),
         };
-        let default_version = version(&default_cfg).unwrap();
+        let default_version = response_for_backend(&default_cfg, local_ip("192.0.2.23"))
+            .unwrap()
+            .version;
         assert_eq!(backend_return_ports_from_config(&default_cfg).len(), 1);
 
         file.listeners[0].target_port = 8081;
@@ -926,13 +937,15 @@ mod tests {
             file,
             path: PathBuf::from("/tmp/edge-lb-test.toml"),
         };
-        let changed_version = version(&changed_cfg).unwrap();
+        let changed_version = response_for_backend(&changed_cfg, local_ip("192.0.2.23"))
+            .unwrap()
+            .version;
         assert_eq!(backend_return_ports_from_config(&changed_cfg).len(), 1);
         assert_ne!(default_version, changed_version);
     }
 
     #[test]
-    fn snapshot_version_changes_when_active_gateway_changes() {
+    fn snapshot_version_ignores_active_gateway_changes() {
         let dir = std::env::temp_dir().join(format!("edge-lb-active-version-{}", nonce()));
         fs::create_dir_all(&dir).unwrap();
         let active_file = dir.join("active-gateway");
@@ -963,11 +976,15 @@ mod tests {
         };
 
         fs::write(&active_file, "gateway-a\n").unwrap();
-        let gateway_a_version = version(&cfg).unwrap();
+        let gateway_a_version = response_for_backend(&cfg, local_ip("192.0.2.23"))
+            .unwrap()
+            .version;
         fs::write(&active_file, "gateway-b\n").unwrap();
-        let gateway_b_version = version(&cfg).unwrap();
+        let gateway_b_version = response_for_backend(&cfg, local_ip("192.0.2.23"))
+            .unwrap()
+            .version;
 
-        assert_ne!(gateway_a_version, gateway_b_version);
+        assert_eq!(gateway_a_version, gateway_b_version);
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -35,7 +35,7 @@ import { t as text } from '@/lib/i18n'
 import {
   healthVariant,
 } from '@/lib/lb'
-import { backendNodes, busy, refreshTargetGroupData, run, targetGroups } from '@/composables/useNodeData'
+import { backendNodes, busy, run, targetGroups } from '@/composables/useNodeData'
 
 type GroupForm = {
   name: string
@@ -97,7 +97,7 @@ function importGroups() { groupImportInput.value?.click() }
 async function onGroupImport(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) return
-  await run(text('import'), async () => { await api.importTargetGroups(JSON.parse(await file.text())); await refreshTargetGroupData() })
+  await run(text('import'), async () => api.importTargetGroups(JSON.parse(await file.text())))
   ;(event.target as HTMLInputElement).value = ''
 }
 
@@ -162,19 +162,15 @@ async function saveGroup() {
     period_secs: groupForm.monitor ? groupForm.period_secs : null, retries: groupForm.monitor ? groupForm.retries : null,
     targets: items.map((item) => ({ address: item.address.trim(), weight: Number(item.weight) })),
   }
-  await run(text('save'), async () => {
-    if (editingGroup.value) await api.updateTargetGroup(editingGroup.value, payload)
-    else await api.createTargetGroup(payload)
-    await refreshTargetGroupData()
+  const saved = await run(text('save'), async () => {
+    if (editingGroup.value) return api.updateTargetGroup(editingGroup.value, payload)
+    return api.createTargetGroup(payload)
   })
-  if (!busy.value) groupDialogOpen.value = false
+  if (saved) groupDialogOpen.value = false
 }
 
 function deleteGroup(group: TargetGroup) {
-  run(`${text('delete')} ${group.name}`, async () => {
-    await api.deleteTargetGroup(group.name)
-    await refreshTargetGroupData()
-  })
+  run(`${text('delete')} ${group.name}`, () => api.deleteTargetGroup(group.name))
 }
 
 function targetAddress(target: BackendTarget) {

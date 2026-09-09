@@ -92,6 +92,9 @@ node_role = "gateway"        # gateway | backend
 `edge-lb ui serve`（或 gateway daemon 自带）：节点状态、监听配置、目标组、
 自动目标组、通知、主备切换和一键验证；危险操作先展示变更摘要。
 
+gateway 角色的独立 `ui serve` 也会发送待同步的 HA 配置，但不启动 BFD 或数据面。
+该进程必须独占 `state_dir`，不要与使用同一数据库的 gateway daemon 同时运行。
+
 ```text
 GET/PUT /api/v1/config
 GET     /api/v1/status

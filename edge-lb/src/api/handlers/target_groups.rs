@@ -96,6 +96,9 @@ fn health_matches_group(
     group: &TargetGroup,
     entry: &crate::provider::native::TargetHealthEntry,
 ) -> bool {
+    if entry.target_group != group.name {
+        return false;
+    }
     let expected_type = group
         .probe_type
         .as_deref()
@@ -134,6 +137,16 @@ pub(in crate::api) fn import_target_groups(cfg: &Config, body: &str) -> Reply {
     if let Some(reply) = require_gateway_role(cfg) {
         return reply;
     }
+    proxy_config::apply_authoritative(
+        cfg,
+        ProxyConfigOperation::TargetGroupImport {
+            body: body.to_string(),
+        },
+    )
+}
+
+pub(in crate::api) fn import_target_groups_local(cfg: &Config, body: &str) -> Reply {
+    use crate::storage::proxy_config::{Rejection, mutate};
     let value: serde_json::Value = match serde_json::from_str(body) {
         Ok(value) => value,
         Err(e) => return Reply::error(400, format!("bad target group import JSON: {e}")),
@@ -143,19 +156,41 @@ pub(in crate::api) fn import_target_groups(cfg: &Config, body: &str) -> Reply {
         Ok(groups) => groups,
         Err(e) => return Reply::error(400, format!("bad target group import payload: {e}")),
     };
-    let mut imported = 0;
-    for group in groups {
-        let body = serde_json::to_string(&group).unwrap();
-        let reply = proxy_config::apply_authoritative(
-            cfg,
-            ProxyConfigOperation::TargetGroupCreate { body },
-        );
-        if !(200..300).contains(&reply.status) {
-            return reply;
+    match mutate(cfg, |state| {
+        let mut names = std::collections::HashSet::new();
+        for group in &groups {
+            if group.name.trim().is_empty() || !names.insert(&group.name) {
+                return Err(Rejection::new(
+                    400,
+                    "empty or duplicate target group name in import",
+                ));
+            }
+            if let Some(existing) = state
+                .target_groups
+                .iter_mut()
+                .find(|item| item.name == group.name)
+            {
+                *existing = group.clone();
+            } else {
+                state.target_groups.push(group.clone());
+            }
         }
-        imported += 1;
+        let mut file = cfg.file.clone();
+        file.listeners = state.listeners.clone();
+        file.target_groups = state.target_groups.clone();
+        file.validate().map_err(|error| {
+            Rejection::new(400, format!("invalid target group import: {error:#}"))
+        })?;
+        Ok(())
+    }) {
+        Ok(((), changed)) => {
+            if changed {
+                crate::provider::native::mark_state_dirty();
+            }
+            Reply::json(200, json!({ "status": "imported", "count": groups.len() }))
+        }
+        Err(error) => proxy_config::mutation_error(error),
     }
-    Reply::json(200, json!({ "status": "imported", "count": imported }))
 }
 
 pub(in crate::api) fn create_target_group(cfg: &Config, body: &str) -> Reply {
@@ -196,52 +231,68 @@ pub(in crate::api) fn delete_target_group(cfg: &Config, name: &str) -> Reply {
 }
 
 pub(in crate::api) fn upsert_target_group_local(cfg: &Config, body: &str) -> Reply {
+    use crate::storage::proxy_config::{Rejection, mutate};
     let group: TargetGroup = match serde_json::from_str(body) {
         Ok(group) => group,
-        Err(e) => return Reply::error(400, format!("bad target group JSON: {e}")),
+        Err(error) => return Reply::error(400, format!("bad target group JSON: {error}")),
     };
-    if group.name.trim().is_empty() {
-        return Reply::error(400, "target group name is required");
-    }
-    let mut file = cfg.file.clone();
-    if let Some(existing) = file
-        .target_groups
-        .iter_mut()
-        .find(|item| item.name == group.name)
-    {
-        *existing = group.clone();
-    } else {
-        file.target_groups.push(group.clone());
-    }
-    if let Err(e) = file.validate() {
-        return Reply::error(400, format!("invalid target group: {e:#}"));
-    }
-    let local_cfg = Config {
-        path: cfg.path.clone(),
-        file,
-    };
-    match crate::provider::native::upsert_target_group(&local_cfg, &group) {
-        Ok(()) => Reply::json(200, serde_json::to_value(group).unwrap()),
-        Err(e) => Reply::error(500, format!("saving target group failed: {e:#}")),
+    match mutate(cfg, |state| {
+        if group.name.trim().is_empty() {
+            return Err(Rejection::new(400, "target group name is required"));
+        }
+        if let Some(existing) = state
+            .target_groups
+            .iter_mut()
+            .find(|item| item.name == group.name)
+        {
+            *existing = group.clone();
+        } else {
+            state.target_groups.push(group.clone());
+        }
+        let mut file = cfg.file.clone();
+        file.listeners = state.listeners.clone();
+        file.target_groups = state.target_groups.clone();
+        file.validate()
+            .map_err(|error| Rejection::new(400, format!("invalid target group: {error:#}")))?;
+        Ok(())
+    }) {
+        Ok(((), changed)) => {
+            if changed {
+                crate::provider::native::mark_state_dirty();
+            }
+            Reply::json(200, serde_json::to_value(group).unwrap())
+        }
+        Err(error) => proxy_config::mutation_error(error),
     }
 }
 
 pub(in crate::api) fn delete_target_group_local(cfg: &Config, name: &str) -> Reply {
-    if cfg
-        .file
-        .listeners
-        .iter()
-        .any(|listener| listener.target_group == name)
-    {
-        return Reply::error(
-            409,
-            format!("target group {name} is still referenced by a listener"),
-        );
-    }
-    match crate::provider::native::delete_target_group(cfg, name) {
-        Ok(true) => Reply::json(200, json!({ "status": "deleted", "name": name })),
-        Ok(false) => Reply::error(404, format!("target group {name} not found")),
-        Err(e) => Reply::error(500, format!("deleting target group failed: {e:#}")),
+    use crate::storage::proxy_config::{Rejection, mutate};
+    match mutate(cfg, |state| {
+        if state
+            .listeners
+            .iter()
+            .any(|listener| listener.target_group == name)
+        {
+            return Err(Rejection::new(
+                409,
+                format!("target group {name} is still referenced by a listener"),
+            ));
+        }
+        let before = state.target_groups.len();
+        state.target_groups.retain(|group| group.name != name);
+        if state.target_groups.len() == before {
+            return Err(Rejection::new(404, format!("no target group {name}")));
+        }
+        Ok(())
+    }) {
+        Ok(((), changed)) => {
+            if changed {
+                crate::provider::native::mark_state_dirty();
+            }
+            Reply::json(200, json!({ "status": "deleted", "name": name }))
+        }
+        Err(error) => proxy_config::mutation_error(error),
     }
 }
 
@@ -277,6 +328,7 @@ mod tests {
             ..TargetGroup::default()
         };
         let entry = crate::provider::native::TargetHealthEntry {
+            target_group: "web".to_string(),
             host_name: "192.0.2.10".to_string(),
             probe_type: Some("none".to_string()),
             probe_port: Some(8080),
@@ -295,6 +347,7 @@ mod tests {
             ..TargetGroup::default()
         };
         let entry = crate::provider::native::TargetHealthEntry {
+            target_group: "web".to_string(),
             host_name: "192.0.2.10".to_string(),
             probe_type: Some("http".to_string()),
             probe_port: Some(9090),

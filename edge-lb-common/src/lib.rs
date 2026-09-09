@@ -5,10 +5,10 @@ extern crate std;
 
 /// Maximum number of destination ports the DSCP marker can match.
 pub const MAX_PORTS: usize = 16;
+/// Room for old and new sets while the marker is updated without clearing it.
+pub const DSCP_PORT_MAP_CAPACITY: u32 = (MAX_PORTS * 2) as u32;
 /// Default DSCP value. 46 is Expedited Forwarding (tos 0xb8).
 pub const DEFAULT_DSCP: u32 = 46;
-/// Default marked port: the VIP port exposed on the gateway.
-pub const DEFAULT_PORT: u32 = 80;
 /// Default source-IP persistence lifetime for `persist` selection.
 pub const DEFAULT_PERSIST_TIMEOUT_SECS: u32 = 3 * 60 * 60;
 pub const NATIVE_SELECT_RR: u32 = 0;
@@ -24,11 +24,12 @@ pub const PROGRAM_NAME: &str = "dscp_mark";
 /// compile-time bound so the verifier sees bounded loops; user space clamps
 /// target map writes to the same limit.
 pub const MAX_TARGETS_PER_LISTENER: u32 = 64;
+pub const NATIVE_LISTENER_ID_CAPACITY: u32 = 4096;
 pub const NATIVE_DNAT_INGRESS_PROGRAM: &str = "native_dnat_ingress";
 pub const NATIVE_DNAT_RETURN_PROGRAM: &str = "native_dnat_return";
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Stats {
     pub matched: u64,
@@ -40,7 +41,7 @@ unsafe impl aya::Pod for Stats {}
 
 /// IPv4 listener lookup key for the native DNAT datapath.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NativeListenerLookupKey {
     /// IPv4 VIP in network byte order.
@@ -67,7 +68,7 @@ pub struct NativeListenerLookupValue {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NativeTargetKey {
     pub listener_id: u32,
@@ -120,6 +121,64 @@ pub struct NativeFlowValue {
     /// Idle timeout copied from the listener when the flow is created.
     pub timeout_secs: u32,
     pub last_seen_ns: u64,
+}
+
+impl NativeFlowKey {
+    /// Ports in keys and vip_port are network order; target_port is host order.
+    #[inline(always)]
+    pub fn reverse_for(self, value: NativeFlowValue) -> Self {
+        Self {
+            src: value.target,
+            dst: self.src,
+            sport: value.target_port.to_be(),
+            dport: self.sport,
+            proto: self.proto,
+            _pad: [0; 3],
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward_for(self, value: NativeFlowValue) -> Self {
+        Self {
+            src: self.dst,
+            dst: value.vip,
+            sport: self.dport,
+            dport: value.vip_port,
+            proto: self.proto,
+            _pad: [0; 3],
+        }
+    }
+}
+
+#[cfg(test)]
+mod flow_key_tests {
+    use super::*;
+
+    #[test]
+    fn flow_pair_retains_client_identity_in_both_directions() {
+        for proto in [6, 17] {
+            let forward = NativeFlowKey {
+                src: 0xc000_0201,
+                dst: 0xc000_0202,
+                sport: 49153u16.to_be(),
+                dport: 8080u16.to_be(),
+                proto,
+                _pad: [0; 3],
+            };
+            let value = NativeFlowValue {
+                vip: forward.dst,
+                vip_port: forward.dport,
+                target: 0xc000_0203,
+                target_port: 9090,
+                ..NativeFlowValue::default()
+            };
+            let reverse = forward.reverse_for(value);
+            assert_eq!(reverse.dst, forward.src);
+            assert_eq!(reverse.dport, forward.sport);
+            assert_eq!(reverse.sport, 9090u16.to_be());
+            assert_eq!(reverse.forward_for(value), forward);
+        }
+    }
 }
 
 #[cfg(test)]

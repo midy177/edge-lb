@@ -27,6 +27,8 @@ pub fn install_service(cfg: &Config, args: &InstallArgs) -> Result<()> {
     fs::create_dir_all(CONFIG_DIR).context("creating /etc/edge-lb")?;
     fs::create_dir_all(STATE_DIR).context("creating /var/lib/edge-lb")?;
     fs::create_dir_all(LOG_DIR).context("creating /var/log/edge-lb")?;
+    crate::runtime::ha::ensure_managed_hook_scripts()
+        .context("creating managed HA hook scripts")?;
     let role = write_config(cfg, args)?;
     write_unit(&bin_path, args)?;
 

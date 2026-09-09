@@ -18,9 +18,9 @@ use aya_ebpf::{
 };
 use aya_ebpf_cty::c_long;
 use edge_lb_common::{
-    DEFAULT_DSCP, DEFAULT_PORT, MAX_PORTS, MAX_TARGETS_PER_LISTENER, NATIVE_SELECT_HASH,
-    NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR,
-    NativeFlowEvent, NativeFlowKey, NativeFlowValue, NativeListenerLookupKey,
+    DEFAULT_DSCP, DSCP_PORT_MAP_CAPACITY, MAX_TARGETS_PER_LISTENER, NATIVE_LISTENER_ID_CAPACITY,
+    NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY,
+    NATIVE_SELECT_RR, NativeFlowEvent, NativeFlowKey, NativeFlowValue, NativeListenerLookupKey,
     NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue, Stats,
 };
 use network_types::{
@@ -31,7 +31,7 @@ use network_types::{
 };
 
 #[map]
-static TARGET_PORTS: Array<u32> = Array::with_max_entries(MAX_PORTS as u32, 0);
+static TARGET_PORTS: HashMap<u32, u32> = HashMap::with_max_entries(DSCP_PORT_MAP_CAPACITY, 0);
 
 #[map]
 static DSCP_CFG: Array<u32> = Array::with_max_entries(1, 0);
@@ -48,7 +48,7 @@ static NATIVE_TARGETS: HashMap<NativeTargetKey, NativeTargetValue> =
     HashMap::with_max_entries(16384, 0);
 
 #[map]
-static NATIVE_RR_COUNTERS: Array<u32> = Array::with_max_entries(4096, 0);
+static NATIVE_RR_COUNTERS: Array<u32> = Array::with_max_entries(NATIVE_LISTENER_ID_CAPACITY, 0);
 
 #[map]
 static NATIVE_ACTIVE_FLOWS: HashMap<NativeTargetLoadKey, u32> = HashMap::with_max_entries(16384, 0);
@@ -86,8 +86,7 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
     }
     let ip_off = EthHdr::LEN;
     let ip: Ipv4Hdr = ctx.load(ip_off)?;
-    if ip.version() != 4 || ip.ihl() < 20 || (ip.proto != IpProto::Tcp && ip.proto != IpProto::Udp)
-    {
+    if !ipv4_l4_supported(&ip) {
         return Ok(TC_ACT_PIPE);
     }
     let l4_off = ip_off + ip.ihl() as usize;
@@ -112,30 +111,11 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
     };
     let preserve_zero_udp_checksum =
         ip.proto == IpProto::Udp && u16::from_be(ctx.load::<u16>(l4_csum_off)?) == 0;
-    let listener_key = NativeListenerLookupKey {
-        vip: u32::from_be_bytes(ip.dst_addr),
-        port: dport.to_be(),
-        proto: ip.proto as u8,
-        _pad: 0,
-    };
-    let Some(listener) = (unsafe { NATIVE_LISTENERS.get(&listener_key) }) else {
-        return Ok(TC_ACT_PIPE);
-    };
-    if listener.target_count == 0 {
-        native_bump(|stats| stats.target_miss += 1);
-        return Ok(TC_ACT_PIPE);
-    }
     let flow_key = flow_key(&ip, sport, dport);
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(existing) = unsafe { NATIVE_FLOWS.get(&flow_key) } {
         let existing = *existing;
-        let reverse_key = make_flow_key(
-            existing.target,
-            existing.vip,
-            existing.target_port,
-            u16::from_be(existing.vip_port),
-            ip.proto as u8,
-        );
+        let reverse_key = flow_key.reverse_for(existing);
         if !flow_expired(existing.last_seen_ns, existing.timeout_secs, now) {
             let mut refreshed = existing;
             refreshed.last_seen_ns = now;
@@ -147,7 +127,9 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
                 l4_off,
                 l4_csum_off,
                 // The packet still carries the listener VIP. Reuse the
-                // cached backend selection for every packet in the flow.
+                // cached backend selection for every packet in the flow, even
+                // when the listener map has changed since the flow was
+                // created.
                 existing.vip,
                 existing.target,
                 dport,
@@ -165,6 +147,20 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
         adjust_active_flows(existing.listener_id, existing.target_id, -1);
         emit_flow_event(flow_key, existing, 2);
         emit_flow_event(reverse_key, existing, 2);
+    }
+    let listener_key = NativeListenerLookupKey {
+        vip: u32::from_be_bytes(ip.dst_addr),
+        port: dport.to_be(),
+        proto: ip.proto as u8,
+        _pad: 0,
+    };
+    let Some(listener) = (unsafe { NATIVE_LISTENERS.get(&listener_key) }) else {
+        native_bump(|stats| stats.listener_miss += 1);
+        return Ok(TC_ACT_PIPE);
+    };
+    if listener.target_count == 0 {
+        native_bump(|stats| stats.target_miss += 1);
+        return Ok(TC_ACT_PIPE);
     }
     let packet_hash = if listener.select == NATIVE_SELECT_HASH {
         unsafe { bpf_get_hash_recalc(ctx.as_ptr() as *mut __sk_buff) }
@@ -260,8 +256,7 @@ fn try_native_dnat_return(mut ctx: TcContext) -> Result<i32, c_long> {
     }
     let ip_off = EthHdr::LEN;
     let ip: Ipv4Hdr = ctx.load(ip_off)?;
-    if ip.version() != 4 || ip.ihl() < 20 || (ip.proto != IpProto::Tcp && ip.proto != IpProto::Udp)
-    {
+    if !ipv4_l4_supported(&ip) {
         return Ok(TC_ACT_PIPE);
     }
     let l4_off = ip_off + ip.ihl() as usize;
@@ -301,13 +296,7 @@ fn try_native_dnat_return(mut ctx: TcContext) -> Result<i32, c_long> {
     let now = unsafe { bpf_ktime_get_ns() };
     if flow_expired(flow.last_seen_ns, flow.timeout_secs, now) {
         let _ = NATIVE_FLOWS.remove(&key);
-        let forward_key = make_flow_key(
-            u32::from_be_bytes(ip.dst_addr),
-            flow.vip,
-            dport,
-            u16::from_be(flow.vip_port),
-            ip.proto as u8,
-        );
+        let forward_key = key.forward_for(flow);
         let _ = NATIVE_FLOWS.remove(&forward_key);
         adjust_active_flows(flow.listener_id, flow.target_id, -1);
         emit_flow_event(key, flow, 2);
@@ -318,13 +307,7 @@ fn try_native_dnat_return(mut ctx: TcContext) -> Result<i32, c_long> {
     let mut refreshed = flow;
     refreshed.last_seen_ns = now;
     let _ = NATIVE_FLOWS.insert(&key, &refreshed, 0);
-    let forward_key = make_flow_key(
-        u32::from_be_bytes(ip.dst_addr),
-        flow.vip,
-        dport,
-        u16::from_be(flow.vip_port),
-        ip.proto as u8,
-    );
+    let forward_key = key.forward_for(flow);
     let _ = NATIVE_FLOWS.insert(&forward_key, &refreshed, 0);
     rewrite_ipv4_source(
         &mut ctx,
@@ -351,6 +334,23 @@ fn flow_key(ip: &Ipv4Hdr, sport: u16, dport: u16) -> NativeFlowKey {
         dport,
         ip.proto as u8,
     )
+}
+
+#[inline(always)]
+fn ipv4_l4_supported(ip: &Ipv4Hdr) -> bool {
+    if ip.version() != 4 || ip.ihl() < 20 || (ip.proto != IpProto::Tcp && ip.proto != IpProto::Udp)
+    {
+        return false;
+    }
+    // Native DNAT/SNAT only rewrites packets where the complete L4 header is
+    // present in this skb. Fragmented IPv4 packets need fragment tracking or
+    // conntrack assistance, so pass them to the kernel unchanged instead of
+    // creating incomplete flow entries.
+    if ip.frag_offset() != 0 {
+        return false;
+    }
+    let more_fragments = ip.frag_flags() & 0x1 != 0;
+    !more_fragments
 }
 
 #[inline(always)]
@@ -726,20 +726,7 @@ fn try_dscp_mark(mut ctx: TcContext) -> Result<i32, c_long> {
 }
 
 fn port_matches(dport: u32) -> bool {
-    let mut configured = false;
-    let mut i = 0;
-    while i < MAX_PORTS {
-        if let Some(port) = TARGET_PORTS.get(i as u32) {
-            if *port != 0 && *port <= 65535 {
-                configured = true;
-                if *port == dport {
-                    return true;
-                }
-            }
-        }
-        i += 1;
-    }
-    !configured && dport == DEFAULT_PORT
+    unsafe { TARGET_PORTS.get(&dport).is_some() }
 }
 
 fn incremental_csum(old_check: u16, old_half: u16, new_half: u16) -> u16 {

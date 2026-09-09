@@ -58,6 +58,7 @@ pub enum NativeTargetState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeListener {
     pub name: String,
+    pub target_group: String,
     pub key: NativeListenerKey,
     pub select: u32,
     pub inactive_timeout_secs: u32,
@@ -118,6 +119,7 @@ fn listener_from_target_group(
         for protocol in &listener.protocols {
             listeners.push(NativeListener {
                 name: listener.name.clone(),
+                target_group: group.name.clone(),
                 key: NativeListenerKey {
                     vip_ip,
                     vip_port: listener.port,

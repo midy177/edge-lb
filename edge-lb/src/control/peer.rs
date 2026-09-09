@@ -121,9 +121,7 @@ async fn pair_gateway_async(
         peer: PairedGateway::from(peer),
         ha_config_storage: "sqlite".to_string(),
         session_token_storage: "sqlite".to_string(),
-        datapath_refresh_required: local_cfg.enabled
-            && (local_cfg.connection_sync
-                || matches!(local_cfg.vip.provider, ha::VipProvider::Bgp)),
+        datapath_refresh_required: local_cfg.enabled && local_cfg.connection_sync,
         warnings: response.warnings,
     })
 }

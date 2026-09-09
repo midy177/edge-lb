@@ -151,5 +151,5 @@ message FlowValue {
   uint32 vip_port = 5;
   uint32 target_port = 6;
   uint32 timeout_secs = 7;
-  uint64 last_seen_ns = 8;
+  uint64 last_seen_age_ns = 8;
 }

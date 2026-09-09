@@ -47,6 +47,11 @@ const pairEndpoint = ref('')
 const pairToken = ref('')
 const pairResult = ref('')
 const unpairArmed = ref(false)
+const managedHookPaths = {
+  promote: '/usr/local/bin/edge-lb-promote',
+  demote: '/usr/local/bin/edge-lb-demote',
+  verify: '/usr/local/bin/edge-lb-verify-vip',
+}
 
 watch(
   haConfig,
@@ -96,17 +101,8 @@ const garpError = computed(() => {
   if (garp.repeat_count < 0 || garp.repeat_count > 10) return text('haGarpRange')
   return ''
 })
-const bgpError = computed(() => {
-  if (form.value.vip.provider !== 'bgp') return ''
-  if (!form.value.bgp.local_as || form.value.bgp.local_as < 1) return text('haBgpRequired')
-  if (!form.value.bgp.peers.length) return text('haBgpRequired')
-  if (form.value.bgp.keepalive_secs < 1 || form.value.bgp.hold_time_secs <= form.value.bgp.keepalive_secs) {
-    return text('haBgpTimerRange')
-  }
-  return ''
-})
 const haFormError = computed(
-  () => peerLimitError.value || peerRequiredError.value || garpError.value || bgpError.value,
+  () => peerLimitError.value || peerRequiredError.value || garpError.value,
 )
 const failoverGatewayNodes = computed(() => {
   const nodes = new Map<string, { name: string; underlay_ip: string; public_ip: string }>()
@@ -156,16 +152,6 @@ const failoverCandidates = computed(() => {
   return failoverGatewayNodes.value.filter((node) => !active || node.name !== active)
 })
 const failoverIsNoop = computed(() => !failoverTarget.value || failoverTarget.value === activeGateway.value)
-const bgpPeersText = computed({
-  get: () => form.value.bgp.peers.join('\n'),
-  set: (value: string) => {
-    form.value.bgp.peers = value
-      .split(/[\n,]/)
-      .map((item) => item.trim())
-      .filter(Boolean)
-  },
-})
-
 watch(
   failoverCandidates,
   (nodes) => {
@@ -260,6 +246,10 @@ function normalizedConfig(options: { pairing?: boolean } = {}): GatewayHaConfig 
     next.vip.promote_hook = null
     next.vip.demote_hook = null
     next.vip.verify_hook = null
+  } else {
+    next.vip.promote_hook = managedHookPaths.promote
+    next.vip.demote_hook = managedHookPaths.demote
+    next.vip.verify_hook = managedHookPaths.verify
   }
   return next
 }
@@ -337,7 +327,6 @@ async function switchActiveGateway() {
                 <SelectContent>
                   <SelectItem value="hook">hook</SelectItem>
                   <SelectItem value="l2">l2</SelectItem>
-                  <SelectItem value="bgp">bgp</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -400,47 +389,18 @@ async function switchActiveGateway() {
             </div>
           </div>
 
-          <div v-if="form.vip.provider === 'bgp'" class="space-y-3 rounded-md border p-4">
-            <div>
-              <h3 class="text-sm font-semibold">{{ text('haBgpConfig') }}</h3>
-              <p class="text-xs text-muted-foreground">{{ text('haBgpConfigDesc') }}</p>
-            </div>
-            <div class="grid gap-4 md:grid-cols-2">
-              <div class="space-y-1.5">
-                <Label>{{ text('haBgpLocalAs') }}</Label>
-                <Input v-model.number="form.bgp.local_as" type="number" min="1" placeholder="65012" />
-              </div>
-              <div class="space-y-1.5">
-                <Label>{{ text('haBgpRouterId') }}</Label>
-                <Input v-model="form.bgp.router_id" placeholder="auto" />
-              </div>
-              <div class="space-y-1.5 md:col-span-2">
-                <Label>{{ text('haBgpPeers') }}</Label>
-                <Input v-model="bgpPeersText" placeholder="192.168.0.1:65001, 192.168.0.2:65001" />
-              </div>
-              <div class="space-y-1.5">
-                <Label>{{ text('haBgpHoldTime') }}</Label>
-                <Input v-model.number="form.bgp.hold_time_secs" type="number" min="1" />
-              </div>
-              <div class="space-y-1.5">
-                <Label>{{ text('haBgpKeepalive') }}</Label>
-                <Input v-model.number="form.bgp.keepalive_secs" type="number" min="1" />
-              </div>
-            </div>
-          </div>
-
           <div v-if="form.vip.provider === 'hook'" class="grid gap-4 md:grid-cols-3">
             <div class="space-y-1.5">
               <Label>{{ text('haPromoteHook') }}</Label>
-              <Input v-model="form.vip.promote_hook" placeholder="/usr/local/bin/edge-lb-promote" />
+              <div class="rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs">{{ managedHookPaths.promote }}</div>
             </div>
             <div class="space-y-1.5">
               <Label>{{ text('haDemoteHook') }}</Label>
-              <Input v-model="form.vip.demote_hook" placeholder="/usr/local/bin/edge-lb-demote" />
+              <div class="rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs">{{ managedHookPaths.demote }}</div>
             </div>
             <div class="space-y-1.5">
               <Label>{{ text('haVerifyHook') }}</Label>
-              <Input v-model="form.vip.verify_hook" placeholder="/usr/local/bin/edge-lb-verify-vip" />
+              <div class="rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs">{{ managedHookPaths.verify }}</div>
             </div>
           </div>
 

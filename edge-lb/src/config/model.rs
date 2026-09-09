@@ -167,14 +167,18 @@ pub struct BackendReturnPort {
 /// (gateway, dscp). Slots keep each gateway's space disjoint.
 pub const EDGE_MARK_BASE: u32 = 0x1000;
 /// Inclusive lower bound of marks emitted by the current slotted derivation.
+#[cfg(test)]
 pub const EDGE_CURRENT_MARK_BASE: u32 = 0x1040;
 /// Exclusive upper bound of every mark edge-lb derives.
+#[cfg(test)]
 pub const EDGE_MARK_LIMIT: u32 = 0x1400;
 pub const EDGE_TABLE_BASE: u32 = 1000;
 /// Inclusive lower bound of route tables emitted by the current slotted
 /// derivation.
+#[cfg(test)]
 pub const EDGE_CURRENT_TABLE_BASE: u32 = 1064;
 /// Exclusive upper bound of every table id edge-lb derives.
+#[cfg(test)]
 pub const EDGE_TABLE_LIMIT: u32 = 1000 + 7 * 64;
 /// Maximum supported simultaneous gateways in the return-path slot space.
 pub const EDGE_MAX_GATEWAY_SLOTS: u32 = 6;

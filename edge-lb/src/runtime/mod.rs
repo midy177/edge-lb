@@ -5,5 +5,6 @@ pub mod ha;
 pub mod ha_write;
 pub mod ka_hook;
 pub mod logging;
+pub mod proxy_replication;
 pub mod shutdown;
 pub mod state;

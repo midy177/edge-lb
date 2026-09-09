@@ -1,6 +1,6 @@
 use std::{collections::HashSet, net::IpAddr};
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -99,48 +99,29 @@ pub(in crate::api) fn export_configs(cfg: &Config) -> Reply {
     if let Some(reply) = require_gateway_role(cfg) {
         return reply;
     }
-    Reply::json(
-        200,
-        serde_json::json!({
-            "version": 1,
-            "listeners": persisted_listeners(cfg).unwrap_or_default()
-        }),
-    )
-}
-
-fn coalesce_listener_resources(
-    resources: Vec<ListenerConfigResource>,
-) -> Vec<ListenerConfigResource> {
-    let mut result = Vec::new();
-    for resource in resources {
-        if let Some(existing) = result
-            .iter_mut()
-            .find(|existing: &&mut ListenerConfigResource| {
-                existing.name == resource.name
-                    && existing.port == resource.port
-                    && existing.target_port == resource.target_port
-                    && existing.protocols == resource.protocols
-                    && existing.target_group == resource.target_group
-                    && existing.select == resource.select
-                    && existing.inactive_timeout == resource.inactive_timeout
-            })
-        {
-            for vip in resource.vip_ips {
-                if !existing.vip_ips.contains(&vip) {
-                    existing.vip_ips.push(vip);
-                }
-            }
-        } else {
-            result.push(resource);
-        }
+    match persisted_listeners(cfg) {
+        Ok(listeners) => Reply::json(
+            200,
+            serde_json::json!({ "version": 1, "listeners": listeners }),
+        ),
+        Err(error) => Reply::error(500, format!("loading listeners: {error:#}")),
     }
-    result
 }
 
 pub(in crate::api) fn import_configs(cfg: &Config, body: &str) -> Reply {
     if let Some(reply) = require_gateway_role(cfg) {
         return reply;
     }
+    proxy_config::apply_authoritative(
+        cfg,
+        ProxyConfigOperation::ListenerImport {
+            body: body.to_string(),
+        },
+    )
+}
+
+pub(in crate::api) fn import_configs_local(cfg: &Config, body: &str) -> Reply {
+    use crate::storage::proxy_config::{Rejection, mutate};
     let value: serde_json::Value = match serde_json::from_str(body) {
         Ok(value) => value,
         Err(e) => return Reply::error(400, format!("bad listener import JSON: {e}")),
@@ -150,18 +131,31 @@ pub(in crate::api) fn import_configs(cfg: &Config, body: &str) -> Reply {
         Ok(entries) => entries,
         Err(e) => return Reply::error(400, format!("bad listener import payload: {e}")),
     };
-    let mut imported = 0;
-    for entry in entries {
-        let reply = create_config(cfg, &serde_json::to_string(&entry).unwrap());
-        if !(200..300).contains(&reply.status) {
-            return reply;
+    let listeners: Vec<Listener> = entries.into_iter().map(Into::into).collect();
+    match mutate(cfg, |state| {
+        let mut names = HashSet::new();
+        for listener in &listeners {
+            if !names.insert(&listener.name) {
+                return Err(Rejection::new(
+                    400,
+                    format!("duplicate listener {} in import", listener.name),
+                ));
+            }
+            edit_snapshot(cfg, state, listener, &ListenerMutation::Create)?;
         }
-        imported += 1;
+        Ok(())
+    }) {
+        Ok(((), changed)) => {
+            if changed {
+                crate::provider::native::mark_state_dirty();
+            }
+            Reply::json(
+                200,
+                serde_json::json!({ "status": "imported", "count": listeners.len() }),
+            )
+        }
+        Err(error) => proxy_config::mutation_error(error),
     }
-    Reply::json(
-        200,
-        serde_json::json!({ "status": "imported", "count": imported }),
-    )
 }
 
 pub(in crate::api) fn create_config(cfg: &Config, body: &str) -> Reply {
@@ -202,155 +196,123 @@ pub(in crate::api) fn delete_config(cfg: &Config, name: &str) -> Reply {
 }
 
 fn persisted_listeners(cfg: &Config) -> anyhow::Result<Vec<ListenerConfigResource>> {
-    let fallback = || {
-        coalesce_listener_resources(
-            cfg.file
-                .listeners
-                .iter()
-                .map(ListenerConfigResource::from)
-                .collect(),
-        )
-    };
-    let Ok(repository) = crate::storage::repository() else {
-        return Ok(fallback());
-    };
-    let Some(payload) = repository.get("listeners", "config")? else {
-        let value = fallback();
-        if !value.is_empty() {
-            repository.put(
-                "listeners",
-                "config",
-                crate::storage::next_revision(),
-                serde_json::to_string(&value).context("encoding listeners")?,
-            )?;
-        }
-        return Ok(value);
-    };
-    serde_json::from_str(&payload).context("parsing stored listeners")
-}
-
-pub(crate) fn load_for_runtime(cfg: &Config) -> anyhow::Result<Vec<Listener>> {
-    Ok(persisted_listeners(cfg)?
-        .into_iter()
-        .map(Into::into)
+    Ok(crate::storage::proxy_config::load(cfg)?
+        .listeners
+        .iter()
+        .map(ListenerConfigResource::from)
         .collect())
 }
 
-fn save_persisted_listeners(listeners: &[ListenerConfigResource]) -> anyhow::Result<()> {
-    let repository = crate::storage::repository()?;
-    repository.put(
-        "listeners",
-        "config",
-        crate::storage::next_revision(),
-        serde_json::to_string(listeners).context("encoding listeners")?,
-    )?;
+pub(crate) fn load_for_runtime(cfg: &Config) -> anyhow::Result<Vec<Listener>> {
+    Ok(crate::storage::proxy_config::load(cfg)?.listeners)
+}
+
+enum ListenerMutation<'a> {
+    Create,
+    Update(&'a str),
+}
+
+fn edit_snapshot(
+    cfg: &Config,
+    state: &mut crate::storage::proxy_config::ProxyConfig,
+    listener: &Listener,
+    operation: &ListenerMutation<'_>,
+) -> Result<(), crate::storage::proxy_config::Rejection> {
+    use crate::storage::proxy_config::Rejection;
+    let old_name = match operation {
+        ListenerMutation::Create => None,
+        ListenerMutation::Update(name) => {
+            if !state.listeners.iter().any(|item| item.name == *name) {
+                return Err(Rejection::new(404, format!("no listener {name}")));
+            }
+            Some(*name)
+        }
+    };
+    validate_listener_config(
+        cfg,
+        listener,
+        old_name,
+        &state.listeners,
+        &state.target_groups,
+    )
+    .map_err(|error| Rejection::new(400, format!("invalid listener config: {error:#}")))?;
+    if let Some(existing) = state
+        .listeners
+        .iter_mut()
+        .find(|item| Some(item.name.as_str()) == old_name)
+    {
+        *existing = listener.clone();
+    } else {
+        state.listeners.push(listener.clone());
+    }
     Ok(())
 }
 
-fn upsert_persisted_listener(
-    cfg: &Config,
-    listener: &Listener,
-    old_name: Option<&str>,
-) -> anyhow::Result<()> {
-    let mut listeners = persisted_listeners(cfg)?;
-    if let Some(old_name) = old_name {
-        listeners.retain(|item| item.name != old_name);
+fn write_listener(cfg: &Config, body: &str, operation: ListenerMutation<'_>) -> Reply {
+    use crate::storage::proxy_config::mutate;
+    let resource: ListenerConfigResource = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(error) => return Reply::error(400, format!("bad listener config JSON: {error}")),
+    };
+    let listener: Listener = resource.into();
+    let result = mutate(cfg, |state| {
+        edit_snapshot(cfg, state, &listener, &operation)
+    });
+    match result {
+        Ok(((), changed)) => {
+            if changed {
+                crate::provider::native::mark_state_dirty();
+            }
+            Reply::json(
+                if matches!(operation, ListenerMutation::Create) {
+                    201
+                } else {
+                    200
+                },
+                serde_json::to_value(ListenerConfigResource::from(&listener)).unwrap(),
+            )
+        }
+        Err(error) => proxy_config::mutation_error(error),
     }
-    let resource = ListenerConfigResource::from(listener);
-    listeners.retain(|item| item.name != resource.name);
-    listeners.push(resource);
-    save_persisted_listeners(&listeners)
-}
-
-fn delete_persisted_listener(cfg: &Config, name: &str) -> anyhow::Result<()> {
-    let mut listeners = persisted_listeners(cfg)?;
-    listeners.retain(|item| item.name != name);
-    save_persisted_listeners(&listeners)
 }
 
 pub(in crate::api) fn create_config_local(cfg: &Config, body: &str) -> Reply {
-    match normalize_listener_body(cfg, body, None) {
-        Ok(listener) => {
-            if let Err(e) = crate::provider::native::create_or_update_listener(cfg, &listener) {
-                return Reply::error(500, format!("applying listener datapath: {e:#}"));
-            }
-            if let Err(e) = upsert_persisted_listener(cfg, &listener, None) {
-                return Reply::error(500, format!("persisting listener: {e:#}"));
-            }
-            Reply::json(
-                201,
-                serde_json::to_value(ListenerConfigResource::from(&listener)).unwrap(),
-            )
-        }
-        Err(e) => Reply::error(400, e),
-    }
+    write_listener(cfg, body, ListenerMutation::Create)
 }
 
 pub(in crate::api) fn update_config_local(cfg: &Config, name: &str, body: &str) -> Reply {
-    match normalize_listener_body(cfg, body, Some(name)) {
-        Ok(listener) => {
-            if let Err(e) = crate::provider::native::delete_listener(cfg, name) {
-                return Reply::error(500, format!("removing old listener datapath: {e:#}"));
-            }
-            if let Err(e) = crate::provider::native::create_or_update_listener(cfg, &listener) {
-                return Reply::error(500, format!("applying listener datapath: {e:#}"));
-            }
-            if let Err(e) = upsert_persisted_listener(cfg, &listener, Some(name)) {
-                return Reply::error(500, format!("persisting listener: {e:#}"));
-            }
-            Reply::json(
-                200,
-                serde_json::to_value(ListenerConfigResource::from(&listener)).unwrap(),
-            )
-        }
-        Err(e) => Reply::error(400, e),
-    }
+    write_listener(cfg, body, ListenerMutation::Update(name))
 }
 
 pub(in crate::api) fn delete_config_local(cfg: &Config, name: &str) -> Reply {
-    match crate::provider::native::delete_listener(cfg, name) {
-        Ok(true) => {
-            if let Err(error) = delete_persisted_listener(cfg, name) {
-                return Reply::error(500, format!("persisting listener deletion: {error:#}"));
+    use crate::storage::proxy_config::{Rejection, mutate};
+    match mutate(cfg, |state| {
+        let before = state.listeners.len();
+        state.listeners.retain(|item| item.name != name);
+        if state.listeners.len() == before {
+            return Err(Rejection::new(404, format!("no listener {name}")));
+        }
+        Ok(())
+    }) {
+        Ok(((), changed)) => {
+            if changed {
+                crate::provider::native::mark_state_dirty();
             }
             Reply::json(
                 200,
                 serde_json::json!({ "status": "deleted", "name": name }),
             )
         }
-        Ok(false) => Reply::error(404, format!("no listener {name}")),
-        Err(e) => Reply::error(500, format!("{e:#}")),
+        Err(error) => proxy_config::mutation_error(error),
     }
-}
-
-pub(in crate::api) fn create_or_replace_config_local(cfg: &Config, body: &str) -> Reply {
-    match normalize_listener_body(cfg, body, None) {
-        Ok(listener) => update_config_local(
-            cfg,
-            &listener.name,
-            &serde_json::to_string(&ListenerConfigResource::from(&listener)).unwrap_or_default(),
-        ),
-        Err(e) => Reply::error(400, e),
-    }
-}
-
-fn normalize_listener_body(
-    cfg: &Config,
-    body: &str,
-    old_name: Option<&str>,
-) -> Result<Listener, String> {
-    let resource: ListenerConfigResource =
-        serde_json::from_str(body).map_err(|e| format!("bad listener config JSON: {e}"))?;
-    let listener: Listener = resource.into();
-    validate_listener_config(cfg, &listener, old_name)
-        .map_err(|e| format!("invalid listener config: {e:#}"))?;
-    Ok(listener)
 }
 
 fn validate_listener_config(
     cfg: &Config,
     listener: &Listener,
     old_name: Option<&str>,
+    existing: &[Listener],
+    groups: &[crate::config::TargetGroup],
 ) -> anyhow::Result<()> {
     if listener.name.trim().is_empty() {
         bail!("listener name is required");
@@ -364,21 +326,23 @@ fn validate_listener_config(
     if listener.protocols.is_empty() {
         bail!("listener must select at least one protocol");
     }
-    let groups =
-        crate::provider::native::target_groups_native(cfg).context("loading target groups")?;
     if !groups
         .iter()
         .any(|group| group.name == listener.target_group)
     {
         bail!("target group {} not found", listener.target_group);
     }
-
-    let existing = persisted_listeners(cfg)?;
-    for item in &existing {
+    for item in existing {
         if old_name.is_some_and(|old| item.name == old) {
             continue;
         }
-        if listener_resource_conflicts(cfg, item, &ListenerConfigResource::from(listener))? {
+        if item.name == listener.name
+            || listener_resource_conflicts(
+                cfg,
+                &ListenerConfigResource::from(item),
+                &ListenerConfigResource::from(listener),
+            )?
+        {
             bail!(
                 "listener {} conflicts with existing listener {} on port {}",
                 listener.name,
@@ -435,6 +399,85 @@ mod tests {
         }
     }
 
+    fn snapshot() -> crate::storage::proxy_config::ProxyConfig {
+        crate::storage::proxy_config::ProxyConfig {
+            listeners: vec![],
+            target_groups: vec![crate::config::TargetGroup {
+                name: "web".into(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn test_listener(port: u16) -> Listener {
+        Listener {
+            name: format!("tcp-{port}"),
+            port,
+            target_port: 18080,
+            target_group: "web".into(),
+            vip_ips: vec!["192.0.2.10".parse().unwrap()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_update_keeps_old_listener_and_rejects_name_collisions() {
+        let cfg = test_cfg();
+        let mut state = snapshot();
+        edit_snapshot(
+            &cfg,
+            &mut state,
+            &test_listener(8080),
+            &ListenerMutation::Create,
+        )
+        .unwrap();
+        edit_snapshot(
+            &cfg,
+            &mut state,
+            &test_listener(8081),
+            &ListenerMutation::Create,
+        )
+        .unwrap();
+        let before = serde_json::to_string(&state.listeners).unwrap();
+        assert!(
+            edit_snapshot(
+                &cfg,
+                &mut state,
+                &test_listener(8081),
+                &ListenerMutation::Update("tcp-8080")
+            )
+            .is_err()
+        );
+        let invalid = Listener {
+            target_group: "missing".into(),
+            ..test_listener(8082)
+        };
+        assert!(
+            edit_snapshot(
+                &cfg,
+                &mut state,
+                &invalid,
+                &ListenerMutation::Update("tcp-8080")
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_string(&state.listeners).unwrap(), before);
+    }
+
+    #[test]
+    fn updating_missing_listener_is_not_an_implicit_create() {
+        let mut state = snapshot();
+        let error = edit_snapshot(
+            &test_cfg(),
+            &mut state,
+            &test_listener(8080),
+            &ListenerMutation::Update("missing"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 404);
+        assert!(state.listeners.is_empty());
+    }
+
     #[test]
     fn empty_target_group_can_back_a_listener_before_backend_registration() {
         let mut cfg = test_cfg();
@@ -452,7 +495,7 @@ mod tests {
             ..Listener::default()
         };
 
-        validate_listener_config(&cfg, &listener, None)
+        validate_listener_config(&cfg, &listener, None, &cfg.listeners, &cfg.target_groups)
             .expect("empty target groups must not block listener creation");
     }
 
@@ -588,29 +631,5 @@ mod tests {
         assert_eq!(restored.protocols, vec![Protocol::Tcp, Protocol::Udp]);
         assert!(restored.vip_ips.is_empty());
         assert_eq!(restored.target_port, 8443);
-    }
-
-    #[test]
-    fn listener_resources_merge_vips_without_merging_different_listeners() {
-        let resource = |vip: &str, port: u16| ListenerConfigResource {
-            name: "tcp-80".to_string(),
-            vip_ips: vec![vip.parse().unwrap()],
-            port,
-            target_port: 8080,
-            protocols: vec![Protocol::Tcp],
-            target_group: "web".to_string(),
-            select: LbSelect::Hash,
-            inactive_timeout: Some(60),
-        };
-
-        let result = coalesce_listener_resources(vec![
-            resource("192.0.2.10", 80),
-            resource("192.0.2.11", 80),
-            resource("192.0.2.12", 81),
-        ]);
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].vip_ips.len(), 2);
-        assert_eq!(result[1].port, 81);
     }
 }

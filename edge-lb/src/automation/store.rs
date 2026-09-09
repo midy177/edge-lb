@@ -13,12 +13,13 @@ pub fn load(_cfg: &Config) -> Result<AutomationConfig> {
 
 pub fn save(_cfg: &Config, value: &AutomationConfig) -> Result<()> {
     let payload = serde_json::to_string(value).context("encoding automation config")?;
-    crate::storage::repository()?.put(
+    crate::storage::repository()?.put_if_changed(
         "automation",
         "config",
         crate::storage::next_revision(),
         payload,
-    )
+    )?;
+    Ok(())
 }
 
 pub fn upsert_template(

@@ -1,26 +1,26 @@
 //! Backend policy routing via rtnetlink.
 
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     io,
     mem::size_of,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    os::fd::RawFd,
+    os::fd::{AsRawFd, RawFd},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
-use crate::config::{
-    BackendConfig, Config, EDGE_CURRENT_MARK_BASE, EDGE_CURRENT_TABLE_BASE, EDGE_MARK_LIMIT,
-    EDGE_TABLE_LIMIT, gateway_slot, return_mark, return_table_id,
-};
+use serde::{Deserialize, Serialize};
+
+use crate::config::{Config, gateway_slot, return_mark, return_table_id};
 
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
 const NLM_F_DUMP: u16 = 0x300;
+const NLM_F_DUMP_INTR: u16 = 0x10;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
-const NLM_F_REPLACE: u16 = 0x100;
 
 const NLMSG_ERROR: u16 = 0x2;
 const NLMSG_DONE: u16 = 0x3;
@@ -46,8 +46,11 @@ const RTA_TABLE: u16 = 15;
 const FR_ACT_TO_TBL: u8 = 1;
 const FRA_PRIORITY: u16 = 6;
 const FRA_FWMARK: u16 = 10;
+const FRA_SUPPRESS_IFGROUP: u16 = 13;
+const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 const FRA_TABLE: u16 = 15;
 const FRA_FWMASK: u16 = 16;
+const FRA_PROTOCOL: u16 = 21;
 
 const EDGE_DSCP_LIMIT: u32 = 63;
 const RULE_BAND: u32 = 64;
@@ -104,7 +107,8 @@ struct NlMsgErr {
 }
 
 pub fn ensure_policy_routing(cfg: &Config) -> Result<()> {
-    let b = cfg.backend_cfg();
+    let _lock = ownership_lock(cfg)?;
+    let mut ownership = RouteOwnership::load()?;
     let local = cfg.local_backend()?;
     let vxlan_ifindex = ifindex(&cfg.network().vxlan_dev)?;
     let underlay_ifindex = ifindex(&cfg.network().underlay_dev)?;
@@ -115,7 +119,7 @@ pub fn ensure_policy_routing(cfg: &Config) -> Result<()> {
         fd,
         cfg,
         &routes,
-        b,
+        &mut ownership,
         vxlan_ifindex,
         underlay_ifindex,
         local.underlay_ip,
@@ -127,17 +131,23 @@ pub fn ensure_policy_routing(cfg: &Config) -> Result<()> {
 }
 
 pub fn policy_rule_present(cfg: &Config) -> bool {
-    let Ok((mark, mask)) = parse_fwmark(&cfg.backend_cfg().fwmark) else {
+    let Ok(desired) = return_routes(cfg) else {
+        return false;
+    };
+    let Ok(ownership) = RouteOwnership::load() else {
         return false;
     };
     let Ok(fd) = socket() else {
         return false;
     };
     let present = dump_policy_rules_on_socket(fd).is_ok_and(|rules| {
-        rules.iter().any(|rule| {
-            rule.mark == Some(mark)
-                && rule.mask == Some(mask)
-                && rule.table == cfg.backend_cfg().route_table_id
+        desired.iter().all(|route| {
+            rules.iter().any(|rule| {
+                ownership.owns_rule(rule)
+                    && rule.mark == Some(route.mark)
+                    && rule.mask == Some(u32::MAX)
+                    && rule.table == route.table
+            })
         })
     });
     unsafe { libc::close(fd) };
@@ -158,174 +168,295 @@ pub fn route_descriptions(cfg: &Config, table: u32) -> Result<Vec<String>> {
     result
 }
 
-pub fn policy_rule_descriptions() -> Result<Vec<String>> {
-    let fd = socket()?;
-    let result = dump_policy_rules_on_socket(fd).map(|rules| {
-        rules
-            .iter()
-            .map(|rule| {
-                let mark = rule
-                    .mark
-                    .map(|value| {
-                        let mask = rule
-                            .mask
-                            .map(|mask| format!("/0x{mask:x}"))
-                            .unwrap_or_default();
-                        format!(" fwmark 0x{value:x}{mask}")
-                    })
-                    .unwrap_or_default();
-                format!("{}: from all{} lookup {}", rule.priority, mark, rule.table)
+/// Ownership is local to this boot and network namespace, never HA-replicated.
+/// Save only after an acknowledged create. A crash before the save can leave an
+/// unclaimed object, which is deliberately refused rather than adopted.
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RouteOwnership {
+    scope: String,
+    rules: Vec<PolicyRule>,
+    routes: Vec<RouteEntry>,
+}
+
+impl RouteOwnership {
+    fn load() -> Result<Self> {
+        let scope = format!(
+            "{}:{}",
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
+            std::fs::read_link("/proc/thread-self/ns/net")?.display()
+        );
+        let stored = crate::storage::repository()?.get("route_ownership", "local")?;
+        Self::decode(stored.as_deref(), scope)
+    }
+
+    fn decode(payload: Option<&str>, scope: String) -> Result<Self> {
+        let stored: Self = payload
+            .map(serde_json::from_str)
+            .transpose()
+            .context("parsing route ownership")?
+            .unwrap_or_default();
+        if stored.scope == scope {
+            Ok(stored)
+        } else {
+            Ok(Self {
+                scope,
+                ..Self::default()
             })
-            .collect()
-    });
+        }
+    }
+
+    fn save(&self) -> Result<()> {
+        crate::storage::repository()?.put(
+            "route_ownership",
+            "local",
+            crate::storage::next_revision(),
+            serde_json::to_string(self)?,
+        )
+    }
+
+    fn owns_rule(&self, rule: &PolicyRule) -> bool {
+        rule.supported && self.rules.contains(rule)
+    }
+
+    fn owns_route(&self, route: &RouteEntry) -> bool {
+        route.supported && self.routes.contains(route)
+    }
+}
+
+fn ownership_lock(cfg: &Config) -> Result<std::fs::File> {
+    std::fs::create_dir_all(&cfg.state_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cfg.state_dir.join("route-ownership.lock"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error()).context("locking route ownership");
+    }
+    Ok(file)
+}
+
+fn validate_rules(
+    rules: &[PolicyRule],
+    desired: &[ReturnRoute],
+    ownership: &RouteOwnership,
+) -> Result<()> {
+    for rule in rules {
+        if ownership.owns_rule(rule) {
+            continue;
+        }
+        for want in desired {
+            // Unmarked rules (e.g. lookup local/main) are not fwmark claims.
+            let matches_mark = rule.mark.is_some_and(|mark| {
+                let mask = rule.mask.unwrap_or(u32::MAX);
+                want.mark & mask == mark & mask
+            });
+            if rule.table == want.table || matches_mark {
+                bail!(
+                    "unowned policy rule conflicts with return path: pref {} mark {:?}/{:?} table {}",
+                    rule.priority,
+                    rule.mark,
+                    rule.mask,
+                    rule.table
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_table(current: &[RouteEntry], ownership: &RouteOwnership) -> Result<()> {
+    for entry in current {
+        if !ownership.owns_route(entry) {
+            bail!(
+                "return table contains unowned route: {}",
+                entry.describe("", "")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn ownership_conflicts(cfg: &Config) -> Result<Vec<super::conflict::NodeConflict>> {
+    let _lock = ownership_lock(cfg)?;
+    let ownership = RouteOwnership::load()?;
+    let desired = return_routes(cfg)?;
+    let fd = socket()?;
+    let result = (|| {
+        let mut conflicts = Vec::new();
+        let rules = dump_policy_rules_on_socket(fd)?;
+        for rule in &rules {
+            if let Err(error) = validate_rules(std::slice::from_ref(rule), &desired, &ownership) {
+                conflicts.push(super::conflict::NodeConflict::warning(
+                    "route_rule",
+                    format!("priority {}", rule.priority),
+                    error.to_string(),
+                ));
+            }
+        }
+        let mut tables = std::collections::BTreeSet::new();
+        for route in &desired {
+            if tables.insert(route.table) {
+                for entry in dump_routes_in_table_on_socket(fd, route.table)? {
+                    if let Err(error) = validate_table(std::slice::from_ref(&entry), &ownership) {
+                        conflicts.push(super::conflict::NodeConflict::warning(
+                            "route_table",
+                            format!("table {}", route.table),
+                            error.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(conflicts)
+    })();
     unsafe { libc::close(fd) };
     result
 }
 
-/// Dump-driven convergence: one RTM_GETRULE dump decides which rules are
-/// ours and stale, one RTM_GETROUTE dump per table decides which routes are
-/// ours and stale. Anything unexpected inside an edge-lb table is *deleted*
-/// (self-heal), never bailed on.
 #[allow(clippy::too_many_arguments)]
 fn reconcile_on_socket(
     fd: RawFd,
     cfg: &Config,
     routes: &[ReturnRoute],
-    b: &BackendConfig,
+    ownership: &mut RouteOwnership,
     vxlan_ifindex: u32,
     underlay_ifindex: u32,
     local_underlay: IpAddr,
 ) -> Result<()> {
-    let rules = dump_policy_rules_on_socket(fd).context("dumping policy rules")?;
-    let mut desired: Vec<(u32, u32)> = routes.iter().map(|r| (r.mark, r.table)).collect();
-    desired.sort_unstable();
-    desired.dedup();
-    let mut stale_tables = Vec::new();
-
-    for rule in &rules {
-        if rule_is_stale_ours(rule, &desired) {
-            if !stale_tables.contains(&rule.table) {
-                stale_tables.push(rule.table);
-            }
-            delete_policy_rule_on_socket(fd, rule);
+    let mut rules = dump_policy_rules_on_socket(fd).context("dumping policy rules")?;
+    validate_rules(&rules, routes, ownership)?;
+    let mut tables = BTreeMap::new();
+    for table in routes
+        .iter()
+        .map(|route| route.table)
+        .chain(ownership.routes.iter().map(|route| route.table))
+    {
+        if let std::collections::btree_map::Entry::Vacant(entry) = tables.entry(table) {
+            entry.insert(dump_routes_in_table_on_socket(fd, table)?);
         }
     }
-
-    if routes.is_empty() {
-        for table in stale_tables {
-            reconcile_table_on_socket(
-                fd,
-                table,
-                &[],
-                !(EDGE_CURRENT_TABLE_BASE..EDGE_TABLE_LIMIT).contains(&table),
-                vxlan_ifindex,
-                underlay_ifindex,
-                local_underlay,
-            )
-            .with_context(|| format!("clearing return route table {table}"))?;
-        }
-        return Ok(());
-    }
-
+    // Validate every desired table before the first mutation, including when an
+    // expected-looking route already exists without a creation record.
     for route in routes {
-        reconcile_table_on_socket(
-            fd,
-            route.table,
-            &expected_table_entries(cfg, route, vxlan_ifindex, underlay_ifindex, local_underlay),
-            false,
-            vxlan_ifindex,
-            underlay_ifindex,
-            local_underlay,
-        )
-        .with_context(|| format!("converging return route table {}", route.table))?;
+        if route.table == 0 || (253..=255).contains(&route.table) {
+            bail!("return route cannot use reserved table {}", route.table);
+        }
+        if routes
+            .iter()
+            .any(|other| other.mark == route.mark && other.table != route.table)
+        {
+            bail!("return mark 0x{:x} selects multiple tables", route.mark);
+        }
+        validate_table(&tables[&route.table], ownership)?;
+    }
+    let mut expected = Vec::new();
+    for route in routes {
+        if routes.iter().any(|other| {
+            other.table == route.table && other.gateway_overlay != route.gateway_overlay
+        }) {
+            bail!(
+                "multiple gateways would own default route in table {}",
+                route.table
+            );
+        }
+        for entry in
+            expected_table_entries(cfg, route, vxlan_ifindex, underlay_ifindex, local_underlay)
+        {
+            if !expected.contains(&entry) {
+                expected.push(entry);
+            }
+        }
+    }
+    let old = ownership.clone();
+    ownership.rules.retain(|rule| rules.contains(rule));
+    ownership.routes.retain(|route| {
+        tables
+            .get(&route.table)
+            .is_some_and(|entries| entries.contains(route))
+    });
+    if *ownership != old {
+        ownership.save()?;
     }
 
-    for (idx, route) in routes.iter().enumerate() {
-        // Rules for desired keys were kept by the sweep; only add missing ones.
-        if rules
-            .iter()
-            .any(|r| r.mark == Some(route.mark) && r.table == route.table)
-        {
+    for rule in ownership.rules.clone() {
+        if !routes.iter().any(|route| {
+            rule.mark == Some(route.mark)
+                && rule.mask == Some(u32::MAX)
+                && rule.table == route.table
+        }) {
+            delete_policy_rule_on_socket(fd, &rule)?;
+            ownership.rules.retain(|value| value != &rule);
+            ownership.save()?;
+            rules.retain(|value| value != &rule);
+        }
+    }
+    for entry in ownership.routes.clone() {
+        if !expected.contains(&entry) {
+            match delete_route_entry_on_socket(fd, &entry) {
+                Ok(()) => (),
+                Err(error) if is_absent_route_error(&error) => (),
+                Err(error) => return Err(error),
+            }
+            ownership.routes.retain(|value| value != &entry);
+            ownership.save()?;
+        }
+    }
+    for want in expected {
+        if !ownership.routes.contains(&want) {
+            // EXCL prevents overwriting a foreign route added after the dump.
+            add_route_exclusive_on_socket(fd, &want)?;
+            ownership.routes.push(want);
+            ownership.save()?;
+        }
+    }
+    for route in routes {
+        if rules.iter().any(|rule| {
+            ownership.owns_rule(rule)
+                && rule.mark == Some(route.mark)
+                && rule.mask == Some(u32::MAX)
+                && rule.table == route.table
+        }) {
             continue;
         }
-        ensure_rule_at_or_after_on_socket(
+        let rule = ensure_rule_at_or_after_on_socket(
             fd,
-            b.rule_priority + idx as u32,
+            cfg.backend_cfg().rule_priority,
             route.mark,
             u32::MAX,
             route.table,
-        )
-        .with_context(|| format!("adding fwmark rule for {}", route.gateway_underlay))?;
+            &rules,
+        )?;
+        ownership.rules.push(rule.clone());
+        ownership.save()?;
+        rules.push(rule);
     }
     Ok(())
 }
 
 pub fn cleanup_policy_routing(cfg: &Config) {
-    let Ok(fd) = socket() else {
-        return;
-    };
-    let result: Result<()> = (|| {
-        let rules = dump_policy_rules_on_socket(fd)?;
-        let mut tables: Vec<u32> = Vec::new();
-        for rule in &rules {
-            if rule_is_stale_ours(rule, &[]) {
-                delete_policy_rule_on_socket(fd, rule);
-            }
-            if rule_is_ours_family(rule) && !tables.contains(&rule.table) {
-                tables.push(rule.table);
-            }
-        }
-        let vxlan_ifindex = ifindex(&cfg.network().vxlan_dev)?;
-        let underlay_ifindex = ifindex(&cfg.network().underlay_dev)?;
-        let local = cfg.local_backend()?;
-        for table in tables {
-            // Shape-guarded on teardown too: a user table (e.g. 100) may hold
-            // foreign routes that must survive edge-lb removal.
-            reconcile_table_on_socket(
-                fd,
-                table,
-                &[],
-                true,
-                vxlan_ifindex,
-                underlay_ifindex,
-                local.underlay_ip,
-            )
-            .ok();
-        }
-        Ok(())
+    let result = (|| -> Result<()> {
+        let _lock = ownership_lock(cfg)?;
+        let mut ownership = RouteOwnership::load()?;
+        let fd = socket()?;
+        // Cleanup uses recorded identities, so deleted/renamed devices and
+        // removed gateways do not prevent clearing surviving owned objects.
+        let result = reconcile_on_socket(
+            fd,
+            cfg,
+            &[],
+            &mut ownership,
+            0,
+            0,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        );
+        unsafe { libc::close(fd) };
+        result
     })();
-    if let Err(e) = result {
-        tracing::warn!("[route] policy routing cleanup incomplete: {e:#}");
+    if let Err(error) = result {
+        tracing::warn!("[route] policy routing cleanup incomplete: {error:#}");
     }
-    unsafe {
-        libc::close(fd);
-    }
-}
-
-/// A rule belongs to edge-lb if its mark or table falls in the derived
-/// ranges.
-fn rule_is_ours_family(rule: &PolicyRule) -> bool {
-    if rule
-        .mark
-        .is_some_and(|m| (EDGE_CURRENT_MARK_BASE..EDGE_MARK_LIMIT).contains(&m))
-    {
-        return true;
-    }
-    if (EDGE_CURRENT_TABLE_BASE..EDGE_TABLE_LIMIT).contains(&rule.table) {
-        return true;
-    }
-    false
-}
-
-fn rule_is_stale_ours(rule: &PolicyRule, desired: &[(u32, u32)]) -> bool {
-    if !rule_is_ours_family(rule) {
-        return false;
-    }
-    let key = (rule.mark.unwrap_or(0), rule.table);
-    if desired.contains(&key) {
-        return false;
-    }
-    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -416,6 +547,7 @@ fn expected_table_entries(
 
 fn default_entry(table: u32, gateway_overlay: IpAddr, oif: u32) -> RouteEntry {
     RouteEntry {
+        supported: true,
         family: family(gateway_overlay),
         table,
         dst_len: 0,
@@ -428,6 +560,7 @@ fn default_entry(table: u32, gateway_overlay: IpAddr, oif: u32) -> RouteEntry {
 
 fn host_entry(table: u32, dst: IpAddr, oif: u32, preferred_src: IpAddr) -> RouteEntry {
     RouteEntry {
+        supported: true,
         family: family(dst),
         table,
         dst_len: prefix_len(dst),
@@ -438,79 +571,9 @@ fn host_entry(table: u32, dst: IpAddr, oif: u32, preferred_src: IpAddr) -> Route
     }
 }
 
-/// Converge one table toward `expected`.
-///
-/// Current derived tables are wholly owned by edge-lb:
-/// anything not expected is deleted — this is what heals stale routes after
-/// a failover, gateway re-IP or local underlay change. Other tables are only
-/// touched where an entry matches the edge-lb route *shape*
-/// (`shape_guard = true`).
-#[allow(clippy::too_many_arguments)]
-fn reconcile_table_on_socket(
-    fd: RawFd,
-    table: u32,
-    expected: &[RouteEntry],
-    shape_guard: bool,
-    vxlan_ifindex: u32,
-    underlay_ifindex: u32,
-    local_underlay: IpAddr,
-) -> Result<()> {
-    let current = dump_routes_in_table_on_socket(fd, table)?;
-    let fully_owned = !shape_guard && (EDGE_CURRENT_TABLE_BASE..EDGE_TABLE_LIMIT).contains(&table);
-    for entry in &current {
-        let stale = if expected.contains(entry) {
-            false
-        } else if fully_owned {
-            true
-        } else {
-            entry_is_ours_by_shape(entry, vxlan_ifindex, underlay_ifindex, local_underlay)
-        };
-        if stale && let Err(error) = delete_route_entry_on_socket(fd, entry) {
-            if is_absent_route_error(&error) {
-                tracing::debug!(
-                    "stale route {} from table {table} already absent",
-                    entry.describe("", "")
-                );
-            } else {
-                return Err(error).with_context(|| {
-                    format!(
-                        "deleting stale route {} from table {table}",
-                        entry.describe("", "")
-                    )
-                });
-            }
-        }
-    }
-    for want in expected {
-        if !current.contains(want) {
-            add_route_replace_on_socket(fd, want).with_context(|| {
-                format!(
-                    "installing route {} in table {table}",
-                    want.describe("", "")
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Shape of routes edge-lb creates: a default via the VXLAN device, or a
-/// host route to a gateway underlay via the underlay device with the local
-/// underlay as preferred source.
-fn entry_is_ours_by_shape(
-    entry: &RouteEntry,
-    vxlan_ifindex: u32,
-    underlay_ifindex: u32,
-    local_underlay: IpAddr,
-) -> bool {
-    (entry.dst_len == 0 && entry.dst.is_none() && entry.oif == Some(vxlan_ifindex))
-        || (entry.oif == Some(underlay_ifindex)
-            && entry.dst_len == prefix_len(entry.dst.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
-            && entry.prefsrc == Some(local_underlay))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RouteEntry {
+    supported: bool,
     family: u8,
     table: u32,
     dst_len: u8,
@@ -553,8 +616,10 @@ impl RouteEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PolicyRule {
+    supported: bool,
+    protocol: u8,
     priority: u32,
     mark: Option<u32>,
     mask: Option<u32>,
@@ -567,24 +632,58 @@ fn ensure_rule_at_or_after_on_socket(
     mark: u32,
     mask: u32,
     table: u32,
-) -> Result<()> {
-    let mut priority = start;
-    for _ in 0..RULE_BAND {
+    rules: &[PolicyRule],
+) -> Result<PolicyRule> {
+    for offset in 0..RULE_BAND {
+        let Some(priority) = start.checked_add(offset) else {
+            break;
+        };
+        if rules.iter().any(|rule| rule.priority == priority) {
+            continue;
+        }
         match send_ack_on_socket(
             fd,
             RTM_NEWRULE,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
             rule_body(mark, mask, priority, table),
         ) {
-            Ok(()) => return Ok(()),
-            Err(e) if is_errno(&e, libc::EEXIST) => priority += 1,
+            Ok(()) => {
+                return Ok(PolicyRule {
+                    supported: true,
+                    protocol: RTPROT_STATIC,
+                    priority,
+                    mark: Some(mark),
+                    mask: Some(mask),
+                    table,
+                });
+            }
+            Err(e) if is_errno(&e, libc::EEXIST) => continue,
             Err(e) => return Err(e),
         }
     }
     bail!("no free policy-rule priority within {RULE_BAND} slots after {start}");
 }
 
-fn delete_policy_rule_on_socket(fd: RawFd, rule: &PolicyRule) {
+fn delete_policy_rule_on_socket(fd: RawFd, rule: &PolicyRule) -> Result<()> {
+    let matches: Vec<_> = dump_policy_rules_on_socket(fd)?
+        .into_iter()
+        .filter(|value| {
+            value.priority == rule.priority
+                && value.mark == rule.mark
+                && value.mask == rule.mask
+                && value.table == rule.table
+                && value.protocol == rule.protocol
+        })
+        .collect();
+    if matches.is_empty() {
+        return Ok(());
+    }
+    if matches.len() != 1 || matches[0] != *rule {
+        bail!(
+            "refusing ambiguous policy rule deletion at priority {}",
+            rule.priority
+        );
+    }
     let mut body = bytes_of(&FibRuleHdr {
         family: libc::AF_INET as u8,
         dst_len: 0,
@@ -598,13 +697,17 @@ fn delete_policy_rule_on_socket(fd: RawFd, rule: &PolicyRule) {
     });
     push_attr_u32(&mut body, FRA_PRIORITY, rule.priority);
     push_attr_u32(&mut body, FRA_TABLE, rule.table);
+    push_attr(&mut body, FRA_PROTOCOL, &[rule.protocol]);
     if let Some(mark) = rule.mark {
         push_attr_u32(&mut body, FRA_FWMARK, mark);
     }
     if let Some(mask) = rule.mask {
         push_attr_u32(&mut body, FRA_FWMASK, mask);
     }
-    let _ = send_ack_on_socket(fd, RTM_DELRULE, NLM_F_REQUEST | NLM_F_ACK, body);
+    match send_ack_on_socket(fd, RTM_DELRULE, NLM_F_REQUEST | NLM_F_ACK, body) {
+        Err(error) if is_absent_route_error(&error) => Ok(()),
+        result => result,
+    }
 }
 
 fn rule_body(mark: u32, mask: u32, priority: u32, table: u32) -> Vec<u8> {
@@ -623,10 +726,11 @@ fn rule_body(mark: u32, mask: u32, priority: u32, table: u32) -> Vec<u8> {
     push_attr_u32(&mut body, FRA_FWMARK, mark);
     push_attr_u32(&mut body, FRA_FWMASK, mask);
     push_attr_u32(&mut body, FRA_TABLE, table);
+    push_attr(&mut body, FRA_PROTOCOL, &[RTPROT_STATIC]);
     body
 }
 
-fn add_route_replace_on_socket(fd: RawFd, entry: &RouteEntry) -> Result<()> {
+fn add_route_exclusive_on_socket(fd: RawFd, entry: &RouteEntry) -> Result<()> {
     let scope = if entry.dst_len == 0 {
         RT_SCOPE_UNIVERSE
     } else {
@@ -646,17 +750,33 @@ fn add_route_replace_on_socket(fd: RawFd, entry: &RouteEntry) -> Result<()> {
         push_attr_ip(&mut body, RTA_PREFSRC, prefsrc);
     }
     push_attr_u32(&mut body, RTA_TABLE, entry.table);
-    // CREATE|REPLACE keeps the write atomic: a converged route is never
-    // briefly removed, and a failure leaves the previous route in place.
+    // Never replace an object that appeared after our ownership check.
     send_ack_on_socket(
         fd,
         RTM_NEWROUTE,
-        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
         body,
     )
 }
 
 fn delete_route_entry_on_socket(fd: RawFd, entry: &RouteEntry) -> Result<()> {
+    let matches: Vec<_> = dump_routes_in_table_on_socket(fd, entry.table)?
+        .into_iter()
+        .filter(|value| {
+            value.family == entry.family
+                && value.dst_len == entry.dst_len
+                && value.dst == entry.dst
+                && value.gateway == entry.gateway
+                && value.oif == entry.oif
+                && value.prefsrc == entry.prefsrc
+        })
+        .collect();
+    if matches.is_empty() {
+        return Ok(());
+    }
+    if matches.len() != 1 || matches[0] != *entry {
+        bail!("refusing ambiguous route deletion in table {}", entry.table);
+    }
     let scope = if entry.dst_len == 0 {
         RT_SCOPE_UNIVERSE
     } else {
@@ -700,12 +820,15 @@ fn read_rule_dump(fd: RawFd, seq: u32) -> Result<Vec<PolicyRule>> {
     let mut rules = Vec::new();
     let mut buf = vec![0u8; 32768];
     loop {
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_TRUNC) };
         if n < 0 {
             return Err(io::Error::last_os_error()).context("reading rtnetlink rule dump");
         }
         let mut offset = 0usize;
         let n = n as usize;
+        if n > buf.len() {
+            bail!("truncated rtnetlink rule dump");
+        }
         while offset + size_of::<NlMsghdr>() <= n {
             let hdr = read_struct::<NlMsghdr>(&buf[offset..])?;
             if (hdr.nlmsg_len as usize) < size_of::<NlMsghdr>()
@@ -716,6 +839,9 @@ fn read_rule_dump(fd: RawFd, seq: u32) -> Result<Vec<PolicyRule>> {
             if hdr.nlmsg_seq != seq {
                 offset += align(hdr.nlmsg_len as usize);
                 continue;
+            }
+            if hdr.nlmsg_flags & NLM_F_DUMP_INTR != 0 {
+                bail!("rtnetlink rule dump interrupted; refusing incomplete ownership snapshot");
             }
             let start = offset + size_of::<NlMsghdr>();
             let end = offset + hdr.nlmsg_len as usize;
@@ -746,10 +872,16 @@ fn parse_policy_rule(data: &[u8]) -> Option<PolicyRule> {
         return None;
     }
     let msg = read_struct::<FibRuleHdr>(data).ok()?;
-    if msg.action != FR_ACT_TO_TBL || msg.family != libc::AF_INET as u8 {
+    if msg.family != libc::AF_INET as u8 {
         return None;
     }
     let mut rule = PolicyRule {
+        supported: msg.action == FR_ACT_TO_TBL
+            && msg.dst_len == 0
+            && msg.src_len == 0
+            && msg.tos == 0
+            && msg.flags == 0,
+        protocol: 0,
         priority: 0,
         mark: None,
         mask: None,
@@ -774,7 +906,10 @@ fn parse_policy_rule(data: &[u8]) -> Option<PolicyRule> {
                     rule.table = table;
                 }
             }
-            _ => {}
+            FRA_PROTOCOL => rule.protocol = *payload.first()?,
+            FRA_SUPPRESS_IFGROUP | FRA_SUPPRESS_PREFIXLEN
+                if parse_u32_attr(payload) == Some(u32::MAX) => {}
+            _ => rule.supported = false,
         }
         offset += align(len);
     }
@@ -914,12 +1049,15 @@ fn read_route_dump(fd: RawFd, seq: u32, table: u32) -> Result<Vec<RouteEntry>> {
     let mut routes = Vec::new();
     let mut buf = vec![0u8; 32768];
     loop {
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_TRUNC) };
         if n < 0 {
             return Err(io::Error::last_os_error()).context("reading rtnetlink route dump");
         }
         let mut offset = 0usize;
         let n = n as usize;
+        if n > buf.len() {
+            bail!("truncated rtnetlink route dump");
+        }
         while offset + size_of::<NlMsghdr>() <= n {
             let hdr = read_struct::<NlMsghdr>(&buf[offset..])?;
             if (hdr.nlmsg_len as usize) < size_of::<NlMsghdr>()
@@ -930,6 +1068,9 @@ fn read_route_dump(fd: RawFd, seq: u32, table: u32) -> Result<Vec<RouteEntry>> {
             if hdr.nlmsg_seq != seq {
                 offset += align(hdr.nlmsg_len as usize);
                 continue;
+            }
+            if hdr.nlmsg_flags & NLM_F_DUMP_INTR != 0 {
+                bail!("rtnetlink route dump interrupted; refusing incomplete ownership snapshot");
             }
             let start = offset + size_of::<NlMsghdr>();
             let end = offset + hdr.nlmsg_len as usize;
@@ -962,6 +1103,17 @@ fn parse_route_entry(data: &[u8]) -> Result<RouteEntry> {
     }
     let msg = read_struct::<RtMsg>(data)?;
     let mut route = RouteEntry {
+        supported: msg.rtm_src_len == 0
+            && msg.rtm_tos == 0
+            && msg.rtm_flags == 0
+            && msg.rtm_protocol == RTPROT_STATIC
+            && msg.rtm_type == RTN_UNICAST
+            && msg.rtm_scope
+                == if msg.rtm_dst_len == 0 {
+                    RT_SCOPE_UNIVERSE
+                } else {
+                    RT_SCOPE_LINK
+                },
         family: msg.rtm_family,
         table: msg.rtm_table as u32,
         dst_len: msg.rtm_dst_len,
@@ -989,7 +1141,7 @@ fn parse_route_entry(data: &[u8]) -> Result<RouteEntry> {
                     route.table = table;
                 }
             }
-            _ => {}
+            _ => route.supported = false,
         }
         offset += align(len);
     }
@@ -1022,24 +1174,6 @@ fn ifindex(dev: &str) -> Result<u32> {
         return Err(io::Error::last_os_error()).context("resolving interface ifindex");
     }
     Ok(index)
-}
-
-fn parse_fwmark(value: &str) -> Result<(u32, u32)> {
-    let (mark, mask) = value
-        .split_once('/')
-        .ok_or_else(|| anyhow!("fwmark must look like 0x1/0xff, got {value}"))?;
-    Ok((parse_u32(mark)?, parse_u32(mask)?))
-}
-
-fn parse_u32(value: &str) -> Result<u32> {
-    let value = value.trim();
-    if let Some(hex) = value.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).with_context(|| format!("parsing {value}"))
-    } else {
-        value
-            .parse::<u32>()
-            .with_context(|| format!("parsing {value}"))
-    }
 }
 
 fn table_field(table: u32) -> u8 {
@@ -1131,15 +1265,67 @@ fn is_absent_route_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::config::{BackendReturnPort, FileConfig, GatewayNode, Protocol};
+    use std::path::PathBuf;
     #[test]
-    fn parses_hex_fwmark_and_mask() {
-        assert_eq!(parse_fwmark("0x1/0xff").unwrap(), (1, 255));
-    }
+    fn return_routes_derive_gateway_slotted_mark_and_table() {
+        let cfg = Config {
+            path: PathBuf::from("/tmp/edge-lb-test.toml"),
+            file: FileConfig {
+                gateway_nodes: vec![
+                    GatewayNode {
+                        name: "gateway-a".to_string(),
+                        public_ip: "203.0.113.10".parse().unwrap(),
+                        underlay_ip: "192.168.0.12".parse().unwrap(),
+                        overlay_ip: "10.255.12.1/24".to_string(),
+                    },
+                    GatewayNode {
+                        name: "gateway-b".to_string(),
+                        public_ip: "203.0.113.11".parse().unwrap(),
+                        underlay_ip: "192.168.0.16".parse().unwrap(),
+                        overlay_ip: "10.255.16.1/24".to_string(),
+                    },
+                ],
+                backend_return_ports: vec![
+                    BackendReturnPort {
+                        backend: None,
+                        address: "192.168.0.14".parse().unwrap(),
+                        protocol: Protocol::Tcp,
+                        port: 8080,
+                        gateway: None,
+                        gateway_underlay_ip: Some("192.168.0.16".parse().unwrap()),
+                        gateway_overlay_ip: Some("10.255.16.1".parse().unwrap()),
+                        backend_overlay_ip: None,
+                        dscp: Some(40),
+                        mark: None,
+                        route_table_id: None,
+                    },
+                    BackendReturnPort {
+                        backend: None,
+                        address: "192.168.0.14".parse().unwrap(),
+                        protocol: Protocol::Tcp,
+                        port: 8080,
+                        gateway: None,
+                        gateway_underlay_ip: Some("192.168.0.12".parse().unwrap()),
+                        gateway_overlay_ip: Some("10.255.12.1".parse().unwrap()),
+                        backend_overlay_ip: None,
+                        dscp: Some(46),
+                        mark: None,
+                        route_table_id: None,
+                    },
+                ],
+                ..FileConfig::default()
+            },
+        };
 
-    #[test]
-    fn parses_decimal_fwmark_and_mask() {
-        assert_eq!(parse_fwmark("1/255").unwrap(), (1, 255));
+        assert_eq!(
+            return_routes(&cfg)
+                .unwrap()
+                .iter()
+                .map(|route| (route.mark, route.table))
+                .collect::<Vec<_>>(),
+            vec![(0x106e, 1110), (0x10a8, 1168)]
+        );
     }
 
     fn v4(ip: &str) -> IpAddr {
@@ -1147,97 +1333,378 @@ mod tests {
     }
 
     #[test]
-    fn shape_predicate_recognizes_only_edge_lb_routes() {
-        let local = v4("192.168.0.14");
-        assert!(entry_is_ours_by_shape(
-            &default_entry(1064, v4("10.255.16.1"), 11),
-            11,
-            2,
-            local
-        ));
-        assert!(entry_is_ours_by_shape(
-            &host_entry(1064, v4("192.168.0.12"), 2, local),
-            11,
-            2,
-            local
-        ));
-        // A default route on the underlay device is not edge-lb-owned.
-        assert!(!entry_is_ours_by_shape(
-            &RouteEntry {
-                family: libc::AF_INET as u8,
-                table: 100,
-                dst_len: 0,
-                dst: None,
-                gateway: Some(v4("192.168.0.1")),
-                oif: Some(2),
-                prefsrc: None,
-            },
-            11,
-            2,
-            local
-        ));
-        // A stale default route on the VXLAN device is still edge-lb-owned.
-        assert!(entry_is_ours_by_shape(
-            &RouteEntry {
-                family: libc::AF_INET as u8,
-                table: 1064,
-                dst_len: 0,
-                dst: None,
-                gateway: Some(v4("10.255.20.1")),
-                oif: Some(11),
-                prefsrc: None,
-            },
-            11,
-            2,
-            local
-        ));
+    fn kernel_reconcile_preserves_foreign_objects_and_persists_ownership() {
+        std::thread::spawn(|| {
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWNET) },
+                0,
+                "requires privileged Linux container: {}",
+                io::Error::last_os_error()
+            );
+            let ip = |args: &[&str]| {
+                let result = std::process::Command::new("ip")
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "ip {args:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            };
+            ip(&["link", "add", "test-underlay", "type", "dummy"]);
+            ip(&["link", "set", "test-underlay", "up"]);
+            ip(&["addr", "add", "192.0.2.10/24", "dev", "test-underlay"]);
+            ip(&["link", "add", "test-return", "type", "dummy"]);
+            ip(&["link", "set", "test-return", "up"]);
+            ip(&["addr", "add", "10.44.0.2/24", "dev", "test-return"]);
+            ip(&["addr", "add", "10.45.0.2/24", "dev", "test-return"]);
+            let vxlan = ifindex("test-return").unwrap();
+            let underlay = ifindex("test-underlay").unwrap();
+            let local = v4("192.0.2.10");
+            let state_dir =
+                std::env::temp_dir().join(format!("edge-route-kernel-{}", std::process::id()));
+            crate::storage::initialize(&state_dir).unwrap();
+            let cfg = Config {
+                path: state_dir.join("config.toml"),
+                file: FileConfig {
+                    state_dir: state_dir.clone(),
+                    gateway_nodes: vec![GatewayNode {
+                        name: "gateway-a".into(),
+                        public_ip: v4("203.0.113.1"),
+                        underlay_ip: v4("192.0.2.1"),
+                        overlay_ip: "10.44.0.1/24".into(),
+                    }],
+                    backend_return_ports: vec![BackendReturnPort {
+                        backend: None,
+                        address: local,
+                        protocol: Protocol::Tcp,
+                        port: 8080,
+                        gateway: None,
+                        gateway_underlay_ip: Some(v4("192.0.2.1")),
+                        gateway_overlay_ip: Some(v4("10.44.0.1")),
+                        backend_overlay_ip: None,
+                        dscp: Some(46),
+                        mark: None,
+                        route_table_id: None,
+                    }],
+                    ..Default::default()
+                },
+            };
+            let fd = socket().unwrap();
+            let mut ownership = RouteOwnership::load().unwrap();
+            ownership.save().unwrap();
+            let want = desired_route();
+            let foreign_rule =
+                ensure_rule_at_or_after_on_socket(fd, 100, 9, u32::MAX, 999, &[]).unwrap();
+            let foreign_route = host_entry(want.table, v4("192.0.2.99"), underlay, local);
+            add_route_exclusive_on_socket(fd, &foreign_route).unwrap();
+            assert_eq!(ownership_conflicts(&cfg).unwrap().len(), 1);
+            let before = dump_policy_rules_on_socket(fd).unwrap();
+            assert!(
+                reconcile_on_socket(fd, &cfg, &[want], &mut ownership, vxlan, underlay, local)
+                    .is_err()
+            );
+            assert_eq!(dump_policy_rules_on_socket(fd).unwrap(), before);
+            assert_eq!(
+                dump_routes_in_table_on_socket(fd, want.table).unwrap(),
+                vec![foreign_route.clone()]
+            );
+            delete_route_entry_on_socket(fd, &foreign_route).unwrap();
+
+            reconcile_on_socket(fd, &cfg, &[want], &mut ownership, vxlan, underlay, local).unwrap();
+            let stored = crate::storage::repository()
+                .unwrap()
+                .get_document("route_ownership", "local")
+                .unwrap();
+            for _ in 0..3 {
+                ownership = RouteOwnership::load().unwrap();
+                reconcile_on_socket(fd, &cfg, &[want], &mut ownership, vxlan, underlay, local)
+                    .unwrap();
+                assert_eq!(
+                    crate::storage::repository()
+                        .unwrap()
+                        .get_document("route_ownership", "local")
+                        .unwrap(),
+                    stored
+                );
+            }
+            assert_eq!(ownership.rules.len(), 1);
+            assert_eq!(ownership.rules[0].priority, 101);
+            assert_eq!(ownership.routes.len(), 2);
+            assert!(ownership_conflicts(&cfg).unwrap().is_empty());
+            assert!(policy_rule_present(&cfg));
+            assert!(
+                dump_policy_rules_on_socket(fd)
+                    .unwrap()
+                    .contains(&foreign_rule)
+            );
+
+            // A gateway re-IP removes the old recorded default even though it
+            // is not in the new topology anymore.
+            let moved = ReturnRoute {
+                gateway_overlay: v4("10.45.0.1"),
+                ..want
+            };
+            reconcile_on_socket(fd, &cfg, &[moved], &mut ownership, vxlan, underlay, local)
+                .unwrap();
+            assert!(
+                !dump_routes_in_table_on_socket(fd, want.table)
+                    .unwrap()
+                    .contains(&default_entry(want.table, want.gateway_overlay, vxlan))
+            );
+            let replacement = default_entry(want.table, v4("10.44.0.1"), vxlan);
+            assert!(add_route_exclusive_on_socket(fd, &replacement).is_err());
+            assert!(
+                dump_routes_in_table_on_socket(fd, want.table)
+                    .unwrap()
+                    .contains(&default_entry(want.table, moved.gateway_overlay, vxlan))
+            );
+
+            // Cleanup protects unrelated entries even in a previously used table.
+            add_route_exclusive_on_socket(fd, &foreign_route).unwrap();
+            let second = ReturnRoute {
+                gateway_underlay: v4("192.0.2.2"),
+                gateway_overlay: v4("10.45.0.1"),
+                mark: return_mark(40, 1),
+                table: return_table_id(40, 1),
+            };
+            reconcile_on_socket(fd, &cfg, &[second], &mut ownership, vxlan, underlay, local)
+                .unwrap();
+            assert_eq!(
+                dump_routes_in_table_on_socket(fd, want.table).unwrap(),
+                vec![foreign_route.clone()]
+            );
+            assert!(
+                ownership
+                    .routes
+                    .iter()
+                    .all(|entry| entry.table == second.table)
+            );
+            reconcile_on_socket(fd, &cfg, &[], &mut ownership, 0, 0, local).unwrap();
+            assert!(ownership.routes.is_empty());
+            assert!(ownership.rules.is_empty());
+            assert_eq!(
+                dump_routes_in_table_on_socket(fd, want.table).unwrap(),
+                vec![foreign_route]
+            );
+            assert_eq!(dump_policy_rules_on_socket(fd).unwrap(), before);
+            assert_eq!(RouteOwnership::load().unwrap(), ownership);
+            // Same mark/table with additional selectors must never be deleted
+            // through a partially specified netlink key.
+            let selector_rule =
+                ensure_rule_at_or_after_on_socket(fd, 200, want.mark, u32::MAX, want.table, &[])
+                    .unwrap();
+            ip(&[
+                "rule",
+                "add",
+                "pref",
+                "200",
+                "from",
+                "198.51.100.0/24",
+                "fwmark",
+                "0x106e",
+                "table",
+                "1110",
+                "protocol",
+                "static",
+            ]);
+            let collision_before = dump_policy_rules_on_socket(fd).unwrap();
+            assert!(delete_policy_rule_on_socket(fd, &selector_rule).is_err());
+            assert_eq!(dump_policy_rules_on_socket(fd).unwrap(), collision_before);
+            unsafe { libc::close(fd) };
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn test_rule() -> PolicyRule {
+        parse_policy_rule(&rule_body(
+            return_mark(46, 0),
+            u32::MAX,
+            100,
+            return_table_id(46, 0),
+        ))
+        .unwrap()
+    }
+
+    fn desired_route() -> ReturnRoute {
+        ReturnRoute {
+            gateway_underlay: v4("192.0.2.1"),
+            gateway_overlay: v4("10.44.0.1"),
+            mark: return_mark(46, 0),
+            table: return_table_id(46, 0),
+        }
     }
 
     #[test]
-    fn stale_rule_detection_only_touches_edge_lb_ranges() {
-        let current_mark = return_mark(46, 0);
-        let current_table = return_table_id(46, 0);
-        let stale_peer_mark = return_mark(46, 1);
-        let stale_peer_table = return_table_id(46, 1);
-        let gw_rule = |mark: u32, table: u32| PolicyRule {
-            priority: 100,
-            mark: Some(mark),
-            mask: Some(u32::MAX),
-            table,
+    fn numeric_ranges_and_expected_shape_do_not_establish_ownership() {
+        let ownership = RouteOwnership::default();
+        let route = default_entry(return_table_id(46, 0), v4("10.44.0.1"), 11);
+        assert!(!ownership.owns_rule(&test_rule()));
+        assert!(!ownership.owns_route(&route));
+        assert!(validate_table(&[route], &ownership).is_err());
+        assert!(validate_rules(&[test_rule()], &[desired_route()], &ownership).is_err());
+    }
+
+    #[test]
+    fn ownership_requires_exact_rule_identity() {
+        let rule = test_rule();
+        let ownership = RouteOwnership {
+            rules: vec![rule.clone()],
+            ..Default::default()
         };
-        // Keep the desired gateway-slotted rule.
-        assert!(!rule_is_stale_ours(
-            &gw_rule(current_mark, current_table),
-            &[(current_mark, current_table)]
-        ));
-        // Remove an edge-lb rule that belongs to another no-longer-desired slot.
-        assert!(rule_is_stale_ours(
-            &gw_rule(stale_peer_mark, stale_peer_table),
-            &[(current_mark, current_table)]
-        ));
-        assert!(rule_is_stale_ours(
-            &gw_rule(stale_peer_mark, stale_peer_table),
-            &[]
-        ));
-        // Foreign rules are never touched.
-        assert!(!rule_is_stale_ours(
-            &PolicyRule {
-                priority: 100,
-                mark: Some(0x4000),
-                mask: Some(u32::MAX),
-                table: 500
+        assert!(ownership.owns_rule(&rule));
+        let variants = [
+            PolicyRule {
+                mark: Some(9),
+                ..rule.clone()
             },
-            &[]
-        ));
-        assert!(!rule_is_stale_ours(
-            &PolicyRule {
-                priority: 100,
-                mark: None,
-                mask: None,
-                table: 500
+            PolicyRule {
+                mask: Some(0xff),
+                ..rule.clone()
             },
-            &[]
-        ));
+            PolicyRule {
+                table: 999,
+                ..rule.clone()
+            },
+            PolicyRule {
+                priority: 101,
+                ..rule.clone()
+            },
+            PolicyRule {
+                protocol: 99,
+                ..rule.clone()
+            },
+            PolicyRule {
+                supported: false,
+                ..rule.clone()
+            },
+        ];
+        for foreign in variants {
+            assert!(!ownership.owns_rule(&foreign));
+            assert!(validate_rules(&[foreign], &[desired_route()], &ownership).is_err());
+        }
+    }
+
+    #[test]
+    fn unrelated_priority_is_not_a_conflict_but_mask_overlap_is() {
+        let mut foreign = test_rule();
+        foreign.mark = Some(9);
+        foreign.table = 999;
+        assert!(
+            validate_rules(
+                &[foreign.clone()],
+                &[desired_route()],
+                &RouteOwnership::default()
+            )
+            .is_ok()
+        );
+        foreign.mark = Some(0x1000);
+        foreign.mask = Some(0xf000);
+        assert!(
+            validate_rules(&[foreign], &[desired_route()], &RouteOwnership::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn previous_gateway_routes_remain_owned_but_foreign_host_routes_do_not() {
+        let old = host_entry(1110, v4("192.0.2.1"), 2, v4("192.0.2.10"));
+        let ownership = RouteOwnership {
+            routes: vec![old.clone()],
+            ..Default::default()
+        };
+        assert!(validate_table(std::slice::from_ref(&old), &ownership).is_ok());
+        for foreign in [
+            host_entry(1110, v4("192.0.2.99"), 2, v4("192.0.2.10")),
+            host_entry(1110, v4("192.0.2.1"), 3, v4("192.0.2.10")),
+            RouteEntry {
+                supported: false,
+                ..old
+            },
+        ] {
+            assert!(validate_table(&[foreign], &ownership).is_err());
+        }
+    }
+
+    #[test]
+    fn journal_round_trip_and_boot_namespace_scope() {
+        let ownership = RouteOwnership {
+            scope: "boot:netns".into(),
+            rules: vec![test_rule()],
+            routes: vec![default_entry(1110, v4("10.44.0.1"), 11)],
+        };
+        let json = serde_json::to_string(&ownership).unwrap();
+        assert_eq!(
+            RouteOwnership::decode(Some(&json), ownership.scope.clone()).unwrap(),
+            ownership
+        );
+        assert!(
+            RouteOwnership::decode(Some(&json), "new-boot:netns".into())
+                .unwrap()
+                .rules
+                .is_empty()
+        );
+        assert!(
+            RouteOwnership::decode(Some(&json), "boot:other-netns".into())
+                .unwrap()
+                .routes
+                .is_empty()
+        );
+        assert!(RouteOwnership::decode(Some("broken"), "boot:netns".into()).is_err());
+    }
+
+    #[test]
+    fn rule_selectors_and_route_attributes_cannot_be_ignored_for_ownership() {
+        let mut body = rule_body(0x106e, u32::MAX, 100, 1110);
+        push_attr_u32(&mut body, 3, 42); // FRA_IIFNAME, unrecognized selector.
+        assert!(!parse_policy_rule(&body).unwrap().supported);
+        let mut body = route_body(1110, libc::AF_INET as u8, 0, RT_SCOPE_UNIVERSE);
+        push_attr_u32(&mut body, 6, 10); // RTA_PRIORITY (metric).
+        assert!(!parse_route_entry(&body).unwrap().supported);
+    }
+
+    fn dump_error(message: &[u8], route_dump: bool) -> String {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::send(fds[0], message.as_ptr().cast(), message.len(), 0) },
+            message.len() as isize
+        );
+        let result = if route_dump {
+            read_route_dump(fds[1], 1, 1110).map(|_| ())
+        } else {
+            read_rule_dump(fds[1], 1).map(|_| ())
+        };
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        };
+        result.unwrap_err().to_string()
+    }
+
+    #[test]
+    fn interrupted_dump_is_not_an_empty_ownership_snapshot() {
+        let message = bytes_of(&NlMsghdr {
+            nlmsg_len: size_of::<NlMsghdr>() as u32,
+            nlmsg_type: NLMSG_DONE,
+            nlmsg_flags: NLM_F_DUMP_INTR,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        });
+        for route_dump in [false, true] {
+            assert!(dump_error(&message, route_dump).contains("interrupted"));
+        }
+    }
+
+    #[test]
+    fn truncated_dump_is_not_an_empty_ownership_snapshot() {
+        for route_dump in [false, true] {
+            assert!(dump_error(&vec![0u8; 40000], route_dump).contains("truncated"));
+        }
     }
 
     #[test]

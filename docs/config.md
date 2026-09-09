@@ -50,12 +50,12 @@ backend 保留当前内核 VXLAN/nft/route 状态并重连；重启后需要重�
 带连接同步的 active-backup 需要配置副本、native flow state 同步和入口 VIP 切换。
 HA 只支持一对 gateway；MASTER 权威写入，BACKUP 转发写入请求并接收副本。
 
-当前支持三种 VIP provider：`l2`、`bgp`、`hook`。不内置云公网 IP/EIP
-API provider。
+当前支持两种 VIP provider：`l2`、`hook`。BGP 接管模式已从配置面移除；
+不内置云公网 IP/EIP API provider。
 
 HA 集群配置不写入 TOML。配置文件只保留启动单机 gateway 所需的 bootstrap；
 `[gateway.reconcile]` 只控制本机巡检间隔。
-gateway peer、VIP 接管方式、BGP、hook 配置和当前 active gateway 状态都由 UI/API
+gateway peer、VIP 接管方式、hook 接管状态和当前 active gateway 状态都由 UI/API
 管理，保存在 SQLite 资源中，例如：
 
 ```text
@@ -63,17 +63,24 @@ gateway peer、VIP 接管方式、BGP、hook 配置和当前 active gateway 状�
 `ha_active_gateway/current`
 ```
 
-## VXLAN MTU 自动探测
+## VXLAN MTU 自动取值
 
 `[gateway.network].vxlan_mtu` 支持数字或 `"auto"`。写 `"auto"` 时，edge-lb
-先读取 underlay 设备 MTU，再对已知 underlay 对端执行 DF ping PMTU 探测，最终取：
+读取 underlay 设备 MTU，再查询已知 IPv4 对端的内核路由 MTU。查询 socket 绑定本机
+underlay 地址和设备，使用 VXLAN 目的端口，只 connect/getsockopt，不发送测试报文。
+这不是 DF ping 或端到端 PMTU 实测。IPv4 underlay 最终取：
 
 ```text
-vxlan_mtu = min(underlay_dev_mtu, peer_pmtu) - 50
+vxlan_mtu = min(1500, underlay_dev_mtu, available_cached_route_mtus...) - 50
 ```
 
-探测失败或尚无对端时使用 underlay 设备 MTU 回退；常见 `eth0 MTU=1500` 会得到
-`1450`。该逻辑不会自动假设 jumbo frame，只有内网路径实测支持时才会调大。
+没有对端或路由查询失败时，只使用设备上限及 1500 的保守上限；设备读取失败也使用
+1500。普通 IPv4 `eth0 MTU=1500` 得到 `1450`，jumbo 设备不会自动提高该值。
+本机 underlay 或已知对端为 IPv6 时按 70 字节预算，保守上限为 1430；目前不查询
+IPv6 路由 MTU，也不代表新增 IPv6 数据面支持。结果低于 576 时拒绝自动配置，
+不得回退成更大的 1450。日志明确 `path_verified=false`：即便得到 1450，也不能
+保证未知的中间链路可通过该大小的报文。需使用更大 MTU 时，先独立验证完整路径，
+再显式设置数值；数值配置行为不变。主动带反馈 PMTU 探测仍未实现。
 backend 从 xDS 接收 gateway 下发的 VXLAN MTU；本地 `mss` 仍是 backend 可调参数，
 必须小于等于 `vxlan_mtu - 40`。
 
@@ -99,9 +106,8 @@ backend 从 xDS 接收 gateway 下发的 VXLAN MTU；本地 `mss` 仍是 backend
   ],
   "vip": {
     "provider": "l2",
-  "private_vip": "192.168.0.6",
-  "bind_device": "loopback",
-    "public_vip": "203.0.113.20",
+    "private_vip": "192.168.0.6",
+    "bind_device": "loopback",
     "bind_timeout_secs": 15,
     "verify_timeout_secs": 10,
     "garp": {
@@ -110,18 +116,11 @@ backend 从 xDS 接收 gateway 下发的 VXLAN MTU；本地 `mss` 仍是 backend
       "repeat_after_ms": 1000,
       "repeat_count": 1
     }
-  },
-  "bgp": {
-    "local_as": 65012,
-    "router_id": "auto",
-    "peers": ["192.168.0.1:65001"],
-    "hold_time_secs": 90,
-    "keepalive_secs": 30
   }
 }
 ```
 
-`l2` 使用本机 VIP 地址和 GARP；`bgp` 发布 VIP 路由；`hook` 执行外部
+`l2` 使用本机 VIP 地址和 GARP；`hook` 执行固定外部
 promote/demote/verify 脚本。只有 provider verify 确认 VIP 已命中新 `MASTER` 后，
 failover 才算完成。
 L2 VIP 默认绑定到 `lo`，主备切换时由当前 MASTER 自动绑定、BACKUP 自动解绑；
@@ -130,9 +129,10 @@ L2 VIP 默认绑定到 `lo`，主备切换时由当前 MASTER 自动绑定、BAC
 GARP 行为：每轮发送 `count` 组 gratuitous ARP request + reply，组内间隔
 `interval_ms`；初始发送完成后再补发 `repeat_count` 轮，每轮之间等待
 `repeat_after_ms`。默认值表示先发 10 组，1 秒后再补发 10 组。
-`bgp` 只在 `provider=bgp` 时生效，用于保存后续 neighbor 配置；
-`promote_hook`、`demote_hook` 和 `verify_hook` 只在 `provider=hook`
-时使用。
+`hook` 模式固定使用 `/usr/local/bin/edge-lb-promote`、
+`/usr/local/bin/edge-lb-demote` 和 `/usr/local/bin/edge-lb-verify-vip`；
+UI/API 不允许修改路径。`edge-lb install` 和 gateway daemon 会自动创建缺失脚本并
+设置 `0755` 权限，已有脚本内容不会被覆盖。
 native listener 的 `vip_ips` 是可选附加入口地址列表，空列表时由 gateway 自动使用本机
 入口地址及已生效的 HA VIP；TCP/UDP 监听不需要额外入口地址字段。
 监听表单第一阶段隐藏 `mark/security/host/BGP/proxyProtocolV2/egress`，提交时

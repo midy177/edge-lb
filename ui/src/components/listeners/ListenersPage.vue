@@ -33,7 +33,7 @@ import { ref } from 'vue'
 import { api, type ListenerConfig } from '@/api'
 import { t as text } from '@/lib/i18n'
 import { listenerSelectOptions } from '@/lib/lb'
-import { busy, listeners, refreshListenerData, run, status, targetGroups } from '@/composables/useNodeData'
+import { busy, listeners, run, status, targetGroups } from '@/composables/useNodeData'
 import {
   canSubmitListener,
   applyListenerTargetGroup,
@@ -72,7 +72,7 @@ function importListeners() { listenerImportInput.value?.click() }
 async function onListenerImport(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) return
-  await run(text('import'), async () => { await api.importListenerConfigs(JSON.parse(await file.text())); await refreshListenerData() })
+  await run(text('import'), async () => api.importListenerConfigs(JSON.parse(await file.text())))
   ;(event.target as HTMLInputElement).value = ''
 }
 </script>

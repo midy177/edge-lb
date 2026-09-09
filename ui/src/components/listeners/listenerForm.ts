@@ -217,16 +217,15 @@ export async function openNewListener() {
   listenerFormOpen.value = true
 }
 
-export function submitListener() {
+export async function submitListener() {
   if (listenerErrors.value.length) {
     error.value = listenerErrors.value[0]
     return
   }
-  if (editingListener.value) {
-    run(t('save'), () => api.updateListenerConfig(editingListener.value!, listenerPayload()))
-  } else {
-    run(t('create'), () => api.createListenerConfig(listenerPayload()))
-  }
+  const saved = editingListener.value
+    ? await run(t('save'), () => api.updateListenerConfig(editingListener.value!, listenerPayload()))
+    : await run(t('create'), () => api.createListenerConfig(listenerPayload()))
+  if (!saved) return
   listenerFormOpen.value = false
   resetListenerForm()
 }
