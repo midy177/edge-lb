@@ -37,10 +37,9 @@ pub fn log_send(node_name: &str, resp: &DiscoveryResponse) {
     };
     let network = snapshot.network.as_ref();
     tracing::debug!(
-        "[control] sending snapshot to {} version {} active_gateway={} gateway_vxlan_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
+        "[control] sending snapshot to {} version {} gateway_vxlan_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
         node_name,
         resp.version,
-        snapshot.active_gateway,
         network
             .map(|n| n.gateway_vxlan_dev.as_str())
             .unwrap_or("unknown"),
@@ -67,10 +66,9 @@ pub fn log_recv(cfg: &Config, resp: &DiscoveryResponse) {
     };
     let network = snapshot.network.as_ref();
     tracing::debug!(
-        "[backend] xDS received snapshot version {} nonce {} active_gateway={} gateway_vxlan_dev={} local_return_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
+        "[backend] xDS received snapshot version {} nonce {} gateway_vxlan_dev={} local_return_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
         resp.version,
         resp.nonce,
-        snapshot.active_gateway,
         network
             .map(|n| n.gateway_vxlan_dev.as_str())
             .unwrap_or("unknown"),
@@ -225,7 +223,6 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
         })
         .collect();
     let mut snapshot = ConfigSnapshot {
-        active_gateway: String::new(),
         network: Some(pb::Network {
             gateway_public_ip: source_gateway.public_ip.to_string(),
             gateway_ip: source_gateway.underlay_ip.to_string(),
@@ -463,20 +460,18 @@ mod tests {
     use crate::config::{
         BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole, TargetGroup,
     };
-    use std::{fs, path::PathBuf};
+    use std::path::PathBuf;
 
     fn gateway_response(
         name: &str,
         gateway_ip: &str,
         overlay_cidr: &str,
         dscp: u32,
-        active_gateway: &str,
     ) -> DiscoveryResponse {
         DiscoveryResponse {
             version: format!("{name}-version"),
             nonce: format!("{name}-nonce"),
             snapshot: Some(ConfigSnapshot {
-                active_gateway: active_gateway.to_string(),
                 network: Some(pb::Network {
                     gateway_public_ip: "203.0.113.10".to_string(),
                     gateway_ip: gateway_ip.to_string(),
@@ -551,8 +546,8 @@ mod tests {
     #[test]
     fn combined_snapshot_uses_deterministic_gateway_network_as_base() {
         let combined = combine_gateway_responses(vec![
-            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46, "gateway-a"),
-            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40, "gateway-a"),
+            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46),
+            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40),
         ])
         .expect("snapshots combine");
         let snapshot = combined.snapshot.expect("combined snapshot");
@@ -565,10 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn combined_snapshot_accepts_multiple_active_gateway_views() {
+    fn combined_snapshot_accepts_multiple_gateway_views() {
         let combined = combine_gateway_responses(vec![
-            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46, "gateway-a"),
-            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40, "gateway-b"),
+            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46),
+            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40),
         ])
         .expect("snapshots combine");
         let snapshot = combined.snapshot.expect("combined snapshot");
@@ -577,10 +572,8 @@ mod tests {
 
     #[test]
     fn combined_snapshot_merges_partial_gateway_inventory() {
-        let mut gateway_a =
-            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46, "gateway-a");
-        let mut gateway_b =
-            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40, "gateway-b");
+        let mut gateway_a = gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46);
+        let mut gateway_b = gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40);
         gateway_a
             .snapshot
             .as_mut()
@@ -611,8 +604,8 @@ mod tests {
     #[test]
     fn backend_config_accepts_gateway_inventory_from_multiple_overlay_cidrs() {
         let combined = combine_gateway_responses(vec![
-            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46, "gateway-a"),
-            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40, "gateway-b"),
+            gateway_response("gateway-a", "192.0.2.11", "10.255.12.0/24", 46),
+            gateway_response("gateway-b", "192.0.2.16", "10.255.16.0/24", 40),
         ])
         .expect("snapshots combine");
         let snapshot = combined.snapshot.expect("combined snapshot");
@@ -667,7 +660,6 @@ mod tests {
         };
 
         let snapshot = ConfigSnapshot {
-            active_gateway: "gateway-a".to_string(),
             network: Some(pb::Network {
                 gateway_public_ip: "203.0.113.10".to_string(),
                 gateway_ip: "192.0.2.11".to_string(),
@@ -942,50 +934,6 @@ mod tests {
             .version;
         assert_eq!(backend_return_ports_from_config(&changed_cfg).len(), 1);
         assert_ne!(default_version, changed_version);
-    }
-
-    #[test]
-    fn snapshot_version_ignores_active_gateway_changes() {
-        let dir = std::env::temp_dir().join(format!("edge-lb-active-version-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
-        let active_file = dir.join("active-gateway");
-        let file = FileConfig {
-            ha: HaConfig {
-                active_state_file: active_file.clone(),
-                ..HaConfig::default()
-            },
-            gateway_nodes: vec![
-                GatewayNode {
-                    name: "gateway-a".to_string(),
-                    public_ip: "203.0.113.10".parse().unwrap(),
-                    underlay_ip: "192.0.2.10".parse().unwrap(),
-                    overlay_ip: "10.255.255.1/24".to_string(),
-                },
-                GatewayNode {
-                    name: "gateway-b".to_string(),
-                    public_ip: "203.0.113.11".parse().unwrap(),
-                    underlay_ip: "192.0.2.11".parse().unwrap(),
-                    overlay_ip: "10.255.255.1/24".to_string(),
-                },
-            ],
-            ..FileConfig::default()
-        };
-        let cfg = Config {
-            file,
-            path: dir.join("config.toml"),
-        };
-
-        fs::write(&active_file, "gateway-a\n").unwrap();
-        let gateway_a_version = response_for_backend(&cfg, local_ip("192.0.2.23"))
-            .unwrap()
-            .version;
-        fs::write(&active_file, "gateway-b\n").unwrap();
-        let gateway_b_version = response_for_backend(&cfg, local_ip("192.0.2.23"))
-            .unwrap()
-            .version;
-
-        assert_eq!(gateway_a_version, gateway_b_version);
-        let _ = fs::remove_dir_all(dir);
     }
 
     fn local_ip(value: &str) -> IpAddr {

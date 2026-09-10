@@ -46,8 +46,6 @@ const cleanupSummary = computed(() =>
             </CardHeader>
             <CardContent class="space-y-2 text-sm">
               <div class="flex justify-between"><span class="text-muted-foreground">{{ text('role') }}</span><span>{{ status?.node_role }}</span></div>
-              <div class="flex justify-between"><span class="text-muted-foreground">{{ text('publicIp') }}</span><span class="font-mono">{{ localNode?.public_ip ?? '—' }}</span></div>
-              <div class="flex justify-between text-xs"><span class="text-muted-foreground">{{ text('publicIp') }} {{ text('discoveryMode') }}</span><span>{{ formatDiscovery(status?.discovery?.public_ip?.mode, status?.discovery?.public_ip?.source) }}</span></div>
               <div class="flex justify-between"><span class="text-muted-foreground">{{ text('underlayIp') }}</span><span class="font-mono">{{ localNode?.underlay_ip ?? '—' }}</span></div>
               <div class="flex justify-between text-xs"><span class="text-muted-foreground">{{ text('underlayIp') }} {{ text('discoveryMode') }}</span><span>{{ formatDiscovery(status?.discovery?.underlay_ip?.mode, status?.discovery?.underlay_ip?.source) }}</span></div>
               <div class="flex justify-between"><span class="text-muted-foreground">{{ text('overlayIp') }}</span><span class="font-mono">{{ localNode?.overlay_ip ?? '—' }}</span></div>
@@ -122,9 +120,6 @@ const cleanupSummary = computed(() =>
               >
                 <div>
                   <div class="font-medium">{{ name }}</div>
-                  <div class="font-mono text-xs text-muted-foreground">
-                    public {{ reg.public_ip || '—' }} ({{ formatDiscovery(reg.public_ip_mode, reg.public_ip_source) }})
-                  </div>
                   <div class="font-mono text-xs text-muted-foreground">
                     underlay {{ reg.underlay_ip }} ({{ formatDiscovery(reg.underlay_ip_mode, reg.underlay_ip_source) }})<span v-if="reg.peer"> · peer {{ reg.peer }}</span>
                   </div>

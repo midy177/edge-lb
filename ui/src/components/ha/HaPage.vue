@@ -105,7 +105,7 @@ const haFormError = computed(
   () => peerLimitError.value || peerRequiredError.value || garpError.value,
 )
 const failoverGatewayNodes = computed(() => {
-  const nodes = new Map<string, { name: string; underlay_ip: string; public_ip: string }>()
+  const nodes = new Map<string, { name: string; underlay_ip: string }>()
   for (const node of gatewayNodes.value) {
     nodes.set(node.name, node)
   }
@@ -117,7 +117,6 @@ const failoverGatewayNodes = computed(() => {
     nodes.set(peer.name, {
       name: peer.name,
       underlay_ip: peer.underlay_ip,
-      public_ip: peer.public_ip || 'auto',
     })
   }
   if (!form.value.enabled || form.value.peers.length !== 1) {
@@ -452,7 +451,6 @@ async function switchActiveGateway() {
                 <TableRow>
                   <TableHead>{{ text('name') }}</TableHead>
                   <TableHead>{{ text('underlayIp') }}</TableHead>
-                  <TableHead>{{ text('publicIp') }}</TableHead>
                   <TableHead>API</TableHead>
                   <TableHead>xDS</TableHead>
                   <TableHead>overlay</TableHead>
@@ -464,7 +462,6 @@ async function switchActiveGateway() {
                 <TableRow v-for="(peer, index) in form.peers" :key="peerKey(peer, index)">
                   <TableCell class="font-medium">{{ peer.name || '-' }}</TableCell>
                   <TableCell class="font-mono text-xs">{{ peer.underlay_ip || '-' }}</TableCell>
-                  <TableCell class="font-mono text-xs">{{ peer.public_ip || '-' }}</TableCell>
                   <TableCell class="font-mono text-xs">{{ peer.api_addr || '-' }}</TableCell>
                   <TableCell class="font-mono text-xs">{{ peer.xds_addr || '-' }}</TableCell>
                   <TableCell class="font-mono text-xs">
@@ -475,7 +472,7 @@ async function switchActiveGateway() {
                   <TableCell class="font-mono text-xs">{{ peer.version || '-' }}</TableCell>
                 </TableRow>
                 <TableRow v-if="!form.peers.length">
-                  <TableCell colspan="8" class="text-muted-foreground">{{ text('haNoPeers') }}</TableCell>
+                  <TableCell colspan="7" class="text-muted-foreground">{{ text('haNoPeers') }}</TableCell>
                 </TableRow>
               </TableBody>
             </Table>
@@ -617,7 +614,7 @@ async function switchActiveGateway() {
                 </SelectTrigger>
                 <SelectContent>
                 <SelectItem v-for="gw in failoverCandidates" :key="gw.name" :value="gw.name">
-                    {{ gw.name }} (underlay {{ gw.underlay_ip }} / {{ text('publicIp') }} {{ gw.public_ip }})
+                    {{ gw.name }} (underlay {{ gw.underlay_ip }})
                   </SelectItem>
                 </SelectContent>
               </Select>

@@ -41,7 +41,6 @@ message DiscoveryResponse {
 }
 
 message ConfigSnapshot {
-  string active_gateway = 1;
   Network network = 2;
   repeated GatewayNode gateway_nodes = 3;
   repeated BackendNode backend_nodes = 4;

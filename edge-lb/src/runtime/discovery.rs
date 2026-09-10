@@ -40,14 +40,9 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
         .trim()
         .eq_ignore_ascii_case("auto")
         || file.network.underlay_dev.trim().is_empty();
-    let need_underlay = needs_local_underlay_ip(file) || needs_local_public_ip(file);
+    let need_underlay = needs_local_underlay_ip(file);
     let underlay = if need_underlay {
         Some(local_underlay_ip(file)?)
-    } else {
-        None
-    };
-    let public = if needs_local_public_ip(file) {
-        local_public_ip(file).ok()
     } else {
         None
     };
@@ -55,13 +50,6 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
         && let Some(underlay) = underlay
     {
         file.underlay_ip = underlay.value;
-    }
-    if file.public_ip.is_unspecified() {
-        if let Some(public) = public {
-            file.public_ip = public.value;
-        } else if let Some(underlay) = underlay {
-            file.public_ip = underlay.value;
-        }
     }
     let underlay_dev = if underlay_dev_was_auto {
         let dev = local_underlay_dev(file)?;
@@ -75,11 +63,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
             value: (!file.public_ip.is_unspecified()).then_some(file.public_ip),
             mode: discovery_mode(public_was_auto).to_string(),
             source: if public_was_auto {
-                public
-                    .map(|ip| ip.source)
-                    .or_else(|| underlay.map(|_| "underlay_fallback"))
-                    .unwrap_or("unresolved")
-                    .to_string()
+                "manual".to_string()
             } else {
                 "config".to_string()
             },
@@ -120,9 +104,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
                     .value;
             }
             if file.network.gateway_public_ip.is_unspecified() {
-                file.network.gateway_public_ip = public
-                    .unwrap_or(underlay.context("local public IP fallback unavailable")?)
-                    .value;
+                file.network.gateway_public_ip = file.public_ip;
             }
             for gw in &mut file.gateway_nodes {
                 if gw.name == file.node_name {
@@ -132,9 +114,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
                             .value;
                     }
                     if gw.public_ip.is_unspecified() {
-                        gw.public_ip = public
-                            .unwrap_or(underlay.context("local public IP fallback unavailable")?)
-                            .value;
+                        gw.public_ip = file.public_ip;
                     }
                 } else {
                     resolve_remote_node_ips(
@@ -172,9 +152,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
                             .value;
                     }
                     if backend.public_ip.is_unspecified() {
-                        backend.public_ip = public
-                            .unwrap_or(underlay.context("local public IP fallback unavailable")?)
-                            .value;
+                        backend.public_ip = file.public_ip;
                     }
                     resolved_backend = Some(backend.underlay_ip);
                 } else {
@@ -202,9 +180,7 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
                 .as_mut()
                 .filter(|ip| ip.is_unspecified())
             {
-                *ip = public
-                    .unwrap_or(underlay.context("local public IP fallback unavailable")?)
-                    .value;
+                *ip = file.public_ip;
             }
             let _ = resolved_backend;
         }
@@ -212,6 +188,15 @@ pub fn resolve_auto_ips(file: &mut FileConfig) -> Result<()> {
     resolve_auto_vxlan_mtu(file)?;
     file.normalize();
     Ok(())
+}
+
+pub fn discover_public_ip(file: &FileConfig) -> Result<IpDiscoveryRuntime> {
+    let resolved = local_public_ip(file)?;
+    Ok(IpDiscoveryRuntime {
+        value: Some(resolved.value),
+        mode: "manual".to_string(),
+        source: resolved.source.to_string(),
+    })
 }
 
 fn discovery_mode(auto: bool) -> &'static str {
@@ -236,29 +221,6 @@ fn needs_local_underlay_ip(file: &FileConfig) -> bool {
                 .is_some_and(|ip| ip.is_unspecified())
                 || file.backend_nodes.iter().any(|backend| {
                     backend.name == file.node_name && backend.underlay_ip.is_unspecified()
-                })
-        }
-    }
-}
-
-fn needs_local_public_ip(file: &FileConfig) -> bool {
-    if file.public_ip.is_unspecified() {
-        return true;
-    }
-    match file.node_role {
-        NodeRole::Gateway => {
-            file.network.gateway_public_ip.is_unspecified()
-                || file
-                    .gateway_nodes
-                    .iter()
-                    .any(|gw| gw.name == file.node_name && gw.public_ip.is_unspecified())
-        }
-        NodeRole::Backend => {
-            file.network
-                .backend_public_ip
-                .is_some_and(|ip| ip.is_unspecified())
-                || file.backend_nodes.iter().any(|backend| {
-                    backend.name == file.node_name && backend.public_ip.is_unspecified()
                 })
         }
     }
@@ -681,6 +643,23 @@ mod tests {
         file.backend.mss = 1200;
         clamp_backend_mss(&mut file, 1450);
         assert_eq!(file.backend.mss, 1200);
+    }
+
+    #[test]
+    fn auto_public_ip_is_manual_only_and_not_resolved_during_config_load() {
+        let mut file = FileConfig::default();
+        file.public_ip = "0.0.0.0".parse().unwrap();
+        file.underlay_ip = "192.0.2.10".parse().unwrap();
+        file.network.gateway_ip = "192.0.2.10".parse().unwrap();
+        file.network.underlay_dev = "eth0".to_string();
+        file.network.vxlan_mtu_auto = false;
+
+        resolve_auto_ips(&mut file).unwrap();
+
+        assert!(file.public_ip.is_unspecified());
+        assert_eq!(file.runtime_discovery.public_ip.value, None);
+        assert_eq!(file.runtime_discovery.public_ip.mode, "auto");
+        assert_eq!(file.runtime_discovery.public_ip.source, "manual");
     }
 
     #[test]

@@ -5,6 +5,7 @@ import type { ProxySyncCursor, ProxyWriteResult } from './proxySync'
 import type {
   BackendNode,
   BackendSubscription,
+  PublicIpDiscovery,
   AutomationTemplate,
   AutomationImportRequest,
   AutomationImportResult,
@@ -84,6 +85,8 @@ export const api = {
     request<ProxyWriteResult<{ status: string; name: string }>>('DELETE', `/api/v1/listener-configs/${encodeURIComponent(name)}`),
   gatewayNodes: () => request<GatewayNode[]>('GET', '/api/v1/nodes/gateways'),
   backendNodes: () => request<BackendNode[]>('GET', '/api/v1/nodes/backends'),
+  discoverPublicIp: () =>
+    request<PublicIpDiscovery>('POST', '/api/v1/nodes/public-ip/discover'),
   backendSubscriptions: () =>
     request<Record<string, BackendSubscription>>('GET', '/api/v1/nodes/backend-subscriptions'),
   apply: () => request<{ status: string }>('POST', '/api/v1/operations/apply'),

@@ -77,6 +77,12 @@ export interface BackendSubscription {
   conflicts?: NodeConflict[]
 }
 
+export interface PublicIpDiscovery {
+  value?: string | null
+  mode: string
+  source: string
+}
+
 export interface NodeConflict {
   severity: string
   kind: string

@@ -55,9 +55,7 @@ import { t as text } from '@/lib/i18n'
 const filterFields: AutomationFilterField[] = [
   'name',
   'underlay_ip',
-  'public_ip',
   'underlay_ip_source',
-  'public_ip_source',
 ]
 const filterOps: AutomationFilterOp[] = [
   'equals',
@@ -260,7 +258,7 @@ function validateTemplate(template: AutomationTemplateForm) {
       if (!value) return text('conditionValueRequired')
       if (condition.op === 'regex' && !validRegex(value)) return text('conditionRegexInvalid')
       if (['in_cidr', 'not_in_cidr'].includes(condition.op)) {
-        if (!['underlay_ip', 'public_ip'].includes(condition.field)) return text('conditionCidrFieldInvalid')
+        if (condition.field !== 'underlay_ip') return text('conditionCidrFieldInvalid')
         if (!validCidr(value)) return text('conditionCidrInvalid')
       }
     }

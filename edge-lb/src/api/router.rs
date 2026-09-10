@@ -61,6 +61,7 @@ pub(in crate::api) fn route(
         (Method::Post, "/api/listener-configs") => handlers::listeners::create_config(cfg, body),
         (Method::Get, "/api/gateway-nodes") => handlers::nodes::gateway_nodes(cfg),
         (Method::Get, "/api/backend-nodes") => handlers::nodes::backend_nodes(cfg),
+        (Method::Post, "/api/nodes/public-ip/discover") => handlers::nodes::discover_public_ip(cfg),
         (Method::Get, "/api/control-backend-subscriptions") => {
             handlers::nodes::control_backend_subscriptions()
         }
@@ -167,6 +168,7 @@ fn canonical_path(path: &str) -> Option<String> {
         "/listener-configs/import" => "/api/listener-configs/import",
         "/nodes/gateways" => "/api/gateway-nodes",
         "/nodes/backends" => "/api/backend-nodes",
+        "/nodes/public-ip/discover" => "/api/nodes/public-ip/discover",
         "/nodes/backend-subscriptions" => "/api/control-backend-subscriptions",
         "/operations/apply" => "/api/apply",
         "/operations/cleanup" => "/api/cleanup",
@@ -299,6 +301,10 @@ mod tests {
             Some("/api/backend-nodes".to_string())
         );
         assert_eq!(
+            canonical_path("/api/v1/nodes/public-ip/discover"),
+            Some("/api/nodes/public-ip/discover".to_string())
+        );
+        assert_eq!(
             canonical_path("/api/v1/operations/failover"),
             Some("/api/failover".to_string())
         );
@@ -324,6 +330,7 @@ mod tests {
             "/api/v1/listener-configs/tcp-udp-443",
             "/api/v1/nodes/gateways",
             "/api/v1/nodes/backends",
+            "/api/v1/nodes/public-ip/discover",
             "/api/v1/nodes/backend-subscriptions",
             "/api/v1/ha/config",
             "/api/v1/ha/status",

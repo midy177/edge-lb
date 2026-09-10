@@ -27,6 +27,13 @@ pub(in crate::api) fn backend_nodes(cfg: &Config) -> Reply {
     Reply::json(200, json!(nodes))
 }
 
+pub(in crate::api) fn discover_public_ip(cfg: &Config) -> Reply {
+    match crate::runtime::discovery::discover_public_ip(&cfg.file) {
+        Ok(value) => Reply::json(200, json!(value)),
+        Err(e) => Reply::error(500, format!("{e:#}")),
+    }
+}
+
 fn gateway_nodes_effective(cfg: &Config) -> Vec<GatewayNode> {
     let mut nodes = cfg.gateway_nodes.clone();
     if !matches!(cfg.node_role, NodeRole::Gateway) {
