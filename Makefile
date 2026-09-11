@@ -13,7 +13,7 @@ VERSION        := $(shell awk -F '"' '/^version[[:space:]]*=/ { print $$2; exit 
 DIST_DIR       := dist
 ZIG_TARGETS    := x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 BUILD_IMAGE    := edge-lb-build:bookworm
-IMAGE_NAME     ?= ghcr.io/midy177/edge-lb
+IMAGE_NAME     ?= ghcr.io/octays/edge-lb
 IMAGE_TAG      ?= v$(VERSION)
 IMAGE_REF      ?= $(IMAGE_NAME):$(IMAGE_TAG)
 LOCAL_PLATFORM ?= linux/amd64

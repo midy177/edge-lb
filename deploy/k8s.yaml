@@ -3,7 +3,7 @@
 # 仅部署 backend 角色（VXLAN 回程 + nft 策略路由）。gateway 仍部署在
 # 独立虚拟机上，通过 [backend.xds] 指向其控制面地址。
 #
-# 镜像：ghcr.io/midy177/edge-lb:0.1.6
+# 镜像：ghcr.io/octays/edge-lb:0.1.7
 #
 # 部署步骤：
 #   1. 私有仓库需要 imagePullSecrets：按下方注释模板创建 Secret，
@@ -110,7 +110,7 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: edge-lb
-          image: ghcr.io/midy177/edge-lb:0.1.6
+          image: ghcr.io/octays/edge-lb:0.1.7
           imagePullPolicy: IfNotPresent
           args:
             - '--config'

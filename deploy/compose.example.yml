@@ -6,8 +6,8 @@
 #   sudo install -m 0644 deploy/config.backend.example.toml /etc/edge-lb/config.toml
 #
 # Start exactly one role on a host:
-#   EDGE_LB_IMAGE=ghcr.io/midy177/edge-lb:0.1.6 docker compose -f deploy/compose.example.yml --profile gateway up -d
-#   EDGE_LB_IMAGE=ghcr.io/midy177/edge-lb:0.1.6 docker compose -f deploy/compose.example.yml --profile backend up -d
+#   EDGE_LB_IMAGE=ghcr.io/octays/edge-lb:0.1.7 docker compose -f deploy/compose.example.yml --profile gateway up -d
+#   EDGE_LB_IMAGE=ghcr.io/octays/edge-lb:0.1.7 docker compose -f deploy/compose.example.yml --profile backend up -d
 #
 # The container runs with host networking because edge-lb owns Linux TC/eBPF,
 # nftables, VXLAN devices, policy routes and VIP addresses on the host.
@@ -15,7 +15,7 @@
 #   sudo sysctl -w net.ipv4.ip_forward=1
 
 x-edge-lb-common: &edge-lb-common
-  image: ${EDGE_LB_IMAGE:-ghcr.io/midy177/edge-lb:0.1.6}
+  image: ${EDGE_LB_IMAGE:-ghcr.io/octays/edge-lb:0.1.7}
   restart: unless-stopped
   network_mode: host
   pid: host

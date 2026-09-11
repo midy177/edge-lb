@@ -53,6 +53,14 @@ pub(in crate::api) fn maybe_paginate_json(items: Vec<Value>, query: &str) -> Val
     if !page.enabled {
         return Value::Array(items);
     }
+    paginate_items(items, page)
+}
+
+pub(in crate::api) fn paginate_json(items: Vec<Value>, query: &str) -> Value {
+    paginate_items(items, page_query(query))
+}
+
+fn paginate_items(items: Vec<Value>, page: PageQuery) -> Value {
     let filtered = if page.q.is_empty() {
         items
     } else {
@@ -148,5 +156,15 @@ mod tests {
         let value = maybe_paginate_json(items, "page=1&per_page=10&q=10.0.0.2");
         assert_eq!(value["total"], 1);
         assert_eq!(value["items"][0]["name"], "udp-53");
+    }
+
+    #[test]
+    fn paginate_json_always_returns_page_shape() {
+        let value = paginate_json(vec![json!({"name":"template-tcp-80"})], "");
+
+        assert_eq!(value["total"], 1);
+        assert_eq!(value["page"], 1);
+        assert_eq!(value["per_page"], 20);
+        assert_eq!(value["items"][0]["name"], "template-tcp-80");
     }
 }

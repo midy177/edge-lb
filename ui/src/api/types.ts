@@ -230,10 +230,6 @@ export interface AutomationTemplate {
   remove_policy: AutomationRemovePolicy
 }
 
-export interface AutomationTemplateList {
-  templates: AutomationTemplate[]
-}
-
 export interface AutomationTemplateExport {
   version: number
   exported_at_unix?: number

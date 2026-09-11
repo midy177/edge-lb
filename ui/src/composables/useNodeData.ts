@@ -85,7 +85,6 @@ export const automationTemplatePage = ref(pageState<AutomationTemplate>())
 export const backendSubscriptions = ref<Record<string, BackendSubscription>>({})
 export const haConfig = ref<GatewayHaConfig | null>(null)
 export const haStatus = ref<GatewayHaStatus | null>(null)
-export const automationTemplates = ref<AutomationTemplate[]>([])
 export const notifications = ref<NotificationChannelSummary[]>([])
 export const notificationEvents = ref<string[]>([])
 export const automationsError = ref('')
@@ -258,12 +257,6 @@ export async function refreshBackendNodePage() {
   const session = dataSession
   const value = await api.backendNodesPage(pageParams(backendNodePage.value))
   if (session !== dataSession) return
-  if (Array.isArray(value)) {
-    backendNodePage.value.items = value
-    backendNodePage.value.total = value.length
-    backendNodePage.value.page = 1
-    return
-  }
   applyPage(backendNodePage.value, value)
 }
 
@@ -341,20 +334,18 @@ export async function refreshNotificationData() {
 export async function refreshAutomationData() {
   automationsError.value = ''
   if (!isGateway.value) {
-    automationTemplates.value = []
+    automationTemplatePage.value.items = []
+    automationTemplatePage.value.total = 0
     return
   }
   try {
-    const [result, page] = await Promise.all([
-      api.automationTemplates(),
+    const [page] = await Promise.all([
       api.automationTemplatesPage(pageParams(automationTemplatePage.value)),
       refreshBackendNodes(),
     ])
-    automationTemplates.value = result.templates
     applyPage(automationTemplatePage.value, page)
   } catch (e) {
     automationsError.value = e instanceof Error ? e.message : String(e)
-    automationTemplates.value = []
     automationTemplatePage.value.items = []
     automationTemplatePage.value.total = 0
   }

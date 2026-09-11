@@ -157,7 +157,8 @@ jobs:
         id: image
         shell: bash
         run: |
-          image="ghcr.io/midy177/edge-lb"
+          repository="${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/${repository}"
           echo "name=${image}" >> "${GITHUB_OUTPUT}"
 
       - name: Compute image metadata

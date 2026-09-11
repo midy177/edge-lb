@@ -44,7 +44,6 @@ import type {
   AutomationTargetGroupTemplate,
 } from '@/api/types'
 import {
-  automationTemplates,
   automationTemplatePage,
   automationsError,
   backendNodes,
@@ -95,7 +94,7 @@ const generatedTargetGroupName = computed(() => {
 })
 
 const formError = computed(() => validateTemplate(form.value))
-const enabledCount = computed(() => automationTemplates.value.filter((item) => item.enabled).length)
+const enabledCount = computed(() => automationTemplatePage.value.items.filter((item) => item.enabled).length)
 
 watch(
   () => automationTemplatePage.value.page,

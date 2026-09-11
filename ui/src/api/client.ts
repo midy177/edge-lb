@@ -9,7 +9,6 @@ import type {
   AutomationTemplate,
   AutomationImportRequest,
   AutomationImportResult,
-  AutomationTemplateList,
   AutomationTemplateExport,
   AutomationTemplateTestResult,
   TargetGroup,
@@ -125,8 +124,6 @@ export const api = {
     request<ProxyWriteResult<{ status: string; id: string }>>('DELETE', `/api/v1/notifications/${encodeURIComponent(id)}`),
   testNotification: (id: string) =>
     request<NotificationDelivery>('POST', `/api/v1/notifications/${encodeURIComponent(id)}/test`),
-  automationTemplates: () =>
-    request<AutomationTemplateList>('GET', '/api/v1/automations'),
   automationTemplatesPage: (params: PageQuery) =>
     request<PageResult<AutomationTemplate>>('GET', withQuery('/api/v1/automations', params)),
   saveAutomationTemplate: (template: AutomationTemplate, oldName?: string) =>

@@ -13,7 +13,7 @@ use crate::{
     provider::native,
 };
 
-use super::common::{maybe_paginate_json, page_query, require_gateway_role};
+use super::common::{paginate_json, require_gateway_role};
 use anyhow::{Context, bail};
 
 #[derive(Debug, Deserialize)]
@@ -41,16 +41,12 @@ pub(in crate::api) fn list(cfg: &Config, query: &str) -> Reply {
     }
     match store::load(cfg) {
         Ok(config) => {
-            if page_query(query).enabled {
-                let items = config
-                    .templates
-                    .into_iter()
-                    .map(|template| serde_json::to_value(template).unwrap())
-                    .collect();
-                Reply::json(200, maybe_paginate_json(items, query))
-            } else {
-                Reply::json(200, serde_json::to_value(config).unwrap())
-            }
+            let items = config
+                .templates
+                .into_iter()
+                .map(|template| serde_json::to_value(template).unwrap())
+                .collect();
+            Reply::json(200, paginate_json(items, query))
         }
         Err(e) => Reply::error(500, format!("{e:#}")),
     }

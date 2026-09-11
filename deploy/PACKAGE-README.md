@@ -47,7 +47,7 @@ Build packages from the repository root:
 ```bash
 make package          # tar.gz bundles
 make deb              # gateway/backend amd64/arm64 Debian packages
-make container-image  # local ghcr.io/midy177/edge-lb:v<version> image
+make container-image  # local ghcr.io/octays/edge-lb:v<version> image
 make container-image-push
 ```
 
@@ -67,12 +67,12 @@ sudo install -d -m 0755 /etc/edge-lb /var/lib/edge-lb /var/log/edge-lb
 # Gateway host
 sudo install -m 0644 deploy/config.gateway.example.toml /etc/edge-lb/config.toml
 sudo sysctl -w net.ipv4.ip_forward=1
-EDGE_LB_IMAGE=ghcr.io/midy177/edge-lb:0.1.6 \
+EDGE_LB_IMAGE=ghcr.io/octays/edge-lb:0.1.7 \
   docker compose -f deploy/compose.example.yml --profile gateway up -d
 
 # Backend host
 sudo install -m 0644 deploy/config.backend.example.toml /etc/edge-lb/config.toml
-EDGE_LB_IMAGE=ghcr.io/midy177/edge-lb:0.1.6 \
+EDGE_LB_IMAGE=ghcr.io/octays/edge-lb:0.1.7 \
   docker compose -f deploy/compose.example.yml --profile backend up -d
 ```
 
