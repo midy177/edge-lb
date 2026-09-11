@@ -69,6 +69,20 @@ ssh ubuntu@129.226.141.9 \
 
 ## 测试结果
 
+## CPS 与吞吐换算
+
+本报告中的 TCP 压测模式为 `tcp_conn_mode=new-per-request`，每个 TCP 请求都会新建一次连接，因此 TCP RPS 可以近似视为 CPS。
+
+| 场景 | TCP 尝试 CPS | TCP 成功 CPS | TCP 失败 CPS | UDP 请求吞吐 |
+| --- | ---: | ---: | ---: | ---: |
+| `concurrency=16`, `timeout=1000ms` | 8734.2 | 8734.2 | 0.0 | 19502.2 req/s |
+| `concurrency=64`, `timeout=1000ms` | 8908.9 | 8906.9 | 2.1 | 31204.1 req/s |
+| `concurrency=64`, `timeout=3000ms` | 8928.1 | 8928.1 | 0.0 | 30856.4 req/s |
+
+本轮已验证的最高稳定 TCP 成功 CPS 为 `8928.1`，对应 `concurrency=64`、`timeout=3000ms`、TCP 成功率 `100.00%`。在 `timeout=1000ms` 的更严格阈值下，TCP 尝试 CPS 为 `8908.9`，成功 CPS 为 `8906.9`，失败 CPS 约 `2.1`。
+
+UDP 使用 `udp_socket_mode=reuse-per-worker`，没有连接建立过程，不能按 CPS 表述；本轮高并发下 UDP 请求吞吐约 `30.9k` 到 `31.2k req/s`。
+
 ### 低并发基线，concurrency=16，timeout=1000ms
 
 | 协议 | total | ok | fail | 成功率 | RPS | p50 | p95 | p99 | max |
