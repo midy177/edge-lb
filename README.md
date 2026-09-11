@@ -56,6 +56,29 @@ edge-lb verify         # both paths + eBPF counters
 Packaging lives in `scripts/package.sh`, `scripts/deb.sh`, and
 `deploy/container.Dockerfile`.
 
+## Debian package installation
+
+Install the role-specific Debian package, write the systemd service
+configuration, then start the daemon:
+
+```bash
+sudo dpkg -i edge-lb-gateway_<version>_<arch>.deb
+sudo edge-lb install service --role gateway
+sudo systemctl enable edge-lb
+sudo systemctl start edge-lb
+sudo journalctl -u edge-lb.service -f
+```
+
+For backend nodes, use the backend package and role:
+
+```bash
+sudo dpkg -i edge-lb-backend_<version>_<arch>.deb
+sudo edge-lb install service --role backend
+sudo systemctl enable edge-lb
+sudo systemctl start edge-lb
+sudo journalctl -u edge-lb.service -f
+```
+
 ## Commands
 
 ```bash

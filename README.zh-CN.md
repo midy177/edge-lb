@@ -50,6 +50,28 @@ edge-lb verify         # 两条路径 + eBPF 计数验证
 打包入口包括 `scripts/package.sh`、`scripts/deb.sh` 和
 `deploy/container.Dockerfile`。
 
+## Debian 包安装
+
+先安装对应角色的 Debian 包，再写入 systemd service 配置并启动 daemon：
+
+```bash
+sudo dpkg -i edge-lb-gateway_<version>_<arch>.deb
+sudo edge-lb install service --role gateway
+sudo systemctl enable edge-lb
+sudo systemctl start edge-lb
+sudo journalctl -u edge-lb.service -f
+```
+
+backend 节点使用 backend 包和 backend 角色：
+
+```bash
+sudo dpkg -i edge-lb-backend_<version>_<arch>.deb
+sudo edge-lb install service --role backend
+sudo systemctl enable edge-lb
+sudo systemctl start edge-lb
+sudo journalctl -u edge-lb.service -f
+```
+
 ## 命令
 
 ```bash
