@@ -7,7 +7,6 @@ use crate::{
     api::response::Reply,
     config::{Config, NodeRole},
     events::{self, EdgeEvent, Severity},
-    role::gateway::{self, ApplyOptions},
     runtime::ha::{self, GatewayHaPeer, GatewayHaRuntimeConfig},
 };
 
@@ -389,16 +388,6 @@ pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
             "vip_bound": vip_bound,
         }),
     )
-}
-
-pub(in crate::api) fn refresh_native_datapath(cfg: &Config) -> Reply {
-    if let Some(reply) = require_gateway(cfg) {
-        return reply;
-    }
-    match gateway::apply(cfg, &ApplyOptions::default()) {
-        Ok(()) => Reply::json(200, json!({ "status": "refreshed" })),
-        Err(e) => Reply::error(500, format!("native gateway refresh failed: {e:#}")),
-    }
 }
 
 pub(in crate::api) fn failover(cfg: &Config, body: &str) -> Reply {

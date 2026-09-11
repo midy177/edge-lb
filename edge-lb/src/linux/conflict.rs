@@ -220,8 +220,8 @@ fn planned_overlay_addrs(cfg: &Config) -> Vec<String> {
     if let Ok(local) = cfg.local_backend() {
         addrs.push(local.overlay_ip);
     }
-    for port in cfg.backend_return_ports() {
-        if let Some(addr) = port.backend_overlay_ip {
+    for path in cfg.backend_return_paths() {
+        if let Some(addr) = path.backend_overlay_ip {
             addrs.push(addr);
         }
     }

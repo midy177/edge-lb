@@ -1,6 +1,5 @@
 pub(super) mod automations;
 pub(super) mod common;
-pub(super) mod config;
 pub(super) mod ha;
 pub(super) mod listeners;
 pub(super) mod nodes;

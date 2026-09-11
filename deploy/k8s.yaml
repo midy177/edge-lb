@@ -49,8 +49,8 @@ data:
   config.toml: |
     # edge-lb backend 配置模板
     #
-    # backend 只连接 gateway xDS-like 控制面，接收 VXLAN、DSCP、回程端口和策略
-    # 路由配置；本机 public_ip、underlay_ip 和 underlay_dev 默认自动发现。
+    # backend 只连接 gateway xDS-like 控制面，接收 VXLAN 和 return path contract；
+    # 本机 public_ip、underlay_ip 和 underlay_dev 默认自动发现。
 
     node_role = "backend"
     # node_name = "backend-1"      # 可选；省略时默认取系统主机名

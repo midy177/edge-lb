@@ -100,27 +100,27 @@ the gateway UI/API and persisted under `state_dir`, not in TOML.
 
 `edge-lb ui serve` (or the gateway daemon, which starts it automatically):
 node status, listener configuration, target groups, automatic target groups,
-notifications, manual failover, and one-click verification. Destructive actions
-always show a summary of what will change before running.
+notifications, manual failover, apply, and cleanup. Destructive actions always
+show a summary of what will change before running.
 
 Standalone `ui serve` also delivers pending HA configuration snapshots for the
 gateway role, but does not start BFD or the datapath. It must own its `state_dir`
 exclusively; do not run it alongside a gateway daemon using the same database.
 
 ```text
-GET/PUT /api/v1/config
 GET     /api/v1/status
 GET     /api/v1/nodes/gateways
 GET     /api/v1/nodes/backends          (runtime xDS registrations)
 GET/POST/PUT/DELETE /api/v1/listener-configs[/{name}]
 GET/POST/PUT/DELETE /api/v1/target-groups[/{name}]
 GET/POST/PUT/DELETE /api/v1/automations[/{name}]
-GET/PUT /api/v1/notifications
+GET/POST /api/v1/notifications
+GET/DELETE /api/v1/notifications/{id}
+POST    /api/v1/notifications/{id}/test
 GET/PUT /api/v1/ha/config
 GET     /api/v1/ha/status
 POST    /api/v1/ha/failover
-POST    /api/v1/operations/{apply|cleanup|failover|verify}
-GET     /api/v1/metrics                 (Prometheus text format)
+POST    /api/v1/operations/{apply|cleanup}
 ```
 
 The server binds `127.0.0.1:18080` by default. Listening on a

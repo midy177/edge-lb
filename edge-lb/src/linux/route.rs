@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, gateway_slot, return_mark, return_table_id};
+use crate::config::Config;
 
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
@@ -469,35 +469,19 @@ struct ReturnRoute {
 
 fn return_routes(cfg: &Config) -> Result<Vec<ReturnRoute>> {
     let mut routes = Vec::new();
-    let fallback_gateway = cfg.active_gateway().ok();
-    let fallback_gateway_overlay = cfg.gateway_overlay_ip().ok();
-    for port in cfg.backend_return_ports() {
-        let dscp = port.dscp.unwrap_or(cfg.network().dscp);
+    for path in cfg.backend_return_paths() {
+        let dscp = path.dscp;
         if dscp > EDGE_DSCP_LIMIT {
             bail!(
-                "backend return port {} has dscp {dscp} outside 0..=63; \
+                "gateway return path has dscp {dscp} outside 0..=63; \
                  the nft match would silently degrade",
-                port.port
             );
         }
-        let gateway_underlay = port
-            .gateway_underlay_ip
-            .or_else(|| fallback_gateway.as_ref().map(|gateway| gateway.underlay_ip));
-        let gateway_overlay = port.gateway_overlay_ip.or(fallback_gateway_overlay);
-        let (Some(gateway_underlay), Some(gateway_overlay)) = (gateway_underlay, gateway_overlay)
-        else {
-            continue;
-        };
-        let slot = gateway_slot(&cfg.gateway_nodes, gateway_underlay);
-        let mark = port.mark.unwrap_or_else(|| return_mark(dscp, slot));
-        let table = port
-            .route_table_id
-            .unwrap_or_else(|| return_table_id(dscp, slot));
         routes.push(ReturnRoute {
-            gateway_underlay,
-            gateway_overlay,
-            mark,
-            table,
+            gateway_underlay: path.gateway_underlay_ip,
+            gateway_overlay: path.gateway_overlay_ip,
+            mark: path.mark,
+            table: path.route_table_id,
         });
     }
     routes.sort_by_key(|route| {
@@ -1265,7 +1249,7 @@ fn is_absent_route_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BackendReturnPort, FileConfig, GatewayNode, Protocol};
+    use crate::config::{FileConfig, GatewayNode, GatewayReturnPath, return_mark, return_table_id};
     use std::path::PathBuf;
     #[test]
     fn return_routes_derive_gateway_slotted_mark_and_table() {
@@ -1286,32 +1270,24 @@ mod tests {
                         overlay_ip: "10.255.16.1/24".to_string(),
                     },
                 ],
-                backend_return_ports: vec![
-                    BackendReturnPort {
-                        backend: None,
-                        address: "192.168.0.14".parse().unwrap(),
-                        protocol: Protocol::Tcp,
-                        port: 8080,
-                        gateway: None,
-                        gateway_underlay_ip: Some("192.168.0.16".parse().unwrap()),
-                        gateway_overlay_ip: Some("10.255.16.1".parse().unwrap()),
+                backend_return_paths: vec![
+                    GatewayReturnPath {
+                        gateway: Some("gateway-b".to_string()),
+                        gateway_underlay_ip: "192.168.0.16".parse().unwrap(),
+                        gateway_overlay_ip: "10.255.16.1".parse().unwrap(),
                         backend_overlay_ip: None,
-                        dscp: Some(40),
-                        mark: None,
-                        route_table_id: None,
+                        dscp: 40,
+                        mark: crate::config::return_mark(40, 1),
+                        route_table_id: crate::config::return_table_id(40, 1),
                     },
-                    BackendReturnPort {
-                        backend: None,
-                        address: "192.168.0.14".parse().unwrap(),
-                        protocol: Protocol::Tcp,
-                        port: 8080,
-                        gateway: None,
-                        gateway_underlay_ip: Some("192.168.0.12".parse().unwrap()),
-                        gateway_overlay_ip: Some("10.255.12.1".parse().unwrap()),
+                    GatewayReturnPath {
+                        gateway: Some("gateway-a".to_string()),
+                        gateway_underlay_ip: "192.168.0.12".parse().unwrap(),
+                        gateway_overlay_ip: "10.255.12.1".parse().unwrap(),
                         backend_overlay_ip: None,
-                        dscp: Some(46),
-                        mark: None,
-                        route_table_id: None,
+                        dscp: 46,
+                        mark: crate::config::return_mark(46, 0),
+                        route_table_id: crate::config::return_table_id(46, 0),
                     },
                 ],
                 ..FileConfig::default()
@@ -1375,18 +1351,14 @@ mod tests {
                         underlay_ip: v4("192.0.2.1"),
                         overlay_ip: "10.44.0.1/24".into(),
                     }],
-                    backend_return_ports: vec![BackendReturnPort {
-                        backend: None,
-                        address: local,
-                        protocol: Protocol::Tcp,
-                        port: 8080,
-                        gateway: None,
-                        gateway_underlay_ip: Some(v4("192.0.2.1")),
-                        gateway_overlay_ip: Some(v4("10.44.0.1")),
+                    backend_return_paths: vec![GatewayReturnPath {
+                        gateway: Some("gateway-a".into()),
+                        gateway_underlay_ip: v4("192.0.2.1"),
+                        gateway_overlay_ip: v4("10.44.0.1"),
                         backend_overlay_ip: None,
-                        dscp: Some(46),
-                        mark: None,
-                        route_table_id: None,
+                        dscp: 46,
+                        mark: crate::config::return_mark(46, 0),
+                        route_table_id: crate::config::return_table_id(46, 0),
                     }],
                     ..Default::default()
                 },

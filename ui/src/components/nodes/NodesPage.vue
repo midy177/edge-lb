@@ -1,7 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { Globe2, Loader2 } from 'lucide-vue-next'
-import { api } from '@/api'
+import { onMounted, watch } from 'vue'
 import {
   Card,
   CardContent,
@@ -9,7 +7,6 @@ import {
   CardHeader,
   CardTitle,
   Badge,
-  Button,
   Table,
   TableBody,
   TableCell,
@@ -17,53 +14,37 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui'
+import PaginationBar from '@/components/common/PaginationBar.vue'
 import { t as text } from '@/lib/i18n'
 import { formatDiscovery } from '@/lib/format'
-import { backendNodes } from '@/composables/useNodeData'
+import { backendNodePage, backendSubscriptionsError, refreshBackendNodePage } from '@/composables/useNodeData'
 
-const publicIpResult = ref('')
-const publicIpError = ref('')
-const discoveringPublicIp = ref(false)
-
-async function discoverPublicIp() {
-  publicIpResult.value = ''
-  publicIpError.value = ''
-  discoveringPublicIp.value = true
-  try {
-    const result = await api.discoverPublicIp()
-    publicIpResult.value = result.value
-      ? `${result.value} (${formatDiscovery(result.mode, result.source)})`
-      : text('publicIpUnresolved')
-  } catch (error) {
-    publicIpError.value = error instanceof Error ? error.message : String(error)
-  } finally {
-    discoveringPublicIp.value = false
-  }
-}
+watch(
+  () => [backendNodePage.value.page, backendNodePage.value.q],
+  () => { void refreshBackendNodePage() },
+)
+onMounted(() => {
+  void refreshBackendNodePage()
+})
 </script>
 
 <template>
         <Card>
           <CardHeader>
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <CardTitle>{{ text('backendNode') }}（{{ backendNodes.length }}）</CardTitle>
-                <CardDescription>{{ text('backendNodesDesc') }}</CardDescription>
-              </div>
-              <div class="flex flex-wrap items-center justify-end gap-2">
-                <Badge v-if="publicIpResult" variant="outline" class="font-mono">{{ publicIpResult }}</Badge>
-                <Button size="sm" variant="outline" :disabled="discoveringPublicIp" @click="discoverPublicIp">
-                  <Loader2 v-if="discoveringPublicIp" class="animate-spin" />
-                  <Globe2 v-else class="size-4" />
-                  {{ text('discoverPublicIp') }}
-                </Button>
-              </div>
-            </div>
-            <p v-if="publicIpError" class="mt-2 rounded-md bg-destructive/10 p-2 text-xs text-destructive">
-              {{ publicIpError }}
-            </p>
+            <CardTitle>{{ text('backendNode') }}（{{ backendNodePage.total }}）</CardTitle>
+            <CardDescription>{{ text('backendNodesDesc') }}</CardDescription>
           </CardHeader>
           <CardContent>
+            <p v-if="backendSubscriptionsError" class="mb-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {{ backendSubscriptionsError }}
+            </p>
+            <PaginationBar
+              v-model:page="backendNodePage.page"
+              v-model:q="backendNodePage.q"
+              :total="backendNodePage.total"
+              :per-page="backendNodePage.per_page"
+              @refresh="refreshBackendNodePage"
+            />
             <Table>
               <TableHeader>
                 <TableRow class="hover:bg-transparent">
@@ -74,7 +55,7 @@ async function discoverPublicIp() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <TableRow v-for="node in backendNodes" :key="node.name">
+                <TableRow v-for="node in backendNodePage.items" :key="node.name">
                   <TableCell class="font-medium">{{ node.name }}</TableCell>
                   <TableCell>
                     <div class="font-mono">{{ node.underlay_ip }}</div>
@@ -98,6 +79,9 @@ async function discoverPublicIp() {
                     </div>
                     <span v-else class="text-muted-foreground">—</span>
                   </TableCell>
+                </TableRow>
+                <TableRow v-if="!backendNodePage.items.length">
+                  <TableCell colspan="4" class="text-muted-foreground">{{ text('empty') }}</TableCell>
                 </TableRow>
               </TableBody>
             </Table>

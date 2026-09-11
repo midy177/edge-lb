@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -23,7 +24,8 @@ struct ManagedHookState {
     vip: String,
 }
 
-static LAST_MANAGED_HOOK_STATE: OnceLock<Mutex<Option<ManagedHookState>>> = OnceLock::new();
+static LAST_MANAGED_HOOK_STATE: OnceLock<Mutex<BTreeMap<PathBuf, ManagedHookState>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeHaState {
@@ -322,19 +324,18 @@ fn apply_managed_hook_state_once(
         state,
         vip: vip.clone(),
     };
-    let lock = LAST_MANAGED_HOOK_STATE.get_or_init(|| Mutex::new(None));
-    if lock
-        .lock()
-        .map(|last| last.as_ref() == Some(&desired))
-        .unwrap_or(false)
+    let key = cfg.state_dir.clone();
+    let lock = LAST_MANAGED_HOOK_STATE.get_or_init(|| Mutex::new(BTreeMap::new()));
     {
-        return Ok(false);
+        let last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.get(&key) == Some(&desired) {
+            return Ok(false);
+        }
     }
 
     run_managed_hook_state(cfg, ha_cfg, state, &vip)?;
-    if let Ok(mut last) = lock.lock() {
-        *last = Some(desired);
-    }
+    let mut last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    last.insert(key, desired);
     Ok(true)
 }
 
@@ -468,7 +469,7 @@ mod tests {
 
     fn reset_test_hooks() {
         if let Some(lock) = LAST_MANAGED_HOOK_STATE.get() {
-            *lock.lock().unwrap() = None;
+            lock.lock().unwrap().clear();
         }
         test_hook_events().lock().unwrap().clear();
     }
@@ -493,12 +494,12 @@ mod tests {
         reset_test_hooks();
         let (cfg, dir) = test_gateway_config("hook-reconcile");
         save_hook_ha_config_with_vip(&dir, "192.0.2.200");
-        fs::write(&cfg.ha.active_state_file, "gateway-a\n").unwrap();
+        cfg.write_active_gateway("gateway-a").unwrap();
         let _ = take_state_dirty();
 
         assert!(reconcile_vip(&cfg).unwrap());
         assert!(!reconcile_vip(&cfg).unwrap());
-        fs::write(&cfg.ha.active_state_file, "gateway-b\n").unwrap();
+        cfg.write_active_gateway("gateway-b").unwrap();
         assert!(reconcile_vip(&cfg).unwrap());
 
         let events: Vec<_> = test_hook_events()

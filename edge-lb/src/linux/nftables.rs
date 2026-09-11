@@ -4,7 +4,7 @@ use std::{ffi::CString, io, mem::size_of, os::fd::RawFd};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{BackendReturnPort, Config, Protocol};
+use crate::config::{Config, GatewayReturnPath};
 
 const NLM_F_REQUEST: u16 = libc::NLM_F_REQUEST as u16;
 const NLM_F_ACK: u16 = libc::NLM_F_ACK as u16;
@@ -35,6 +35,7 @@ const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = libc::NFT_PAYLOAD_TRANSPORT_HEADER as 
 const NFT_CMP_EQ: u32 = libc::NFT_CMP_EQ as u32;
 const NFT_BITWISE_BOOL: u32 = 0;
 const NFT_META_MARK: u32 = libc::NFT_META_MARK as u32;
+const NFT_META_IIFNAME: u32 = libc::NFT_META_IIFNAME as u32;
 const NFT_META_OIFNAME: u32 = libc::NFT_META_OIFNAME as u32;
 const NFT_META_NFPROTO: u32 = libc::NFT_META_NFPROTO as u32;
 const NFT_META_L4PROTO: u32 = libc::NFT_META_L4PROTO as u32;
@@ -131,11 +132,11 @@ pub fn apply_return_path(cfg: &Config) -> Result<()> {
             next_seq(&mut seq),
         );
     }
-    for port in cfg.backend_return_ports() {
+    for path in cfg.backend_return_paths() {
         msg.nft_msg(
             NFT_MSG_NEWRULE,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND,
-            rule_body(cfg, "prerouting", forward_mark_exprs(cfg, &port)?),
+            rule_body(cfg, "prerouting", forward_mark_exprs(cfg, &path)?),
             next_seq(&mut seq),
         );
     }
@@ -283,24 +284,22 @@ fn rule_body_in_table(table: &str, chain: &str, exprs: Vec<Vec<u8>>) -> Vec<u8> 
     body
 }
 
-fn forward_mark_exprs(cfg: &Config, port: &BackendReturnPort) -> Result<Vec<Vec<u8>>> {
-    let dscp = return_dscp(cfg, port);
+fn forward_mark_exprs(cfg: &Config, path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
+    let dscp = path.dscp;
     // Out-of-range dscp used to be truncated to a DSCP-0 match here, which
     // silently matched nothing and dropped the connection into the main
     // table. Fail loudly instead.
     let tos = u8::try_from(dscp << 2)
-        .with_context(|| format!("return port {} dscp {dscp} out of range 0..=63", port.port))?;
-    let mark = port.mark.unwrap_or_else(|| fallback_mark(cfg, port));
+        .with_context(|| format!("gateway return path dscp {dscp} out of range 0..=63"))?;
+    let mark = path.mark;
     Ok(vec![
+        meta_load(NFT_META_IIFNAME),
+        cmp_bytes(&ifname_bytes(&cfg.network().vxlan_dev)),
         meta_load(NFT_META_NFPROTO),
         cmp_u8(NFPROTO_IPV4),
         payload_load(NFT_PAYLOAD_NETWORK_HEADER, 1, 1),
         bitwise_and(1, &[0xfc]),
         cmp_bytes(&[tos]),
-        meta_load(NFT_META_L4PROTO),
-        cmp_u8(protocol_number(port.protocol)),
-        payload_load(NFT_PAYLOAD_TRANSPORT_HEADER, 2, 2),
-        cmp_bytes(&port.port.to_be_bytes()),
         counter(),
         immediate_mark(mark),
         ct_set(NFT_CT_MARK),
@@ -321,28 +320,13 @@ fn reply_mark_exprs(mark: u32) -> Vec<Vec<u8>> {
 
 fn return_marks(cfg: &Config) -> Vec<u32> {
     let mut marks = cfg
-        .backend_return_ports()
+        .backend_return_paths()
         .into_iter()
-        .map(|port| port.mark.unwrap_or_else(|| fallback_mark(cfg, &port)))
+        .map(|path| path.mark)
         .collect::<Vec<_>>();
     marks.sort_unstable();
     marks.dedup();
     marks
-}
-
-fn return_dscp(cfg: &Config, port: &BackendReturnPort) -> u32 {
-    port.dscp.unwrap_or(cfg.network().dscp)
-}
-
-fn fallback_mark(cfg: &Config, port: &BackendReturnPort) -> u32 {
-    let dscp = return_dscp(cfg, port);
-    let gateway = port
-        .gateway_underlay_ip
-        .or_else(|| cfg.active_gateway().ok().map(|gw| gw.underlay_ip));
-    let slot = gateway
-        .map(|underlay| crate::config::gateway_slot(&cfg.gateway_nodes, underlay))
-        .unwrap_or(0);
-    crate::config::return_mark(dscp, slot)
 }
 
 fn mss_clamp_exprs(cfg: &Config) -> Vec<Vec<u8>> {
@@ -358,13 +342,6 @@ fn mss_clamp_exprs(cfg: &Config) -> Vec<Vec<u8>> {
         immediate_bytes(&cfg.backend_cfg().mss.to_be_bytes()[2..]),
         exthdr_tcpopt_write(TCP_OPT_MAXSEG, 2, 2),
     ]
-}
-
-fn protocol_number(protocol: Protocol) -> u8 {
-    match protocol {
-        Protocol::Tcp => 6,
-        Protocol::Udp => 17,
-    }
 }
 
 fn expr(name: &str, build: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
@@ -704,7 +681,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{BackendReturnPort, FileConfig, NetworkConfig};
+    use crate::config::{FileConfig, GatewayReturnPath, NetworkConfig};
 
     #[test]
     fn applies_and_deletes_probe_table_when_privileged() {
@@ -719,32 +696,24 @@ mod tests {
         file.backend.nft_table = format!("edge_lb_test_{}", std::process::id());
         file.backend.ct_mark = 1;
         file.backend.mss = 1410;
-        file.backend_return_ports = vec![
-            BackendReturnPort {
-                backend: None,
-                address: "192.0.2.10".parse().unwrap(),
-                protocol: Protocol::Tcp,
-                port: 8080,
-                gateway: None,
-                gateway_underlay_ip: None,
-                gateway_overlay_ip: None,
-                backend_overlay_ip: None,
-                dscp: None,
-                mark: None,
-                route_table_id: None,
+        file.backend_return_paths = vec![
+            GatewayReturnPath {
+                gateway: Some("gateway-a".to_string()),
+                gateway_underlay_ip: "192.0.2.1".parse().unwrap(),
+                gateway_overlay_ip: "10.44.0.1".parse().unwrap(),
+                backend_overlay_ip: Some("10.44.0.2/24".to_string()),
+                dscp: 46,
+                mark: crate::config::return_mark(46, 0),
+                route_table_id: crate::config::return_table_id(46, 0),
             },
-            BackendReturnPort {
-                backend: None,
-                address: "192.0.2.10".parse().unwrap(),
-                protocol: Protocol::Udp,
-                port: 8080,
-                gateway: None,
-                gateway_underlay_ip: None,
-                gateway_overlay_ip: None,
-                backend_overlay_ip: None,
-                dscp: None,
-                mark: None,
-                route_table_id: None,
+            GatewayReturnPath {
+                gateway: Some("gateway-b".to_string()),
+                gateway_underlay_ip: "192.0.2.2".parse().unwrap(),
+                gateway_overlay_ip: "10.45.0.1".parse().unwrap(),
+                backend_overlay_ip: Some("10.45.0.2/24".to_string()),
+                dscp: 40,
+                mark: crate::config::return_mark(40, 1),
+                route_table_id: crate::config::return_table_id(40, 1),
             },
         ];
         let cfg = Config {

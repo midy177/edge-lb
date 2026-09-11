@@ -78,6 +78,10 @@ export const targetGroups = ref<TargetGroup[]>([])
 export const listeners = ref<ListenerConfig[]>([])
 export const gatewayNodes = ref<GatewayNode[]>([])
 export const backendNodes = ref<BackendNode[]>([])
+export const targetGroupPage = ref(pageState<TargetGroup>())
+export const listenerPage = ref(pageState<ListenerConfig>())
+export const backendNodePage = ref(pageState<BackendNode>())
+export const automationTemplatePage = ref(pageState<AutomationTemplate>())
 export const backendSubscriptions = ref<Record<string, BackendSubscription>>({})
 export const haConfig = ref<GatewayHaConfig | null>(null)
 export const haStatus = ref<GatewayHaStatus | null>(null)
@@ -97,6 +101,34 @@ export const proxyWriteStatus = ref<{ authority: string; state: ProxySyncOutcome
 let proxySyncController: AbortController | null = null
 let pendingAcceptance: ProxyWriteAcceptance | null = null
 let dataSession = 0
+
+function pageState<T>() {
+  return {
+    items: [] as T[],
+    total: 0,
+    page: 1,
+    per_page: 20,
+    q: '',
+  }
+}
+
+function pageParams(state: { page: number; per_page: number; q: string }) {
+  return {
+    page: state.page,
+    per_page: state.per_page,
+    q: state.q.trim() || undefined,
+  }
+}
+
+function applyPage<T>(
+  state: { items: T[]; total: number; page: number; per_page: number; q: string },
+  value: { items: T[]; total: number; page: number; per_page: number },
+) {
+  state.items = value.items
+  state.total = value.total
+  state.page = value.page
+  state.per_page = value.per_page
+}
 
 export function cancelProxySync() {
   proxySyncController?.abort()
@@ -201,15 +233,15 @@ export async function refreshOverviewData() {
 }
 
 export async function refreshNodeData() {
-  await refreshBackendNodes()
+  await Promise.all([refreshBackendNodes(), refreshBackendNodePage(), refreshSubscriptions()])
 }
 
 export async function refreshTargetGroupData() {
-  await Promise.all([refreshBackendNodes(), refreshTargetGroups()])
+  await Promise.all([refreshBackendNodes(), refreshTargetGroups(), refreshTargetGroupPage()])
 }
 
 export async function refreshListenerData() {
-  await Promise.all([refreshBackendNodes(), refreshTargetGroups(), refreshListeners()])
+  await Promise.all([refreshBackendNodes(), refreshTargetGroups(), refreshListeners(), refreshListenerPage()])
 }
 
 export async function refreshGatewayNodes() {
@@ -222,16 +254,41 @@ export async function refreshBackendNodes() {
   if (session === dataSession) backendNodes.value = value
 }
 
+export async function refreshBackendNodePage() {
+  const session = dataSession
+  const value = await api.backendNodesPage(pageParams(backendNodePage.value))
+  if (session !== dataSession) return
+  if (Array.isArray(value)) {
+    backendNodePage.value.items = value
+    backendNodePage.value.total = value.length
+    backendNodePage.value.page = 1
+    return
+  }
+  applyPage(backendNodePage.value, value)
+}
+
 export async function refreshTargetGroups() {
   const session = dataSession
   const value = await api.targetGroups()
   if (session === dataSession) targetGroups.value = value
 }
 
+export async function refreshTargetGroupPage() {
+  const session = dataSession
+  const value = await api.targetGroupsPage(pageParams(targetGroupPage.value))
+  if (session === dataSession) applyPage(targetGroupPage.value, value)
+}
+
 export async function refreshListeners() {
   const session = dataSession
   const value = await api.listenerConfigs()
   if (session === dataSession) listeners.value = value
+}
+
+export async function refreshListenerPage() {
+  const session = dataSession
+  const value = await api.listenerConfigsPage(pageParams(listenerPage.value))
+  if (session === dataSession) applyPage(listenerPage.value, value)
 }
 
 export async function refreshSubscriptions() {
@@ -288,11 +345,38 @@ export async function refreshAutomationData() {
     return
   }
   try {
-    const [result] = await Promise.all([api.automationTemplates(), refreshBackendNodes()])
+    const [result, page] = await Promise.all([
+      api.automationTemplates(),
+      api.automationTemplatesPage(pageParams(automationTemplatePage.value)),
+      refreshBackendNodes(),
+    ])
     automationTemplates.value = result.templates
+    applyPage(automationTemplatePage.value, page)
   } catch (e) {
     automationsError.value = e instanceof Error ? e.message : String(e)
     automationTemplates.value = []
+    automationTemplatePage.value.items = []
+    automationTemplatePage.value.total = 0
+  }
+}
+
+export async function refreshAutomationPage() {
+  const session = dataSession
+  automationsError.value = ''
+  if (!isGateway.value) {
+    automationTemplatePage.value.items = []
+    automationTemplatePage.value.total = 0
+    return
+  }
+  try {
+    const value = await api.automationTemplatesPage(pageParams(automationTemplatePage.value))
+    if (session === dataSession) applyPage(automationTemplatePage.value, value)
+  } catch (e) {
+    if (session === dataSession) {
+      automationsError.value = e instanceof Error ? e.message : String(e)
+      automationTemplatePage.value.items = []
+      automationTemplatePage.value.total = 0
+    }
   }
 }
 
@@ -336,6 +420,10 @@ export function logout() {
   status.value = null
   listeners.value = []
   targetGroups.value = []
+  listenerPage.value.items = []
+  targetGroupPage.value.items = []
+  backendNodePage.value.items = []
+  automationTemplatePage.value.items = []
 }
 
 //! 切 tab 时只刷新当前页需要的数据;status 已加载则复用,不重复拉取。

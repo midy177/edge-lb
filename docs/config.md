@@ -171,23 +171,27 @@ active-backup HA 最多两个地址；超过两个会配置校验失败，不会
 
 ## xDS 下发内容
 
-gateway 下发的是 backend 应用数据面所需的快照，不下发 gateway 运行参数。允许下发：
+gateway 下发的是 backend 回程数据面所需的快照，不下发 gateway 业务配置或运行参数。允许下发：
 
-- active gateway：名称、underlay IP、overlay IP。
 - VXLAN 参数：`overlay_cidr`、gateway VXLAN 接口名、`vni`、`vxlan_port`、`vxlan_mtu`。
-- DSCP：gateway 打标值，backend 按该值识别回程连接。
-- 节点清单：gateway 节点和已注册 backend 节点的 underlay/overlay 地址。
-- 本 backend 相关后端目标：协议、监听指定的目标端口、权重。
+- 本 gateway 节点信息：名称、underlay 地址和 overlay 地址。
+- return path contract：每个 gateway 的 underlay IP、overlay IP、DSCP、fwmark
+  和 route table，以及本 backend 在对应 overlay 中使用的 overlay IP。
 
-运行期服务投影和 `backend_return_ports` 会按订阅 backend 的 underlay IP 裁剪。
-同一个 listener 绑定多个 backend 时，每台 backend 只收到自己的后端目标、
-目标端口、权重和回程端口；不同 backend 可以有不同的代理端口需求。
+backend 不订阅 listener、target group、目标端口、健康探测或运行期服务投影。
+backend nft 回程打标只按 gateway DSCP 识别连接，不匹配 L4 protocol 或 backend
+port；业务监听端口由 gateway DSCP marker 负责限定。return-path 打标还必须匹配
+backend VXLAN ingress 设备，直连 backend 的同 DSCP 流量不会进入 edge-lb 回程路由。
 
 不下发：`[gateway.api]`、`[gateway.reconcile]`
 的本地管理细节，以及 active gateway 运行期状态、
-API token。
+API token、backend inventory 和公网 IP。
 `underlay_dev` 和 `[backend.return_path].vxlan_dev` 是 backend 本机配置，不由
 gateway 覆盖。推荐命名：gateway 使用 `edge-hub`，backend 使用 `edge-return`。
+
+backend 同时订阅两个 HA gateway 时，收到其中一个 gateway 的 snapshot 后不会立刻
+收窄数据面；必须等配置中的两个 gateway snapshot 都到齐，才合并并 apply 多 gateway
+return path。重复收到相同合并版本只 ACK，不重复重建 VXLAN、nft 或策略路由。
 
 gateway 运行时会从 SQLite HA 配置合并 HA peer 到 gateway 节点清单；
 如果某个 HA peer 的 underlay IP 曾经作为 backend 注册过，会从 backend inventory
@@ -349,7 +353,7 @@ native 运行态不提供独立后端目标资源，后端目标、权重和健�
 ## Native Datapath
 
 当前版本不依赖外部负载均衡器、容器运行时或第三方 LB API。gateway 负责加载
-native DNAT/SNAT eBPF，backend 通过 xDS 接收回程端口和网关信息，并配置
+native DNAT/SNAT eBPF，backend 通过 xDS 接收 return path contract，并配置
 VXLAN、nftables 和策略路由。
 
 控制面请求使用短超时和有限重试；配置写入按请求幂等性处理，不对 POST 做通用盲重试。

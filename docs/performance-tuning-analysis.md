@@ -331,7 +331,7 @@ P1 剩余问题：
 
 优先：缓存最小鉴权配置并先认证，限制读取时间/并发重操作，peer Client 复用，阻塞任务隔离。状态读取复用最近观测及 freshness，不因刷新页面执行全量 apply；不把缓存过期状态伪装“健康”。
 
-静态缓存、预压缩资源、分页放在容量证据之后；不为了小规模管理 UI 加完整缓存平台。公开 API 只接受当前 /api/v1 已有保障；内部 canonical_path 再转旧风格路由，以及 operations/failover 与 ha/failover 重复入口，可在有契约测试后精简。
+静态缓存、预压缩资源、分页放在容量证据之后；不为了小规模管理 UI 加完整缓存平台。公开 API 只接受当前 /api/v1 资源面：监听配置、目标组、自动目标组、通知、节点、HA、apply/cleanup。整体配置替换、metrics、HTTP verify、legacy operations/failover 已从公开入口移除，避免 UI/API 接入重新绕回旧模型。
 
 ### 12.4 日志与生命周期
 

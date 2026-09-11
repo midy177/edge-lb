@@ -231,7 +231,12 @@ async fn subscribe_gateway(
         // Merge, version check, apply and commit share one serialization boundary.
         // Waiting for netlink must not block the subscription runtime.
         let result = tokio::task::spawn_blocking(move || {
-            merge_snapshot(&snapshots, &endpoint, resp, apply_cfg.gateway_nodes.len())?;
+            if !merge_snapshot(&snapshots, &endpoint, resp, apply_cfg.gateway_nodes.len())? {
+                tracing::debug!(
+                    "[backend] waiting for all gateway snapshots before datapath apply"
+                );
+                return Ok::<_, anyhow::Error>(None);
+            }
             let _apply_guard = DATAPATH_APPLY_LOCK
                 .lock()
                 .map_err(|_| anyhow::anyhow!("backend datapath apply lock is poisoned"))?;
@@ -249,7 +254,7 @@ async fn subscribe_gateway(
                 .as_ref()
                 .and_then(|last| last.conflicts_for(&combined_version))
             {
-                return Ok::<_, anyhow::Error>(conflicts.to_vec());
+                return Ok::<_, anyhow::Error>(Some(conflicts.to_vec()));
             }
             let conflicts = snapshot::backend_conflicts_for_response(&apply_cfg, &combined)?;
             let mut guard = return_path_guard
@@ -264,16 +269,17 @@ async fn subscribe_gateway(
                 version: combined_version,
                 conflicts: conflicts.clone(),
             });
-            Ok(conflicts)
+            Ok(Some(conflicts))
         })
         .await
         .context("backend snapshot task failed")?;
         match result {
-            Ok(conflicts) => {
+            Ok(Some(conflicts)) => {
                 let _ = tx
                     .send(discovery_request(cfg, &version, &nonce, true, conflicts))
                     .await;
             }
+            Ok(None) => {}
             Err(error) => {
                 let _ = tx
                     .send(
@@ -292,7 +298,7 @@ fn merge_snapshot(
     endpoint: &str,
     resp: crate::control::pb::DiscoveryResponse,
     expected_gateways: usize,
-) -> Result<crate::control::pb::DiscoveryResponse> {
+) -> Result<bool> {
     let mut guard = snapshots
         .lock()
         .map_err(|_| anyhow::anyhow!("snapshot store lock is poisoned"))?;
@@ -307,7 +313,7 @@ fn merge_snapshot(
     let guard = snapshots
         .lock()
         .map_err(|_| anyhow::anyhow!("snapshot store lock is poisoned"))?;
-    snapshot::combine_gateway_responses(guard.values().cloned().collect())
+    Ok(expected_gateways <= 1 || guard.len() >= expected_gateways)
 }
 
 fn endpoint_host(endpoint: &str) -> &str {
@@ -407,5 +413,23 @@ mod tests {
         };
         assert_eq!(applied.conflicts_for("v2"), Some([].as_slice()));
         assert!(applied.conflicts_for("v1").is_none());
+    }
+
+    #[test]
+    fn ha_snapshot_merge_waits_until_all_gateways_are_present() {
+        let snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let one = crate::control::pb::DiscoveryResponse {
+            version: "a".to_string(),
+            nonce: "a".to_string(),
+            snapshot: Some(crate::control::pb::ConfigSnapshot::default()),
+        };
+        let two = crate::control::pb::DiscoveryResponse {
+            version: "b".to_string(),
+            nonce: "b".to_string(),
+            snapshot: Some(crate::control::pb::ConfigSnapshot::default()),
+        };
+
+        assert!(!merge_snapshot(&snapshots, "http://192.0.2.11:22222", one, 2).unwrap());
+        assert!(merge_snapshot(&snapshots, "http://192.0.2.16:22222", two, 2).unwrap());
     }
 }

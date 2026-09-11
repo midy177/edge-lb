@@ -43,17 +43,15 @@ message DiscoveryResponse {
 message ConfigSnapshot {
   Network network = 2;
   repeated GatewayNode gateway_nodes = 3;
-  repeated BackendNode backend_nodes = 4;
-  reserved 5;
-  reserved "services";
-  repeated BackendReturnPort backend_return_ports = 6;
+  reserved 4, 5;
+  reserved "backend_nodes", "services";
+  repeated GatewayReturnPath gateway_return_paths = 6;
 }
 
 message Network {
-  reserved 3;
-  reserved "underlay_dev";
+  reserved 1, 3;
+  reserved "gateway_public_ip", "underlay_dev";
 
-  string gateway_public_ip = 1;
   string gateway_ip = 2;
   string gateway_vxlan_dev = 4;
   uint32 vni = 5;
@@ -65,30 +63,20 @@ message Network {
 
 message GatewayNode {
   string name = 1;
-  string public_ip = 2;
+  reserved 2;
+  reserved "public_ip";
   string underlay_ip = 3;
   string overlay_ip = 4;
 }
 
-message BackendNode {
-  string name = 1;
-  string public_ip = 2;
-  string underlay_ip = 3;
-  string overlay_ip = 4;
-}
-
-message BackendReturnPort {
-  string backend = 1;
-  string address = 2;
-  string protocol = 3;
-  uint32 port = 4;
-  string gateway = 5;
-  string gateway_underlay_ip = 6;
-  string gateway_overlay_ip = 7;
-  uint32 dscp = 8;
-  uint32 mark = 9;
-  uint32 route_table_id = 10;
-  string backend_overlay_ip = 11;
+message GatewayReturnPath {
+  string gateway = 1;
+  string gateway_underlay_ip = 2;
+  string gateway_overlay_ip = 3;
+  string backend_overlay_ip = 4;
+  uint32 dscp = 5;
+  uint32 mark = 6;
+  uint32 route_table_id = 7;
 }
 
 message GatewayPeerInfo {

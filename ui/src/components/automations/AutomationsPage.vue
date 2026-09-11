@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Download, FlaskConical, Loader2, Plus, Save, Trash2, Upload } from 'lucide-vue-next'
 import {
   Badge,
@@ -30,6 +30,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui'
+import PaginationBar from '@/components/common/PaginationBar.vue'
 import { api } from '@/api'
 import type {
   AutomationFilterCondition,
@@ -44,10 +45,12 @@ import type {
 } from '@/api/types'
 import {
   automationTemplates,
+  automationTemplatePage,
   automationsError,
   backendNodes,
   busy,
   refreshAutomationData,
+  refreshAutomationPage,
   run,
 } from '@/composables/useNodeData'
 import { t as text } from '@/lib/i18n'
@@ -93,6 +96,11 @@ const generatedTargetGroupName = computed(() => {
 
 const formError = computed(() => validateTemplate(form.value))
 const enabledCount = computed(() => automationTemplates.value.filter((item) => item.enabled).length)
+
+watch(
+  () => automationTemplatePage.value.page,
+  () => { void refreshAutomationPage() },
+)
 
 function defaultTemplate(): AutomationTemplateForm {
   return {
@@ -411,6 +419,13 @@ function setNodeScope(value: string) {
           >
             {{ automationsError }}
           </div>
+          <PaginationBar
+            v-model:page="automationTemplatePage.page"
+            v-model:q="automationTemplatePage.q"
+            :total="automationTemplatePage.total"
+            :per-page="automationTemplatePage.per_page"
+            @refresh="refreshAutomationPage"
+          />
           <Table>
             <TableHeader>
               <TableRow>
@@ -423,7 +438,7 @@ function setNodeScope(value: string) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              <TableRow v-for="template in automationTemplates" :key="template.name">
+              <TableRow v-for="template in automationTemplatePage.items" :key="template.name">
                 <TableCell>
                   <button class="text-left font-medium hover:underline" @click="openEdit(template)">
                     {{ template.name }}
@@ -455,7 +470,7 @@ function setNodeScope(value: string) {
                   </div>
                 </TableCell>
               </TableRow>
-              <TableRow v-if="!automationTemplates.length">
+              <TableRow v-if="!automationTemplatePage.items.length">
                 <TableCell colspan="6" class="text-muted-foreground">{{ text('empty') }}</TableCell>
               </TableRow>
             </TableBody>

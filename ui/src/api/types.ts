@@ -4,6 +4,20 @@
 export type NodeRole = 'backend' | 'gateway'
 export type Protocol = 'tcp' | 'udp'
 export type LbSelect = 'rr' | 'hash' | 'priority' | 'persist' | 'lc'
+
+export interface PageQuery {
+  page?: number
+  per_page?: number
+  q?: string
+}
+
+export interface PageResult<T> {
+  items: T[]
+  total: number
+  page: number
+  per_page: number
+}
+
 export interface BackendTarget {
   backend?: string | null
   address: string

@@ -8,10 +8,22 @@
 - 监听配置只负责对外地址、对外端口、协议、调度策略、转发模式、目标组绑定和连接超时。
 - 目标组只负责后端地址、权重和健康探测配置；监听配置负责目标转发端口。
 - `Config.services` 和 `TargetEndpoint` 已删除；监听配置和目标组是唯一业务模型。
-  native map 写入、DSCP 端口推导和回程端口推导都必须直接从
-  `listeners + target_groups` 计算，不能重新引入运行期 service 投影。
-- backend xDS 的 `backend_return_ports` 必须优先直接从 `listeners + target_groups`
-  推导，不能下发监听、目标组或任何 gateway 业务配置字段。
+  native map 写入和 DSCP 端口推导都必须直接从 `listeners + target_groups`
+  计算，不能重新引入运行期 service 投影。
+- backend xDS 只下发 backend 配置回程 VXLAN 所必需的 contract：
+  gateway underlay IP、gateway overlay IP、backend overlay IP、VXLAN
+  设备/VNI/端口/MTU，以及每个 gateway 的 DSCP、fwmark 和 route table。
+  不能下发监听、目标组、目标端口、健康探测、backend inventory、公网 IP 或任何
+  gateway 业务配置字段。
+- backend nft 回程打标只按 gateway DSCP 识别连接，不匹配 L4 protocol 或
+  backend port。业务端口边界由 gateway DSCP marker 负责；backend 不再依赖
+  `return_ports` 或监听端口裁剪。
+- backend nft 回程打标必须同时匹配配置中的 backend VXLAN ingress 设备名
+  （默认 `edge-return`）和 DSCP。直连 backend 的业务流量即使带相同 DSCP，也不能被
+  edge-lb return-path 规则设置 `ct mark`。
+- HA backend 同时订阅多个 gateway 时，必须等所有配置中的 gateway snapshot 都收到
+  后再 apply。部分快照只能 ACK 等待或保持现有数据面，不能把已安装的多 gateway
+  return path 收窄成单 gateway。
 - 自动配置模板只生成或覆盖目标组，字段名必须是 `target_group`；不接受
   `listener` 字段别名。
 - 自动配置目标组在没有匹配节点时仍保留组对象，方便监听提前绑定。
@@ -41,7 +53,7 @@
   `overlay_cidr`。peer overlay 允许属于对端网段，不能用本机 `gateway.overlay_ip`
   覆盖，也不能要求所有 `gateway_nodes[].overlay_ip` 都属于本机
   `network.overlay_cidr`。
-- 后端只接收并执行数据面配置，不判断 active gateway，不保存 gateway 的 HA 运行来源。
+- 后端只接收并执行回程数据面配置，不判断 active gateway，不保存 gateway 的 HA 运行来源。
 - IPv4 forwarding 由 gateway 和 backend 启动时幂等开启：gateway 用于 DNAT 后转发，backend 用于容器、桥接地址或其他本地路由目标的回程转发；cleanup 不关闭这个主机级能力。
 
 ## Backend VXLAN reachability
@@ -56,21 +68,21 @@ persisted by edge-lb.
 
 Managed backend return tables may contain `/32` gateway-underlay bypass routes
 via the backend underlay device with the local backend `src` address. These are
-edge-lb-owned routes even if the current xDS snapshot only includes one gateway
-inventory entry, and must not be reported as external `route_table` conflicts.
+edge-lb-owned routes derived from gateway return-path contracts and must not be
+reported as external `route_table` conflicts.
 Ownership is keyed by the known gateway underlay destination plus `/32` route
 shape; it must not depend solely on a transient device-name string such as
 `auto`, `eth0`, `eth0(2)`, or a cloud NIC alias.
-When a backend combines two gateway xDS streams, it must merge `gateway_nodes`
-from every stream. Every per-gateway return table must include host routes for
-all known gateway underlay IPs. A real failure on backend-b showed table
+When a backend combines two gateway xDS streams, it must merge gateway
+return-path contracts from every stream. Every per-gateway return table must
+include host routes for all known gateway underlay IPs. A real failure on backend-b showed table
 `1104` only had `192.168.0.12/32`; VXLAN packets for gateway
 `192.168.0.16` then recursively followed the table default via `edge-return`,
 so only hash selections landing on that backend timed out.
-Backend xDS-derived config validation is role-aware: `gateway_nodes` and
-`backend_nodes` may carry overlay addresses from multiple gateway CIDRs. Only
-the snapshot network's own gateway overlay must belong to that snapshot CIDR;
-peer gateway/backend overlays are inventory for route/FDB convergence, not
+Backend xDS-derived config validation is role-aware: gateway return-path
+contracts may carry overlay addresses from multiple gateway CIDRs. Only the
+snapshot network's own gateway overlay must belong to that snapshot CIDR; peer
+gateway/backend overlays are return-path data for route/FDB convergence, not
 members of the current overlay.
 
 ## Recorded incident: VXLAN return path

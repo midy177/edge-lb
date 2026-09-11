@@ -102,24 +102,6 @@ pub(in crate::api) fn test(cfg: &Config, id: &str) -> Reply {
     }
 }
 
-pub(in crate::api) fn replace_config(cfg: &Config, body: &str) -> Reply {
-    if let Some(reply) = require_gateway(cfg) {
-        return reply;
-    }
-    let value: NotificationConfig = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(e) => return Reply::error(400, format!("bad notification config JSON: {e}")),
-    };
-    let value = match store::normalize_config(value) {
-        Ok(value) => value,
-        Err(e) => return Reply::error(400, format!("{e:#}")),
-    };
-    match sync::save_authoritative(cfg, &value) {
-        Ok(sync) => Reply::json(200, json!({ "status": "saved", "sync": sync })),
-        Err(e) => Reply::error(500, format!("{e:#}")),
-    }
-}
-
 pub(in crate::api) fn peer_replace_active(cfg: &Config, body: &str) -> Reply {
     if let Some(reply) = require_gateway(cfg) {
         return reply;

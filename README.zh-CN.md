@@ -90,25 +90,25 @@ node_role = "gateway"        # gateway | backend
 ## 管理 UI / API
 
 `edge-lb ui serve`（或 gateway daemon 自带）：节点状态、监听配置、目标组、
-自动目标组、通知、主备切换和一键验证；危险操作先展示变更摘要。
+自动目标组、通知、主备切换、apply 和 cleanup；危险操作先展示变更摘要。
 
 gateway 角色的独立 `ui serve` 也会发送待同步的 HA 配置，但不启动 BFD 或数据面。
 该进程必须独占 `state_dir`，不要与使用同一数据库的 gateway daemon 同时运行。
 
 ```text
-GET/PUT /api/v1/config
 GET     /api/v1/status
 GET     /api/v1/nodes/gateways
 GET     /api/v1/nodes/backends          （运行时 xDS 注册）
 GET/POST/PUT/DELETE /api/v1/listener-configs[/{name}]
 GET/POST/PUT/DELETE /api/v1/target-groups[/{name}]
 GET/POST/PUT/DELETE /api/v1/automations[/{name}]
-GET/PUT /api/v1/notifications
+GET/POST /api/v1/notifications
+GET/DELETE /api/v1/notifications/{id}
+POST    /api/v1/notifications/{id}/test
 GET/PUT /api/v1/ha/config
 GET     /api/v1/ha/status
 POST    /api/v1/ha/failover
-POST    /api/v1/operations/{apply|cleanup|failover|verify}
-GET     /api/v1/metrics                 （Prometheus 文本）
+POST    /api/v1/operations/{apply|cleanup}
 ```
 
 默认只监听 `127.0.0.1:18080`；监听非 loopback 必须配置 `gateway.api.auth_token`

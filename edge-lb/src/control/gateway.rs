@@ -271,6 +271,8 @@ impl ConfigDiscovery for GatewayDiscovery {
         let local_cfg = ha::reciprocal_config(&incoming, &local, &caller)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         ha::save_for_state_dir(state_dir, &local_cfg).map_err(internal_status)?;
+        cfg.write_active_gateway(&ha::initial_active_gateway_key(&local_cfg, &local, &caller))
+            .map_err(internal_status)?;
 
         let caller_secret = ha::new_session_token_secret(&caller, req.session_token);
         ha::save_secrets_for_state_dir(state_dir, &caller_secret).map_err(internal_status)?;

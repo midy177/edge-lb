@@ -15,7 +15,7 @@ impl ManagedReturnPath {
 }
 
 pub fn apply(cfg: &Config) -> Result<()> {
-    if cfg.backend_return_ports().is_empty() {
+    if cfg.backend_return_paths().is_empty() {
         nft::delete_table(cfg);
         return Ok(());
     }
@@ -26,7 +26,7 @@ pub fn apply_managed_reusing(
     cfg: &Config,
     _existing: Option<ManagedReturnPath>,
 ) -> Result<ManagedReturnPath> {
-    if cfg.backend_return_ports().is_empty() {
+    if cfg.backend_return_paths().is_empty() {
         nft::delete_table(cfg);
     } else {
         nft::apply(cfg)?;
@@ -45,7 +45,7 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
 }
 
 pub fn heal(cfg: &Config) -> Result<()> {
-    if cfg.backend_return_ports().is_empty() {
+    if cfg.backend_return_paths().is_empty() {
         nft::delete_table(cfg);
     } else if !nft::table_exists(cfg) {
         nft::apply(cfg)?;

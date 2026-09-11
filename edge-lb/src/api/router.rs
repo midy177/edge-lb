@@ -17,20 +17,19 @@ pub(in crate::api) fn route(
     path: &str,
     body: &str,
     cfg: &Config,
-    config_path: &std::path::Path,
+    _config_path: &std::path::Path,
 ) -> Reply {
-    if !path.starts_with("/api/v1/") {
+    let (path_only, query) = split_path_query(path);
+    if !path_only.starts_with("/api/v1/") {
         return Reply::error(404, "API path must use /api/v1");
     }
-    let Some(canonical) = canonical_path(path) else {
+    let Some(canonical) = canonical_path(path_only) else {
         return Reply::error(404, format!("unknown API path: {path}"));
     };
     let path = canonical.as_str();
     match (method, path) {
         (Method::Get, "/api/status") => handlers::status::status(cfg),
-        (Method::Get, "/api/config") => Reply::json(200, serde_json::to_value(&cfg.file).unwrap()),
-        (Method::Put, "/api/config") => handlers::config::put_config(cfg, config_path, body),
-        (Method::Get, "/api/target-groups") => handlers::target_groups::target_groups(cfg),
+        (Method::Get, "/api/target-groups") => handlers::target_groups::target_groups(cfg, query),
         (Method::Get, "/api/target-groups/export") => {
             handlers::target_groups::export_target_groups(cfg)
         }
@@ -53,22 +52,20 @@ pub(in crate::api) fn route(
                 path.trim_start_matches("/api/target-groups/"),
             )
         }
-        (Method::Get, "/api/listener-configs") => handlers::listeners::list_configs(cfg),
+        (Method::Get, "/api/listener-configs") => handlers::listeners::list_configs(cfg, query),
         (Method::Get, "/api/listener-configs/export") => handlers::listeners::export_configs(cfg),
         (Method::Post, "/api/listener-configs/import") => {
             handlers::listeners::import_configs(cfg, body)
         }
         (Method::Post, "/api/listener-configs") => handlers::listeners::create_config(cfg, body),
         (Method::Get, "/api/gateway-nodes") => handlers::nodes::gateway_nodes(cfg),
-        (Method::Get, "/api/backend-nodes") => handlers::nodes::backend_nodes(cfg),
+        (Method::Get, "/api/backend-nodes") => handlers::nodes::backend_nodes(cfg, query),
         (Method::Post, "/api/nodes/public-ip/discover") => handlers::nodes::discover_public_ip(cfg),
         (Method::Get, "/api/control-backend-subscriptions") => {
             handlers::nodes::control_backend_subscriptions()
         }
         (Method::Post, "/api/apply") => handlers::ops::apply(cfg),
         (Method::Post, "/api/cleanup") => handlers::ops::cleanup(cfg),
-        (Method::Post, "/api/failover") => handlers::ops::failover(cfg, body),
-        (Method::Post, "/api/verify") => handlers::ops::verify(cfg),
         (Method::Get, "/api/ha/config") => handlers::ha::get_config(cfg),
         (Method::Put, "/api/ha/config") => handlers::ha::put_config(cfg, body),
         (Method::Get, "/api/ha/status") => handlers::ha::status(cfg),
@@ -90,11 +87,9 @@ pub(in crate::api) fn route(
         (Method::Post, "/api/ha/pair") => handlers::ha::pair(cfg, body),
         (Method::Delete, "/api/ha/pair") => handlers::ha::unpair(cfg),
         (Method::Post, "/api/ha/failover") => handlers::ha::failover(cfg, body),
-        (Method::Post, "/api/ha/refresh-datapath") => handlers::ha::refresh_native_datapath(cfg),
         (Method::Get, "/api/notifications") => handlers::notifications::list(cfg),
-        (Method::Put, "/api/notifications") => handlers::notifications::replace_config(cfg, body),
         (Method::Post, "/api/notifications") => handlers::notifications::save(cfg, body),
-        (Method::Get, "/api/automation-templates") => handlers::automations::list(cfg),
+        (Method::Get, "/api/automation-templates") => handlers::automations::list(cfg, query),
         (Method::Post, "/api/automation-templates") => handlers::automations::create(cfg, body),
         (Method::Get, "/api/automation-templates/export") => handlers::automations::export(cfg),
         (Method::Post, "/api/automation-templates/import") => {
@@ -106,12 +101,12 @@ pub(in crate::api) fn route(
         (Method::Put, "/api/ha/peer/automation-templates/replica") => {
             handlers::automations::peer_replace_replica(cfg, body)
         }
-        (Method::Get, "/api/metrics") => handlers::status::metrics(cfg),
         _ => route_named(method, path, body, cfg),
     }
 }
 
 pub(in crate::api) fn load_options(method: &Method, path: &str) -> LoadOptions {
+    let (path, _) = split_path_query(path);
     let Some(canonical) = canonical_path(path) else {
         return LoadOptions::default();
     };
@@ -132,16 +127,17 @@ pub(in crate::api) fn load_options(method: &Method, path: &str) -> LoadOptions {
         && !peer_write;
     let needs_backend_subscriptions = matches!(
         (method, path),
-        (Method::Get, "/api/backend-nodes")
-            | (Method::Post, "/api/apply")
-            | (Method::Post, "/api/ha/refresh-datapath")
-            | (Method::Post, "/api/verify")
+        (Method::Get, "/api/backend-nodes") | (Method::Post, "/api/apply")
     );
 
     LoadOptions {
         hydrate_proxy: proxy_read || proxy_write,
         merge_backend_subscriptions: needs_backend_subscriptions || proxy_read || proxy_write,
     }
+}
+
+fn split_path_query(path: &str) -> (&str, &str) {
+    path.split_once('?').unwrap_or((path, ""))
 }
 
 /// The public entry point accepts only the current `/api/v1` resource surface.
@@ -159,7 +155,6 @@ fn canonical_path(path: &str) -> Option<String> {
     }
     let mapped = match rest {
         "/status" => "/api/status",
-        "/config" => "/api/config",
         "/target-groups" => "/api/target-groups",
         "/target-groups/export" => "/api/target-groups/export",
         "/target-groups/import" => "/api/target-groups/import",
@@ -172,8 +167,6 @@ fn canonical_path(path: &str) -> Option<String> {
         "/nodes/backend-subscriptions" => "/api/control-backend-subscriptions",
         "/operations/apply" => "/api/apply",
         "/operations/cleanup" => "/api/cleanup",
-        "/operations/failover" => "/api/failover",
-        "/operations/verify" => "/api/verify",
         "/ha/config" => "/api/ha/config",
         "/ha/status" => "/api/ha/status",
         "/ha/proxy-config-sync" => "/api/ha/proxy-config-sync",
@@ -187,9 +180,7 @@ fn canonical_path(path: &str) -> Option<String> {
         "/ha/peer/automation-templates/replica" => "/api/ha/peer/automation-templates/replica",
         "/ha/pair" => "/api/ha/pair",
         "/ha/failover" => "/api/ha/failover",
-        "/ha/refresh-datapath" => "/api/ha/refresh-datapath",
         "/notifications" => "/api/notifications",
-        "/metrics" => "/api/metrics",
         _ => {
             if rest.starts_with("/target-groups/")
                 || rest.starts_with("/listener-configs/")
@@ -246,7 +237,6 @@ fn route_named(method: &Method, path: &str, body: &str, cfg: &Config) -> Reply {
         }
         return match method {
             Method::Get => handlers::notifications::get(cfg, rest),
-            Method::Put => handlers::notifications::save(cfg, body),
             Method::Delete => handlers::notifications::delete(cfg, rest),
             _ => Reply::error(405, "method not allowed"),
         };
@@ -272,7 +262,7 @@ fn route_named(method: &Method, path: &str, body: &str, cfg: &Config) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_path;
+    use super::{canonical_path, split_path_query};
 
     #[test]
     fn v1_listener_config_paths_dispatch_to_listener_config_handlers() {
@@ -305,8 +295,8 @@ mod tests {
             Some("/api/nodes/public-ip/discover".to_string())
         );
         assert_eq!(
-            canonical_path("/api/v1/operations/failover"),
-            Some("/api/failover".to_string())
+            canonical_path("/api/v1/ha/failover"),
+            Some("/api/ha/failover".to_string())
         );
         assert_eq!(canonical_path("/api/v1/automation-templates"), None);
         assert_eq!(
@@ -323,20 +313,31 @@ mod tests {
         let paths = [
             "/api/v1/status",
             "/api/v1/target-groups",
+            "/api/v1/target-groups/web",
             "/api/v1/target-groups/export",
             "/api/v1/target-groups/import",
             "/api/v1/listener-configs",
             "/api/v1/listener-configs/export",
+            "/api/v1/listener-configs/import",
             "/api/v1/listener-configs/tcp-udp-443",
             "/api/v1/nodes/gateways",
             "/api/v1/nodes/backends",
             "/api/v1/nodes/public-ip/discover",
             "/api/v1/nodes/backend-subscriptions",
             "/api/v1/ha/config",
+            "/api/v1/ha/pair",
+            "/api/v1/ha/failover",
             "/api/v1/ha/status",
             "/api/v1/notifications",
+            "/api/v1/notifications/webhook",
+            "/api/v1/notifications/webhook/test",
             "/api/v1/automations",
+            "/api/v1/automations/template-tcp-80",
+            "/api/v1/automations/template-tcp-80/test",
+            "/api/v1/automations/export",
+            "/api/v1/automations/import",
             "/api/v1/operations/apply",
+            "/api/v1/operations/cleanup",
         ];
 
         for path in paths {
@@ -345,5 +346,29 @@ mod tests {
                 "v1 path was not normalized: {path}"
             );
         }
+    }
+
+    #[test]
+    fn unused_public_v1_paths_are_rejected() {
+        for path in [
+            "/api/v1/config",
+            "/api/v1/metrics",
+            "/api/v1/operations/failover",
+            "/api/v1/operations/verify",
+            "/api/v1/ha/refresh-datapath",
+        ] {
+            assert_eq!(canonical_path(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn query_string_is_not_part_of_canonical_path() {
+        let (path, query) = split_path_query("/api/v1/listener-configs?page=2&per_page=20");
+        assert_eq!(path, "/api/v1/listener-configs");
+        assert_eq!(query, "page=2&per_page=20");
+        assert_eq!(
+            canonical_path(path),
+            Some("/api/listener-configs".to_string())
+        );
     }
 }

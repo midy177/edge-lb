@@ -5,6 +5,8 @@ use crate::{
     config::{Config, GatewayNode, NodeRole},
 };
 
+use super::common::maybe_paginate_json;
+
 pub(in crate::api) fn control_backend_subscriptions() -> Reply {
     match crate::control::active_backend_subscriptions_status() {
         Ok(subs) => Reply::json(200, subs),
@@ -16,7 +18,7 @@ pub(in crate::api) fn gateway_nodes(cfg: &Config) -> Reply {
     Reply::json(200, json!(gateway_nodes_effective(cfg)))
 }
 
-pub(in crate::api) fn backend_nodes(cfg: &Config) -> Reply {
+pub(in crate::api) fn backend_nodes(cfg: &Config, query: &str) -> Reply {
     let subscriptions =
         crate::control::active_backend_subscriptions_status().unwrap_or_else(|_| json!({}));
     let nodes = if matches!(cfg.node_role, NodeRole::Gateway) {
@@ -24,7 +26,7 @@ pub(in crate::api) fn backend_nodes(cfg: &Config) -> Reply {
     } else {
         local_backend_nodes(cfg, &subscriptions)
     };
-    Reply::json(200, json!(nodes))
+    Reply::json(200, maybe_paginate_json(nodes, query))
 }
 
 pub(in crate::api) fn discover_public_ip(cfg: &Config) -> Reply {

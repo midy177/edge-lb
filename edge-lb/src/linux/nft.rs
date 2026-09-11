@@ -16,14 +16,11 @@ pub fn ruleset(cfg: &Config) -> String {
     let n = cfg.network();
     let b = cfg.backend_cfg();
     let mut forward_rules = String::new();
-    for port in cfg.backend_return_ports() {
-        let mark = port.mark.unwrap_or_else(|| fallback_mark(cfg, &port));
+    for path in cfg.backend_return_paths() {
         forward_rules.push_str(&format!(
-            "        ip dscp {dscp} {proto} dport {port} counter ct mark set {mark:#x}\n",
-            dscp = return_dscp(cfg, &port),
-            proto = port.protocol.as_str(),
-            port = port.port,
-            mark = mark,
+            "        ip dscp {dscp} counter ct mark set {mark:#x}\n",
+            dscp = path.dscp,
+            mark = path.mark,
         ));
     }
     let mut reply_rules = String::new();
@@ -58,28 +55,13 @@ pub fn ruleset(cfg: &Config) -> String {
 
 fn return_marks(cfg: &Config) -> Vec<u32> {
     let mut marks = cfg
-        .backend_return_ports()
+        .backend_return_paths()
         .into_iter()
-        .map(|port| port.mark.unwrap_or_else(|| fallback_mark(cfg, &port)))
+        .map(|path| path.mark)
         .collect::<Vec<_>>();
     marks.sort_unstable();
     marks.dedup();
     marks
-}
-
-fn return_dscp(cfg: &Config, port: &crate::config::BackendReturnPort) -> u32 {
-    port.dscp.unwrap_or(cfg.network().dscp)
-}
-
-fn fallback_mark(cfg: &Config, port: &crate::config::BackendReturnPort) -> u32 {
-    let dscp = return_dscp(cfg, port);
-    let gateway = port
-        .gateway_underlay_ip
-        .or_else(|| cfg.active_gateway().ok().map(|gw| gw.underlay_ip));
-    let slot = gateway
-        .map(|underlay| crate::config::gateway_slot(&cfg.gateway_nodes, underlay))
-        .unwrap_or(0);
-    crate::config::return_mark(dscp, slot)
 }
 
 pub fn apply(cfg: &Config) -> Result<()> {

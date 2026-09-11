@@ -29,11 +29,12 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
+import PaginationBar from '@/components/common/PaginationBar.vue'
 import { api, type ListenerConfig } from '@/api'
 import { t as text } from '@/lib/i18n'
 import { listenerSelectOptions } from '@/lib/lb'
-import { busy, listeners, run, status, targetGroups } from '@/composables/useNodeData'
+import { busy, listenerPage, refreshListenerPage, run, status, targetGroups } from '@/composables/useNodeData'
 import {
   canSubmitListener,
   applyListenerTargetGroup,
@@ -75,6 +76,11 @@ async function onListenerImport(event: Event) {
   await run(text('import'), async () => api.importListenerConfigs(JSON.parse(await file.text())))
   ;(event.target as HTMLInputElement).value = ''
 }
+
+watch(
+  () => listenerPage.value.page,
+  () => { void refreshListenerPage() },
+)
 </script>
 
 <template>
@@ -82,7 +88,7 @@ async function onListenerImport(event: Event) {
           <CardHeader>
             <div class="flex items-start justify-between gap-3">
               <div>
-                <CardTitle>{{ text('navListeners') }}（{{ listeners.length }}）</CardTitle>
+                <CardTitle>{{ text('navListeners') }}（{{ listenerPage.total }}）</CardTitle>
                 <CardDescription>{{ text('listenerDesc') }}</CardDescription>
               </div>
               <div class="flex flex-wrap justify-end gap-2">
@@ -94,6 +100,13 @@ async function onListenerImport(event: Event) {
             </div>
           </CardHeader>
           <CardContent>
+            <PaginationBar
+              v-model:page="listenerPage.page"
+              v-model:q="listenerPage.q"
+              :total="listenerPage.total"
+              :per-page="listenerPage.per_page"
+              @refresh="refreshListenerPage"
+            />
             <Table>
               <TableHeader>
                 <TableRow class="hover:bg-transparent">
@@ -106,7 +119,7 @@ async function onListenerImport(event: Event) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <TableRow v-for="listener in listeners" :key="listener.name" class="align-top">
+                <TableRow v-for="listener in listenerPage.items" :key="listener.name" class="align-top">
                   <TableCell class="font-medium">{{ listener.name }}</TableCell>
                   <TableCell class="font-mono text-xs">{{ externalIps(listener) }}</TableCell>
                   <TableCell class="font-mono">{{ listener.port }}</TableCell>
@@ -182,6 +195,9 @@ async function onListenerImport(event: Event) {
                       <Trash2 />
                     </Button>
                   </TableCell>
+                </TableRow>
+                <TableRow v-if="!listenerPage.items.length">
+                  <TableCell colspan="6" class="text-muted-foreground">{{ text('empty') }}</TableCell>
                 </TableRow>
               </TableBody>
             </Table>

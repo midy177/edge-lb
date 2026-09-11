@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    common::require_gateway_role,
+    common::{maybe_paginate_json, require_gateway_role},
     proxy_config::{self, ProxyConfigOperation},
 };
 
@@ -85,12 +85,21 @@ impl From<ListenerConfigResource> for Listener {
     }
 }
 
-pub(in crate::api) fn list_configs(cfg: &Config) -> Reply {
+pub(in crate::api) fn list_configs(cfg: &Config, query: &str) -> Reply {
     if let Some(reply) = require_gateway_role(cfg) {
         return reply;
     }
     match persisted_listeners(cfg) {
-        Ok(listeners) => Reply::json(200, serde_json::to_value(listeners).unwrap()),
+        Ok(listeners) => Reply::json(
+            200,
+            maybe_paginate_json(
+                listeners
+                    .into_iter()
+                    .map(|listener| serde_json::to_value(listener).unwrap())
+                    .collect(),
+                query,
+            ),
+        ),
         Err(e) => Reply::error(500, format!("loading listeners: {e:#}")),
     }
 }
@@ -141,7 +150,16 @@ pub(in crate::api) fn import_configs_local(cfg: &Config, body: &str) -> Reply {
                     format!("duplicate listener {} in import", listener.name),
                 ));
             }
-            edit_snapshot(cfg, state, listener, &ListenerMutation::Create)?;
+            let mutation = if state
+                .listeners
+                .iter()
+                .any(|item| item.name == listener.name)
+            {
+                ListenerMutation::Update(listener.name.as_str())
+            } else {
+                ListenerMutation::Create
+            };
+            edit_snapshot(cfg, state, listener, &mutation)?;
         }
         Ok(())
     }) {
@@ -497,6 +515,38 @@ mod tests {
 
         validate_listener_config(&cfg, &listener, None, &cfg.listeners, &cfg.target_groups)
             .expect("empty target groups must not block listener creation");
+    }
+
+    #[test]
+    fn listener_import_upserts_existing_names() {
+        let cfg = test_cfg();
+        let mut state = snapshot();
+        edit_snapshot(
+            &cfg,
+            &mut state,
+            &test_listener(8080),
+            &ListenerMutation::Create,
+        )
+        .unwrap();
+        let mut imported = test_listener(8080);
+        imported.target_port = 18081;
+        let listeners = vec![imported.clone()];
+
+        for listener in &listeners {
+            let mutation = if state
+                .listeners
+                .iter()
+                .any(|item| item.name == listener.name)
+            {
+                ListenerMutation::Update(listener.name.as_str())
+            } else {
+                ListenerMutation::Create
+            };
+            edit_snapshot(&cfg, &mut state, listener, &mutation).unwrap();
+        }
+
+        assert_eq!(state.listeners.len(), 1);
+        assert_eq!(state.listeners[0].target_port, 18081);
     }
 
     #[test]

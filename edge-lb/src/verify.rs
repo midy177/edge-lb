@@ -10,12 +10,10 @@ use crate::{cli::VerifyArgs, config::Config, linux::dscp};
 pub struct VerifyOutcome {
     pub vip_ok: bool,
     pub backend_ok: bool,
-    pub detail: String,
 }
 
 pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
     let n = cfg.network();
-    let mut detail = String::new();
     let mut vip_ok = false;
     let mut backend_ok = false;
 
@@ -25,11 +23,9 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
         match curl(&url, args.timeout) {
             Ok((code, body)) => {
                 vip_ok = code == 200;
-                detail.push_str(&format!("VIP {url} -> {code} {body}\n"));
                 println!("   HTTP {code} {body}");
             }
             Err(e) => {
-                detail.push_str(&format!("VIP {url} -> ERROR {e}\n"));
                 println!("   ERROR: {e}");
             }
         }
@@ -46,11 +42,9 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
         match curl(&url, args.timeout) {
             Ok((code, body)) => {
                 backend_ok = code == 200;
-                detail.push_str(&format!("backend {url} -> {code} {body}\n"));
                 println!("   HTTP {code} {body}");
             }
             Err(e) => {
-                detail.push_str(&format!("backend {url} -> ERROR {e}\n"));
                 println!("   ERROR: {e}");
             }
         }
@@ -60,7 +54,6 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
             "== DSCP marker: matched={} changed={}",
             stats.matched, stats.changed
         );
-        detail.push_str(format!("dscp stats: {stats:?}\n").as_str());
         if stats.matched == 0 {
             println!("   NOTE: no packets matched yet; generate VIP traffic first");
         }
@@ -78,11 +71,7 @@ pub fn run_checks(cfg: &Config, args: &VerifyArgs) -> Result<VerifyOutcome> {
         n.vxlan_dev,
         n.vxlan_port
     );
-    Ok(VerifyOutcome {
-        vip_ok,
-        backend_ok,
-        detail,
-    })
+    Ok(VerifyOutcome { vip_ok, backend_ok })
 }
 
 fn vip_port(cfg: &Config) -> u16 {

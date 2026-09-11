@@ -142,25 +142,14 @@ pub struct BackendNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendReturnPort {
-    pub backend: Option<String>,
-    pub address: IpAddr,
-    pub protocol: Protocol,
-    pub port: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+pub struct GatewayReturnPath {
     pub gateway: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_underlay_ip: Option<IpAddr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_overlay_ip: Option<IpAddr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_underlay_ip: IpAddr,
+    pub gateway_overlay_ip: IpAddr,
     pub backend_overlay_ip: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dscp: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mark: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_table_id: Option<u32>,
+    pub dscp: u32,
+    pub mark: u32,
+    pub route_table_id: u32,
 }
 
 /// Marks and route-table ids for the return path are derived per
@@ -751,7 +740,7 @@ pub struct FileConfig {
     pub target_groups: Vec<TargetGroup>,
     pub listeners: Vec<Listener>,
     #[serde(skip)]
-    pub backend_return_ports: Vec<BackendReturnPort>,
+    pub backend_return_paths: Vec<GatewayReturnPath>,
     #[serde(skip)]
     pub runtime_discovery: RuntimeDiscovery,
     pub gateway: GatewayConfig,
@@ -777,7 +766,7 @@ impl Default for FileConfig {
             backend_nodes: Vec::new(),
             target_groups: Vec::new(),
             listeners: Vec::new(),
-            backend_return_ports: Vec::new(),
+            backend_return_paths: Vec::new(),
             runtime_discovery: RuntimeDiscovery::default(),
             gateway: GatewayConfig::default(),
             backend: BackendConfig::default(),

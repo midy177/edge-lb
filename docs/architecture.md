@@ -68,16 +68,19 @@ netlink socket。规则层只删除"属于 edge-lb mark/table 范围且不再是
 
 所有路由写入使用 `NLM_F_CREATE|NLM_F_REPLACE` 原子替换：已正确的路由不会被
 先删后建，失败时原有路由保持原位。规则
-优先级被外来规则占用时自动顺延，不覆盖。每个回程端口的 DSCP 超出 0..=63 时
+优先级被外来规则占用时自动顺延，不覆盖。每条 return path 的 DSCP 超出 0..=63 时
 直接报错，不再静默截断为 DSCP 0 匹配。
 
-gateway 下发的 snapshot 只包含 backend 数据面所需内容：active gateway、
-overlay CIDR、gateway VXLAN 接口名、VNI、VXLAN 端口、MTU、DSCP、gateway/backend
-节点清单，以及当前 default-mode listener + target group 推导出的本 backend
-相关回程端口。gateway/backend 节点清单保持全量下发，用于 VXLAN overlay 拓扑；
-业务 listener、target group、健康探测配置和运行期服务投影不进入 backend xDS。
-`backend_return_ports` 按订阅 backend 的 underlay IP 裁剪，不同 backend 可以收到
-不同的回程端口、gateway DSCP、mark 和 route table。
+gateway 下发的 snapshot 只包含 backend 回程数据面所需内容：overlay CIDR、
+gateway VXLAN 接口名、VNI、VXLAN 端口、MTU、本 gateway 节点信息，以及本
+gateway 的 return path contract。contract 包含 gateway underlay IP、
+gateway overlay IP、本 backend overlay IP、DSCP、fwmark 和 route table。
+backend inventory、公网 IP、业务 listener、target group、目标端口、健康探测配置
+和运行期服务投影不进入 backend xDS，也不参与 backend snapshot version 计算。
+
+HA 多 gateway 下，backend 会合并多个 gateway stream。只有已收到所有配置中的
+gateway snapshot 后才会 apply；缺少任一 gateway 时只保持当前数据面并等待，避免
+某一条 xDS 先恢复时把已有 return path 临时收窄成单 gateway。
 
 HA 多 gateway 下，backend 会同时配置多套回程路径。回程 mark 和 route table 由
 **(gateway slot, DSCP)** 二元组派生，单一实现在 `config/model.rs`：
@@ -88,9 +91,10 @@ mark  = 0x1000 | ((slot+1) << 6) | dscp      # slot 0 → 0x1040..0x107f
 table = 1000 + (slot+1)*64 + dscp            # slot 0 → 1064..1127
 ```
 
-两台 gateway 即使配置相同 DSCP 也不会共享 mark/table。backend nft 按 DSCP
-区分回程连接打 `ct mark`，policy route 再把不同 mark 的回包送入对应 gateway
-的 VXLAN 下一跳。
+两台 gateway 即使配置相同 DSCP 也不会共享 mark/table。backend nft 只在包从
+backend VXLAN 设备进入时按 DSCP 区分来自不同 gateway 的回程连接并打 `ct mark`，
+不匹配 L4 protocol 或 backend port；直连业务流量即使携带相同 DSCP 也不会被捕获。
+policy route 再把不同 mark 的回包送入对应 gateway 的 VXLAN 下一跳。
 `edge-return` 同时持有多个本地 overlay 地址和多个 VXLAN FDB peer；overlay
 镜像地址与网关自身或其他 backend 已占地址冲突时跳过并告警，不抢占。
 

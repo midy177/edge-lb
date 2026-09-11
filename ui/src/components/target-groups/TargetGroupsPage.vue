@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { Download, Eye, Pencil, Plus, Trash2, Upload } from 'lucide-vue-next'
 import {
   Badge,
@@ -30,12 +30,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui'
+import PaginationBar from '@/components/common/PaginationBar.vue'
 import { api, type BackendTarget, type TargetGroup } from '@/api'
 import { t as text } from '@/lib/i18n'
 import {
   healthVariant,
 } from '@/lib/lb'
-import { backendNodes, busy, run, targetGroups } from '@/composables/useNodeData'
+import { backendNodes, busy, refreshTargetGroupPage, run, targetGroupPage } from '@/composables/useNodeData'
 
 type GroupForm = {
   name: string
@@ -188,6 +189,10 @@ function targetHealth(target: BackendTarget, group: TargetGroup) {
   return target.health ? { currState: target.health } : undefined
 }
 
+watch(
+  () => targetGroupPage.value.page,
+  () => { void refreshTargetGroupPage() },
+)
 </script>
 
 <template>
@@ -195,7 +200,7 @@ function targetHealth(target: BackendTarget, group: TargetGroup) {
           <CardHeader>
             <div class="flex items-start justify-between gap-4">
               <div>
-                <CardTitle>{{ text('targetGroup') }}（{{ targetGroups.length }}）</CardTitle>
+                <CardTitle>{{ text('targetGroup') }}（{{ targetGroupPage.total }}）</CardTitle>
                 <CardDescription>{{ text('targetGroupDesc') }}</CardDescription>
               </div>
               <div class="flex flex-wrap justify-end gap-2">
@@ -207,6 +212,13 @@ function targetHealth(target: BackendTarget, group: TargetGroup) {
             </div>
           </CardHeader>
           <CardContent>
+            <PaginationBar
+              v-model:page="targetGroupPage.page"
+              v-model:q="targetGroupPage.q"
+              :total="targetGroupPage.total"
+              :per-page="targetGroupPage.per_page"
+              @refresh="refreshTargetGroupPage"
+            />
             <div class="overflow-x-auto">
             <Table class="min-w-[800px] table-fixed">
               <TableHeader>
@@ -220,7 +232,7 @@ function targetHealth(target: BackendTarget, group: TargetGroup) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <TableRow v-for="group in targetGroups" :key="group.name" class="align-top">
+                <TableRow v-for="group in targetGroupPage.items" :key="group.name" class="align-top">
                   <TableCell class="font-medium">{{ group.name }}</TableCell>
                   <TableCell>
                     <span class="text-sm">{{ group.targets.length }} {{ text('targetGroupMembers') }}</span>
@@ -256,6 +268,9 @@ function targetHealth(target: BackendTarget, group: TargetGroup) {
                       <Button size="icon" variant="ghost" class="text-destructive" :title="text('delete')" @click="deleteGroup(group)"><Trash2 /></Button>
                     </div>
                   </TableCell>
+                </TableRow>
+                <TableRow v-if="!targetGroupPage.items.length">
+                  <TableCell colspan="6" class="text-muted-foreground">{{ text('empty') }}</TableCell>
                 </TableRow>
               </TableBody>
             </Table>

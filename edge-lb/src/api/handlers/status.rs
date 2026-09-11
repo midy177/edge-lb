@@ -67,22 +67,3 @@ pub(in crate::api) fn status(cfg: &Config) -> Reply {
     }
     Reply::json(200, value)
 }
-
-pub(in crate::api) fn metrics(cfg: &Config) -> Reply {
-    let mut text =
-        std::fs::read_to_string(std::path::Path::new(&*cfg.state_dir).join("edge-lb-backend.prom"))
-            .unwrap_or_default();
-    if let Ok(stats) = crate::linux::dscp::stats(cfg) {
-        text.push_str(&format!(
-            "# TYPE edge_lb_dscp_packets_total counter\n\
-             edge_lb_dscp_packets_total{{kind=\"matched\"}} {}\n\
-             edge_lb_dscp_packets_total{{kind=\"changed\"}} {}\n",
-            stats.matched, stats.changed
-        ));
-    }
-    Reply {
-        status: 200,
-        content_type: "text/plain; version=0.0.4".into(),
-        body: text.into_bytes(),
-    }
-}

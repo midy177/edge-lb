@@ -48,14 +48,14 @@ fn apply_with(
     let gw = backend_gateway_reference(cfg)?;
     let local = cfg.local_backend().context("resolving local backend")?;
     let n = cfg.network();
-    let return_ports = cfg.backend_return_ports();
+    let return_paths = cfg.backend_return_paths();
     // A backend may forward replies from a container, bridge, or another
     // local address. Forwarding is required and capacity knobs are raised
     // conservatively for production.
     crate::linux::sysctl::ensure_backend_datapath_tuning()
         .with_context(|| "applying backend datapath sysctl tuning")?;
     tracing::info!(
-        "[backend] apply node={} return_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} gateway_reference={} gateway_underlay={} gateway_overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} return_engine=nftables",
+        "[backend] apply node={} return_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} gateway_reference={} gateway_underlay={} gateway_overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} return_paths={} return_engine=nftables",
         cfg.node_name,
         n.vxlan_dev,
         n.underlay_dev,
@@ -69,8 +69,7 @@ fn apply_with(
         n.vni,
         n.vxlan_port,
         n.vxlan_mtu,
-        n.dscp,
-        return_ports.len(),
+        return_paths.len(),
     );
     let created = ensure_vxlan(cfg, gw.underlay_ip)?;
     if let Some((local_addrs, peers)) = multipoint_return_vxlan(cfg) {
@@ -109,10 +108,8 @@ fn apply_with(
         return_path::apply(cfg)?;
         None
     };
-    if return_ports.is_empty() {
-        tracing::info!(
-            "[backend] return-path engine nftables cleared: no default-mode backend ports"
-        );
+    if return_paths.is_empty() {
+        tracing::info!("[backend] return-path engine nftables cleared: no gateway return paths");
     } else {
         tracing::info!(
             "[backend] return-path engine nftables applied (nft table inet {})",
@@ -120,8 +117,8 @@ fn apply_with(
         );
     }
     return_path::ensure_policy_routing(cfg)?;
-    if return_ports.is_empty() {
-        tracing::info!("[backend] policy routing cleared: no default-mode backend ports");
+    if return_paths.is_empty() {
+        tracing::info!("[backend] policy routing cleared: no gateway return paths");
     } else if let Some((_, peers)) = multipoint_return_vxlan(cfg) {
         tracing::info!(
             "[backend] policy routing: per-gateway return paths applied for {} gateway peer(s)",
@@ -136,19 +133,6 @@ fn apply_with(
         );
     }
     Ok(return_path_guard)
-}
-
-/// One reconcile pass: switch the return path when the active gateway
-/// changed, heal drift otherwise. Used by the daemon loop and the failover
-/// API for immediate effect.
-pub fn reconcile_once(cfg: &Config) -> Result<()> {
-    let gw = cfg.active_gateway().context("resolving active gateway")?;
-    let n = cfg.network();
-    if net::vxlan_remote(&n.vxlan_dev) == Some(gw.underlay_ip) {
-        heal(cfg, gw.underlay_ip)
-    } else {
-        switch_active(cfg, &gw)
-    }
 }
 
 pub fn run(cfg: &Config) -> Result<()> {
@@ -293,15 +277,16 @@ fn ensure_vxlan(cfg: &Config, remote: IpAddr) -> Result<bool> {
 fn multipoint_return_vxlan(cfg: &Config) -> Option<(Vec<String>, Vec<IpAddr>)> {
     let mut local_addrs = Vec::new();
     let mut peers = Vec::new();
-    for port in cfg.backend_return_ports() {
-        if let Some(addr) = port.backend_overlay_ip {
+    for path in cfg.backend_return_paths() {
+        if let Some(addr) = path.backend_overlay_ip {
             local_addrs.push(addr);
         }
-        if let Some(peer) = port.gateway_underlay_ip {
-            peers.push(peer);
-        }
+        peers.push(path.gateway_underlay_ip);
     }
-    if matches!(cfg.ha.active_source, ActiveSource::Xds) && cfg.gateway_nodes.len() > 1 {
+    if local_addrs.is_empty()
+        && matches!(cfg.ha.active_source, ActiveSource::Xds)
+        && cfg.gateway_nodes.len() > 1
+    {
         for addr in ha_backend_overlay_addrs(cfg) {
             local_addrs.push(addr);
         }

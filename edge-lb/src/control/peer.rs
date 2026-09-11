@@ -104,6 +104,7 @@ async fn pair_gateway_async(
     let local_cfg = ha::config_with_peer(desired, &local, &peer)?;
     let state_dir = Path::new(&*cfg.state_dir);
     ha::save_for_state_dir(state_dir, &local_cfg)?;
+    cfg.write_active_gateway(&ha::initial_active_gateway_key(&local_cfg, &local, &peer))?;
     let secret = ha::new_session_token_secret(&peer, session_token);
     ha::save_secrets_for_state_dir(state_dir, &secret)?;
 

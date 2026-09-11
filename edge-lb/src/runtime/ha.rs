@@ -536,6 +536,24 @@ pub fn config_with_peer(
     Ok(next)
 }
 
+pub fn initial_active_gateway_key(
+    cfg: &GatewayHaRuntimeConfig,
+    local: &GatewayIdentity,
+    peer: &GatewayIdentity,
+) -> String {
+    if let Some(preferred) = cfg.preferred_active.as_deref() {
+        let preferred = preferred.trim();
+        if !preferred.is_empty() {
+            return preferred.to_string();
+        }
+    }
+    if cfg.self_index == 0 {
+        local.name.clone()
+    } else {
+        peer.name.clone()
+    }
+}
+
 pub fn validate_identity_pair(local: &GatewayIdentity, peer: &GatewayIdentity) -> Result<()> {
     if local.name.trim().is_empty() {
         bail!("local gateway name is required");
@@ -1097,6 +1115,52 @@ mod tests {
         assert_eq!(cfg.peers[0].name, "gateway-a");
         assert_eq!(cfg.peers[0].dscp, Some(46));
         assert_eq!(cfg.peers[0].overlay_cidr.as_deref(), Some("10.255.12.0/24"));
+    }
+
+    #[test]
+    fn initial_active_gateway_uses_preferred_active_on_both_peers() {
+        let local = test_identity("gateway-a", "192.168.0.12", "10.255.12.0/24", 46);
+        let peer = test_identity("gateway-b", "192.168.0.16", "10.255.16.0/24", 40);
+        let input = GatewayHaRuntimeConfig {
+            enabled: true,
+            self_index: 0,
+            preferred_active: Some("gateway-a".to_string()),
+            ..GatewayHaRuntimeConfig::default()
+        };
+        let initiator = config_with_peer(&input, &local, &peer).unwrap();
+        let receiver = reciprocal_config(&input, &peer, &local).unwrap();
+
+        assert_eq!(
+            initial_active_gateway_key(&initiator, &local, &peer),
+            "gateway-a"
+        );
+        assert_eq!(
+            initial_active_gateway_key(&receiver, &peer, &local),
+            "gateway-a"
+        );
+    }
+
+    #[test]
+    fn initial_active_gateway_falls_back_to_self_index() {
+        let local = test_identity("gateway-a", "192.168.0.12", "10.255.12.0/24", 46);
+        let peer = test_identity("gateway-b", "192.168.0.16", "10.255.16.0/24", 40);
+        let initiator = GatewayHaRuntimeConfig {
+            self_index: 0,
+            ..GatewayHaRuntimeConfig::default()
+        };
+        let receiver = GatewayHaRuntimeConfig {
+            self_index: 1,
+            ..GatewayHaRuntimeConfig::default()
+        };
+
+        assert_eq!(
+            initial_active_gateway_key(&initiator, &local, &peer),
+            "gateway-a"
+        );
+        assert_eq!(
+            initial_active_gateway_key(&receiver, &peer, &local),
+            "gateway-a"
+        );
     }
 
     #[test]

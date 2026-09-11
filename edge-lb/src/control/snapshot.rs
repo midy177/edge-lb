@@ -10,8 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{
-        self, ActiveSource, BackendNode, BackendReturnPort, Config, FileConfig, GatewayNode,
-        NetworkConfig, Protocol,
+        self, ActiveSource, Config, FileConfig, GatewayNode, GatewayReturnPath, NetworkConfig,
     },
     control::pb::{self, ConfigSnapshot, DiscoveryResponse},
 };
@@ -37,7 +36,7 @@ pub fn log_send(node_name: &str, resp: &DiscoveryResponse) {
     };
     let network = snapshot.network.as_ref();
     tracing::debug!(
-        "[control] sending snapshot to {} version {} gateway_vxlan_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
+        "[control] sending snapshot to {} version {} gateway_vxlan_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} return_paths={}",
         node_name,
         resp.version,
         network
@@ -49,9 +48,7 @@ pub fn log_send(node_name: &str, resp: &DiscoveryResponse) {
         network.map(|n| n.vni).unwrap_or_default(),
         network.map(|n| n.vxlan_port).unwrap_or_default(),
         network.map(|n| n.vxlan_mtu).unwrap_or_default(),
-        network.map(|n| n.dscp).unwrap_or_default(),
-        snapshot.backend_return_ports.len(),
-        snapshot.backend_nodes.len(),
+        snapshot.gateway_return_paths.len(),
     );
 }
 
@@ -66,7 +63,7 @@ pub fn log_recv(cfg: &Config, resp: &DiscoveryResponse) {
     };
     let network = snapshot.network.as_ref();
     tracing::debug!(
-        "[backend] xDS received snapshot version {} nonce {} gateway_vxlan_dev={} local_return_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} dscp={} return_ports={} backends={}",
+        "[backend] xDS received snapshot version {} nonce {} gateway_vxlan_dev={} local_return_dev={} overlay_cidr={} vni={} vxlan_port={} mtu={} return_paths={}",
         resp.version,
         resp.nonce,
         network
@@ -79,9 +76,7 @@ pub fn log_recv(cfg: &Config, resp: &DiscoveryResponse) {
         network.map(|n| n.vni).unwrap_or_default(),
         network.map(|n| n.vxlan_port).unwrap_or_default(),
         network.map(|n| n.vxlan_mtu).unwrap_or_default(),
-        network.map(|n| n.dscp).unwrap_or_default(),
-        snapshot.backend_return_ports.len(),
-        snapshot.backend_nodes.len(),
+        snapshot.gateway_return_paths.len(),
     );
 }
 
@@ -134,12 +129,10 @@ pub fn combine_gateway_responses(responses: Vec<DiscoveryResponse>) -> Result<Di
         .and_then(|resp| resp.snapshot.clone())
         .context("missing latest snapshot")?;
     combined.gateway_nodes.clear();
-    combined.backend_nodes.clear();
-    combined.backend_return_ports.clear();
+    combined.gateway_return_paths.clear();
 
     let mut gateway_keys = BTreeSet::new();
-    let mut backend_keys = BTreeSet::new();
-    let mut port_keys = BTreeSet::new();
+    let mut path_keys = BTreeSet::new();
     let mut versions = Vec::new();
     for resp in responses {
         versions.push(resp.version);
@@ -152,24 +145,16 @@ pub fn combine_gateway_responses(responses: Vec<DiscoveryResponse>) -> Result<Di
                 combined.gateway_nodes.push(gateway);
             }
         }
-        for backend in snapshot.backend_nodes {
-            let key = (backend.underlay_ip.clone(), backend.name.clone());
-            if backend_keys.insert(key) {
-                combined.backend_nodes.push(backend);
-            }
-        }
-        for port in snapshot.backend_return_ports {
+        for path in snapshot.gateway_return_paths {
             let key = (
-                port.gateway_underlay_ip.clone(),
-                port.address.clone(),
-                port.protocol.clone(),
-                port.port,
-                port.dscp,
-                port.mark,
-                port.route_table_id,
+                path.gateway_underlay_ip.clone(),
+                path.gateway_overlay_ip.clone(),
+                path.dscp,
+                path.mark,
+                path.route_table_id,
             );
-            if port_keys.insert(key) {
-                combined.backend_return_ports.push(port);
+            if path_keys.insert(key) {
+                combined.gateway_return_paths.push(path);
             }
         }
     }
@@ -202,29 +187,17 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
     };
     let source_gateway = source_gateway(cfg, &fallback);
     let gateway_overlay_ip = overlay_addr(&source_gateway.overlay_ip, "gateway overlay_ip")?;
+    let backend_overlay_ip = cfg
+        .backend_nodes_effective()
+        .into_iter()
+        .find(|backend| backend.underlay_ip == backend_underlay)
+        .map(|backend| backend.overlay_ip)
+        .unwrap_or_default();
     // Marks/tables are gateway-slotted so two HA gateways never share one
     // return table.
     let slot = config::gateway_slot(&cfg.gateway_nodes, source_gateway.underlay_ip);
-    let backend_return_ports = backend_return_ports_from_config(cfg)
-        .into_iter()
-        .filter(|p| p.address == backend_underlay)
-        .map(|p| pb::BackendReturnPort {
-            backend: p.backend.clone().unwrap_or_default(),
-            address: p.address.to_string(),
-            protocol: p.protocol.as_str().to_string(),
-            port: p.port as u32,
-            gateway: source_gateway.name.clone(),
-            gateway_underlay_ip: source_gateway.underlay_ip.to_string(),
-            gateway_overlay_ip: gateway_overlay_ip.to_string(),
-            dscp: n.dscp,
-            mark: config::return_mark(n.dscp, slot),
-            route_table_id: config::return_table_id(n.dscp, slot),
-            backend_overlay_ip: p.backend_overlay_ip.unwrap_or_default(),
-        })
-        .collect();
     let mut snapshot = ConfigSnapshot {
         network: Some(pb::Network {
-            gateway_public_ip: source_gateway.public_ip.to_string(),
             gateway_ip: source_gateway.underlay_ip.to_string(),
             overlay_cidr: n.overlay_cidr.clone(),
             gateway_vxlan_dev: n.vxlan_dev.clone(),
@@ -233,33 +206,23 @@ fn from_config_for_backend(cfg: &Config, backend_underlay: IpAddr) -> Result<Con
             vxlan_mtu: n.vxlan_mtu,
             dscp: n.dscp,
         }),
-        gateway_nodes: cfg
-            .gateway_nodes
-            .iter()
-            .map(|g| pb::GatewayNode {
-                name: g.name.clone(),
-                public_ip: g.public_ip.to_string(),
-                underlay_ip: g.underlay_ip.to_string(),
-                overlay_ip: g.overlay_ip.clone(),
-            })
-            .collect(),
-        backend_nodes: cfg
-            .backend_nodes_effective()
-            .iter()
-            .map(|b| pb::BackendNode {
-                name: b.name.clone(),
-                public_ip: b.public_ip.to_string(),
-                underlay_ip: b.underlay_ip.to_string(),
-                overlay_ip: b.overlay_ip.clone(),
-            })
-            .collect(),
-        backend_return_ports,
+        gateway_nodes: vec![pb::GatewayNode {
+            name: source_gateway.name.clone(),
+            underlay_ip: source_gateway.underlay_ip.to_string(),
+            overlay_ip: source_gateway.overlay_ip.clone(),
+        }],
+        gateway_return_paths: vec![pb::GatewayReturnPath {
+            gateway: source_gateway.name.clone(),
+            gateway_underlay_ip: source_gateway.underlay_ip.to_string(),
+            gateway_overlay_ip: gateway_overlay_ip.to_string(),
+            backend_overlay_ip,
+            dscp: n.dscp,
+            mark: config::return_mark(n.dscp, slot),
+            route_table_id: config::return_table_id(n.dscp, slot),
+        }],
     };
     snapshot
         .gateway_nodes
-        .sort_by(|a, b| a.underlay_ip.cmp(&b.underlay_ip).then(a.name.cmp(&b.name)));
-    snapshot
-        .backend_nodes
         .sort_by(|a, b| a.underlay_ip.cmp(&b.underlay_ip).then(a.name.cmp(&b.name)));
     Ok(snapshot)
 }
@@ -271,9 +234,10 @@ fn file_from_snapshot(base: &Config, snapshot: &ConfigSnapshot) -> Result<FileCo
         .context("snapshot missing network")?;
     let mut file = base.file.clone();
     let local_vxlan_dev = file.network.vxlan_dev.clone();
+    let gateway_ip = parse_ip(&network.gateway_ip, "gateway_ip")?;
     file.network = NetworkConfig {
-        gateway_public_ip: parse_ip(&network.gateway_public_ip, "gateway_public_ip")?,
-        gateway_ip: parse_ip(&network.gateway_ip, "gateway_ip")?,
+        gateway_public_ip: gateway_ip,
+        gateway_ip,
         standby_gateway_ip: None,
         backend_public_ip: file.network.backend_public_ip,
         backend_ip: file.network.backend_ip,
@@ -294,99 +258,53 @@ fn file_from_snapshot(base: &Config, snapshot: &ConfigSnapshot) -> Result<FileCo
         .gateway_nodes
         .iter()
         .map(|g| {
+            let underlay_ip = parse_ip(&g.underlay_ip, "gateway underlay_ip")?;
             Ok(GatewayNode {
                 name: g.name.clone(),
-                public_ip: parse_ip(&g.public_ip, "gateway public_ip")?,
-                underlay_ip: parse_ip(&g.underlay_ip, "gateway underlay_ip")?,
+                public_ip: underlay_ip,
+                underlay_ip,
                 overlay_ip: g.overlay_ip.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    file.backend_nodes = snapshot
-        .backend_nodes
-        .iter()
-        .map(|b| {
-            Ok(BackendNode {
-                name: b.name.clone(),
-                public_ip: parse_ip(&b.public_ip, "backend public_ip")?,
-                underlay_ip: parse_ip(&b.underlay_ip, "backend underlay_ip")?,
-                overlay_ip: b.overlay_ip.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let local = local_backend_for_snapshot(base, &file)?;
+    let mut local = base.local_backend()?;
     file.listeners.clear();
     file.target_groups.clear();
-    file.backend_return_ports = snapshot
-        .backend_return_ports
+    file.backend_return_paths = snapshot
+        .gateway_return_paths
         .iter()
-        .filter_map(|p| backend_return_port_from_proto_for_local(p, local.underlay_ip).transpose())
+        .map(|path| gateway_return_path_from_proto(path, local.overlay_ip.clone()))
         .collect::<Result<Vec<_>>>()?;
+    if let Some(overlay) = file
+        .backend_return_paths
+        .iter()
+        .filter_map(|path| path.backend_overlay_ip.clone())
+        .next()
+    {
+        local.overlay_ip = overlay;
+    }
+    file.backend_nodes = vec![local];
     file.ha.active_source = ActiveSource::Xds;
     file.normalize();
     file.validate()?;
     Ok(file)
 }
 
-fn backend_return_ports_from_config(cfg: &Config) -> Vec<BackendReturnPort> {
-    let mut ports = cfg.listener_backend_return_ports();
-    if ports.is_empty() {
-        ports = cfg.backend_return_ports();
-    }
-    ports.sort_by(|a, b| {
-        (
-            a.backend.as_deref().unwrap_or_default(),
-            a.address,
-            a.protocol.as_str(),
-            a.port,
-        )
-            .cmp(&(
-                b.backend.as_deref().unwrap_or_default(),
-                b.address,
-                b.protocol.as_str(),
-                b.port,
-            ))
-    });
-    ports.dedup_by(|a, b| {
-        a.backend == b.backend
-            && a.address == b.address
-            && a.protocol == b.protocol
-            && a.port == b.port
-            && a.gateway_underlay_ip == b.gateway_underlay_ip
-            && a.dscp == b.dscp
-            && a.mark == b.mark
-            && a.route_table_id == b.route_table_id
-    });
-    ports
-}
-
-fn backend_return_port_from_proto_for_local(
-    port: &pb::BackendReturnPort,
-    local_underlay: IpAddr,
-) -> Result<Option<BackendReturnPort>> {
-    let address = parse_ip(&port.address, "backend return port address")?;
-    if address != local_underlay {
-        return Ok(None);
-    }
-    let protocol = match port.protocol.as_str() {
-        "tcp" => Protocol::Tcp,
-        "udp" => Protocol::Udp,
-        other => bail!("unknown backend return port protocol {other:?}"),
-    };
-    Ok(Some(BackendReturnPort {
-        backend: (!port.backend.is_empty()).then(|| port.backend.clone()),
-        address,
-        protocol,
-        port: u16::try_from(port.port).context("backend return port out of range")?,
-        gateway: (!port.gateway.is_empty()).then(|| port.gateway.clone()),
-        gateway_underlay_ip: parse_optional_ip(&port.gateway_underlay_ip, "gateway_underlay_ip")?,
-        gateway_overlay_ip: parse_optional_ip(&port.gateway_overlay_ip, "gateway_overlay_ip")?,
-        backend_overlay_ip: (!port.backend_overlay_ip.is_empty())
-            .then(|| port.backend_overlay_ip.clone()),
-        dscp: (port.dscp > 0).then_some(port.dscp),
-        mark: (port.mark > 0).then_some(port.mark),
-        route_table_id: (port.route_table_id > 0).then_some(port.route_table_id),
-    }))
+fn gateway_return_path_from_proto(
+    path: &pb::GatewayReturnPath,
+    local_backend_overlay: String,
+) -> Result<GatewayReturnPath> {
+    Ok(GatewayReturnPath {
+        gateway: (!path.gateway.is_empty()).then(|| path.gateway.clone()),
+        gateway_underlay_ip: parse_ip(&path.gateway_underlay_ip, "gateway_underlay_ip")?,
+        gateway_overlay_ip: parse_ip(&path.gateway_overlay_ip, "gateway_overlay_ip")?,
+        backend_overlay_ip: (!path.backend_overlay_ip.is_empty())
+            .then(|| path.backend_overlay_ip.clone())
+            .or(Some(local_backend_overlay)),
+        dscp: path.dscp,
+        mark: path.mark,
+        route_table_id: path.route_table_id,
+    })
 }
 
 fn source_gateway<'a>(cfg: &'a Config, fallback: &'a GatewayNode) -> &'a GatewayNode {
@@ -403,37 +321,6 @@ fn overlay_addr(value: &str, name: &str) -> Result<IpAddr> {
         .unwrap_or(value)
         .parse()
         .with_context(|| format!("bad {name} {value:?}"))
-}
-
-fn parse_optional_ip(value: &str, name: &str) -> Result<Option<IpAddr>> {
-    if value.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(parse_ip(value, name)?))
-}
-
-fn local_backend_for_snapshot(base: &Config, file: &FileConfig) -> Result<BackendNode> {
-    if let Some(backend) = file
-        .backend_nodes
-        .iter()
-        .find(|b| b.name == base.node_name)
-        .cloned()
-    {
-        return Ok(backend);
-    }
-    if let Ok(local) = base.local_backend()
-        && let Some(backend) = file
-            .backend_nodes
-            .iter()
-            .find(|b| b.underlay_ip == local.underlay_ip)
-            .cloned()
-    {
-        return Ok(backend);
-    }
-    bail!(
-        "snapshot does not contain local backend node {}",
-        base.node_name
-    )
 }
 
 fn snapshot_version(snapshot: &ConfigSnapshot) -> String {
@@ -458,7 +345,8 @@ fn parse_ip(value: &str, name: &str) -> Result<IpAddr> {
 mod tests {
     use super::*;
     use crate::config::{
-        BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole, TargetGroup,
+        BackendNode, BackendTarget, ControlPlaneMode, HaConfig, LbMode, Listener, NodeRole,
+        Protocol, TargetGroup,
     };
     use std::path::PathBuf;
 
@@ -473,7 +361,6 @@ mod tests {
             nonce: format!("{name}-nonce"),
             snapshot: Some(ConfigSnapshot {
                 network: Some(pb::Network {
-                    gateway_public_ip: "203.0.113.10".to_string(),
                     gateway_ip: gateway_ip.to_string(),
                     gateway_vxlan_dev: "edge-hub".to_string(),
                     vni: 100,
@@ -485,24 +372,16 @@ mod tests {
                 gateway_nodes: vec![
                     pb::GatewayNode {
                         name: "gateway-a".to_string(),
-                        public_ip: "203.0.113.10".to_string(),
                         underlay_ip: "192.0.2.11".to_string(),
                         overlay_ip: "10.255.12.1/24".to_string(),
                     },
                     pb::GatewayNode {
                         name: "gateway-b".to_string(),
-                        public_ip: "203.0.113.11".to_string(),
                         underlay_ip: "192.0.2.16".to_string(),
                         overlay_ip: "10.255.16.1/24".to_string(),
                     },
                 ],
-                backend_nodes: vec![pb::BackendNode {
-                    name: "backend-1".to_string(),
-                    public_ip: "198.51.100.20".to_string(),
-                    underlay_ip: "192.0.2.22".to_string(),
-                    overlay_ip: "10.255.12.2/24".to_string(),
-                }],
-                backend_return_ports: vec![{
+                gateway_return_paths: vec![{
                     let gateway_underlay = parse_ip(gateway_ip, "gateway underlay").unwrap();
                     let slot = config::gateway_slot(
                         &[
@@ -521,11 +400,7 @@ mod tests {
                         ],
                         gateway_underlay,
                     );
-                    pb::BackendReturnPort {
-                        backend: "backend-1".to_string(),
-                        address: "192.0.2.22".to_string(),
-                        protocol: "tcp".to_string(),
-                        port: 8080,
+                    pb::GatewayReturnPath {
                         gateway: name.to_string(),
                         gateway_underlay_ip: gateway_ip.to_string(),
                         gateway_overlay_ip: if name == "gateway-a" {
@@ -556,7 +431,7 @@ mod tests {
         assert_eq!(network.gateway_ip, "192.0.2.11");
         assert_eq!(network.overlay_cidr, "10.255.12.0/24");
         assert_eq!(network.dscp, 46);
-        assert_eq!(snapshot.backend_return_ports.len(), 2);
+        assert_eq!(snapshot.gateway_return_paths.len(), 2);
     }
 
     #[test]
@@ -567,7 +442,7 @@ mod tests {
         ])
         .expect("snapshots combine");
         let snapshot = combined.snapshot.expect("combined snapshot");
-        assert_eq!(snapshot.backend_return_ports.len(), 2);
+        assert_eq!(snapshot.gateway_return_paths.len(), 2);
     }
 
     #[test]
@@ -598,7 +473,7 @@ mod tests {
         underlays.sort_unstable();
 
         assert_eq!(underlays, vec!["192.0.2.11", "192.0.2.16"]);
-        assert_eq!(snapshot.backend_return_ports.len(), 2);
+        assert_eq!(snapshot.gateway_return_paths.len(), 2);
     }
 
     #[test]
@@ -632,7 +507,7 @@ mod tests {
             .expect("backend xDS config accepts multi-overlay gateway inventory");
 
         assert_eq!(file.gateway_nodes.len(), 2);
-        assert!(file.backend_return_ports.len() >= 2);
+        assert!(file.backend_return_paths.len() >= 2);
     }
 
     #[test]
@@ -661,7 +536,6 @@ mod tests {
 
         let snapshot = ConfigSnapshot {
             network: Some(pb::Network {
-                gateway_public_ip: "203.0.113.10".to_string(),
                 gateway_ip: "192.0.2.11".to_string(),
                 overlay_cidr: "10.255.255.0/24".to_string(),
                 gateway_vxlan_dev: "edge-hub".to_string(),
@@ -672,45 +546,27 @@ mod tests {
             }),
             gateway_nodes: vec![pb::GatewayNode {
                 name: "gateway-a".to_string(),
-                public_ip: "203.0.113.10".to_string(),
                 underlay_ip: "192.0.2.11".to_string(),
                 overlay_ip: "10.255.255.1/24".to_string(),
             }],
-            backend_nodes: vec![
-                pb::BackendNode {
-                    name: "backend-1".to_string(),
-                    public_ip: "198.51.100.20".to_string(),
-                    underlay_ip: "192.0.2.22".to_string(),
-                    overlay_ip: "10.255.255.2/24".to_string(),
+            gateway_return_paths: vec![
+                pb::GatewayReturnPath {
+                    gateway: "gateway-a".to_string(),
+                    gateway_underlay_ip: "192.0.2.11".to_string(),
+                    gateway_overlay_ip: "10.255.255.1".to_string(),
+                    backend_overlay_ip: "10.255.255.3/24".to_string(),
+                    dscp: 46,
+                    mark: config::return_mark(46, 0),
+                    route_table_id: config::return_table_id(46, 0),
                 },
-                pb::BackendNode {
-                    name: "backend-2".to_string(),
-                    public_ip: "198.51.100.21".to_string(),
-                    underlay_ip: "192.0.2.23".to_string(),
-                    overlay_ip: "10.255.255.3/24".to_string(),
-                },
-            ],
-            backend_return_ports: vec![
-                pb::BackendReturnPort {
-                    backend: "backend-2".to_string(),
-                    address: "192.0.2.23".to_string(),
-                    protocol: "tcp".to_string(),
-                    port: 8080,
-                    ..Default::default()
-                },
-                pb::BackendReturnPort {
-                    backend: "backend-2".to_string(),
-                    address: "192.0.2.23".to_string(),
-                    protocol: "udp".to_string(),
-                    port: 8080,
-                    ..Default::default()
-                },
-                pb::BackendReturnPort {
-                    backend: "backend-1".to_string(),
-                    address: "192.0.2.22".to_string(),
-                    protocol: "tcp".to_string(),
-                    port: 8081,
-                    ..Default::default()
+                pb::GatewayReturnPath {
+                    gateway: "gateway-b".to_string(),
+                    gateway_underlay_ip: "192.0.2.16".to_string(),
+                    gateway_overlay_ip: "10.255.16.1".to_string(),
+                    backend_overlay_ip: "10.255.16.3/24".to_string(),
+                    dscp: 40,
+                    mark: config::return_mark(40, 1),
+                    route_table_id: config::return_table_id(40, 1),
                 },
             ],
         };
@@ -719,9 +575,11 @@ mod tests {
 
         assert!(file.listeners.is_empty());
         assert!(file.target_groups.is_empty());
-        assert_eq!(file.backend_return_ports.len(), 2);
-        assert_eq!(file.backend_return_ports[0].address, local_ip("192.0.2.23"));
-        assert_eq!(file.backend_return_ports[0].port, 8080);
+        assert_eq!(file.backend_return_paths.len(), 2);
+        assert_eq!(
+            file.backend_return_paths[0].gateway_underlay_ip,
+            local_ip("192.0.2.11")
+        );
     }
 
     #[test]
@@ -729,6 +587,10 @@ mod tests {
         let backend_ip = local_ip("192.0.2.23");
         let cfg = Config {
             file: FileConfig {
+                node_role: NodeRole::Gateway,
+                node_name: "gateway-a".to_string(),
+                public_ip: "203.0.113.10".parse().unwrap(),
+                underlay_ip: "192.0.2.11".parse().unwrap(),
                 gateway_nodes: vec![GatewayNode {
                     name: "gateway-a".to_string(),
                     public_ip: "203.0.113.10".parse().unwrap(),
@@ -766,71 +628,17 @@ mod tests {
 
         let snapshot = from_config_for_backend(&cfg, backend_ip).unwrap();
 
-        assert_eq!(snapshot.backend_return_ports.len(), 1);
+        assert_eq!(snapshot.gateway_return_paths.len(), 1);
     }
 
     #[test]
-    fn snapshot_return_ports_include_all_native_listeners() {
+    fn backend_snapshot_contains_gateway_return_path_not_listener_ports() {
         let cfg = Config {
             file: FileConfig {
-                target_groups: vec![
-                    TargetGroup {
-                        name: "default-targets".to_string(),
-                        targets: vec![BackendTarget {
-                            address: "192.0.2.23".parse().unwrap(),
-                            weight: 1,
-                            ..BackendTarget::default()
-                        }],
-                        ..TargetGroup::default()
-                    },
-                    TargetGroup {
-                        name: "secondary-targets".to_string(),
-                        targets: vec![BackendTarget {
-                            address: "192.0.2.23".parse().unwrap(),
-                            weight: 1,
-                            ..BackendTarget::default()
-                        }],
-                        ..TargetGroup::default()
-                    },
-                ],
-                listeners: vec![
-                    Listener {
-                        name: "default".to_string(),
-                        port: 80,
-                        target_port: 8080,
-                        target_group: "default-targets".to_string(),
-                        protocols: vec![Protocol::Tcp],
-                        mode: LbMode::Default,
-                        ..Listener::default()
-                    },
-                    Listener {
-                        name: "secondary".to_string(),
-                        port: 81,
-                        target_port: 8081,
-                        target_group: "secondary-targets".to_string(),
-                        protocols: vec![Protocol::Tcp],
-                        mode: LbMode::Default,
-                        ..Listener::default()
-                    },
-                ],
-                ..FileConfig::default()
-            },
-            path: PathBuf::from("/tmp/edge-lb-test.toml"),
-        };
-
-        let ports = backend_return_ports_from_config(&cfg);
-
-        assert_eq!(ports.len(), 2);
-        assert_eq!(ports[0].port, 8080);
-        assert_eq!(ports[0].address, local_ip("192.0.2.23"));
-        assert_eq!(ports[1].port, 8081);
-        assert_eq!(ports[1].address, local_ip("192.0.2.23"));
-    }
-
-    #[test]
-    fn backend_snapshot_contains_only_that_backend_ports() {
-        let cfg = Config {
-            file: FileConfig {
+                node_role: NodeRole::Gateway,
+                node_name: "gateway-a".to_string(),
+                public_ip: "203.0.113.10".parse().unwrap(),
+                underlay_ip: "192.0.2.11".parse().unwrap(),
                 gateway_nodes: vec![GatewayNode {
                     name: "gateway-a".to_string(),
                     public_ip: "203.0.113.10".parse().unwrap(),
@@ -883,14 +691,23 @@ mod tests {
 
         let snapshot = from_config_for_backend(&cfg, local_ip("192.0.2.21")).unwrap();
 
-        assert_eq!(snapshot.backend_nodes.len(), 2);
-        assert_eq!(snapshot.backend_return_ports.len(), 1);
-        assert_eq!(snapshot.backend_return_ports[0].address, "192.0.2.21");
-        assert_eq!(snapshot.backend_return_ports[0].port, 8081);
+        assert_eq!(snapshot.gateway_return_paths.len(), 1);
+        assert_eq!(
+            snapshot.gateway_return_paths[0].gateway_underlay_ip,
+            "192.0.2.11"
+        );
+        assert_eq!(
+            snapshot.gateway_return_paths[0].gateway_overlay_ip,
+            "10.255.255.1"
+        );
+        assert_eq!(
+            snapshot.gateway_return_paths[0].backend_overlay_ip,
+            "10.255.255.3/24"
+        );
     }
 
     #[test]
-    fn snapshot_version_changes_when_return_path_changes() {
+    fn snapshot_version_ignores_listener_ports_but_tracks_gateway_return_path() {
         let mut file = FileConfig {
             node_role: NodeRole::Gateway,
             target_groups: vec![TargetGroup {
@@ -921,19 +738,30 @@ mod tests {
         let default_version = response_for_backend(&default_cfg, local_ip("192.0.2.23"))
             .unwrap()
             .version;
-        assert_eq!(backend_return_ports_from_config(&default_cfg).len(), 1);
 
         file.listeners[0].target_port = 8081;
         file.normalize();
-        let changed_cfg = Config {
+        let listener_changed_cfg = Config {
+            file: file.clone(),
+            path: PathBuf::from("/tmp/edge-lb-test.toml"),
+        };
+        let listener_changed_version =
+            response_for_backend(&listener_changed_cfg, local_ip("192.0.2.23"))
+                .unwrap()
+                .version;
+        assert_eq!(default_version, listener_changed_version);
+
+        file.network.dscp = 40;
+        file.normalize();
+        let return_path_changed_cfg = Config {
             file,
             path: PathBuf::from("/tmp/edge-lb-test.toml"),
         };
-        let changed_version = response_for_backend(&changed_cfg, local_ip("192.0.2.23"))
-            .unwrap()
-            .version;
-        assert_eq!(backend_return_ports_from_config(&changed_cfg).len(), 1);
-        assert_ne!(default_version, changed_version);
+        let return_path_changed_version =
+            response_for_backend(&return_path_changed_cfg, local_ip("192.0.2.23"))
+                .unwrap()
+                .version;
+        assert_ne!(default_version, return_path_changed_version);
     }
 
     fn local_ip(value: &str) -> IpAddr {

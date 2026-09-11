@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { Activity, Loader2, RadioTower, Server, ShieldAlert } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
+import { Activity, Globe2, Loader2, RadioTower, Server, ShieldAlert } from 'lucide-vue-next'
 import {
   Badge,
   Button,
@@ -35,16 +35,52 @@ const cleanupSummary = computed(() =>
     ? text('cleanupGatewaySummary').replace('{dev}', status.value?.vxlan?.dev ?? 'VXLAN')
     : text('cleanupBackendSummary').replace('{dev}', status.value?.vxlan?.dev ?? 'VXLAN'),
 )
+
+const publicIpResult = ref('')
+const publicIpError = ref('')
+const discoveringPublicIp = ref(false)
+
+async function discoverPublicIp() {
+  publicIpResult.value = ''
+  publicIpError.value = ''
+  discoveringPublicIp.value = true
+  try {
+    const result = await api.discoverPublicIp()
+    publicIpResult.value = result.value
+      ? `${result.value} (${formatDiscovery(result.mode, result.source)})`
+      : text('publicIpUnresolved')
+  } catch (error) {
+    publicIpError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    discoveringPublicIp.value = false
+  }
+}
 </script>
 
 <template>
         <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <Card>
             <CardHeader>
-              <CardTitle class="flex items-center gap-2"><Server class="size-4" /> {{ text('node') }}</CardTitle>
-              <CardDescription>{{ status?.node_name ?? text('loading') }}</CardDescription>
+              <div class="flex items-start justify-between gap-3">
+                <div>
+                  <CardTitle class="flex items-center gap-2"><Server class="size-4" /> {{ text('node') }}</CardTitle>
+                  <CardDescription>{{ status?.node_name ?? text('loading') }}</CardDescription>
+                </div>
+                <Button size="sm" variant="outline" :disabled="discoveringPublicIp" @click="discoverPublicIp">
+                  <Loader2 v-if="discoveringPublicIp" class="animate-spin" />
+                  <Globe2 v-else class="size-4" />
+                  {{ text('discoverPublicIp') }}
+                </Button>
+              </div>
             </CardHeader>
             <CardContent class="space-y-2 text-sm">
+              <div v-if="publicIpResult" class="flex justify-between gap-3">
+                <span class="text-muted-foreground">{{ text('publicIp') }}</span>
+                <span class="truncate font-mono">{{ publicIpResult }}</span>
+              </div>
+              <p v-if="publicIpError" class="rounded-md bg-destructive/10 p-2 text-xs text-destructive">
+                {{ publicIpError }}
+              </p>
               <div class="flex justify-between"><span class="text-muted-foreground">{{ text('role') }}</span><span>{{ status?.node_role }}</span></div>
               <div class="flex justify-between"><span class="text-muted-foreground">{{ text('underlayIp') }}</span><span class="font-mono">{{ localNode?.underlay_ip ?? '—' }}</span></div>
               <div class="flex justify-between text-xs"><span class="text-muted-foreground">{{ text('underlayIp') }} {{ text('discoveryMode') }}</span><span>{{ formatDiscovery(status?.discovery?.underlay_ip?.mode, status?.discovery?.underlay_ip?.source) }}</span></div>
