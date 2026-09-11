@@ -16,6 +16,10 @@ paths are rejected with HTTP 404 and are not alternate aliases.
 
 Import and export are subresources of their owning collection, for example
 `/api/v1/listener-configs/export` and `/api/v1/target-groups/import`.
+
+List endpoints that back tables return a pagination object by default:
+`{ "items": [], "total": 0, "page": 1, "per_page": 20 }`. They accept
+`page`, `per_page`, and `q` query parameters.
 Import is idempotent by resource name: existing listener configs or target
 groups with the same name are updated in place, and missing names are created.
 Duplicate names inside one import payload are rejected before committing the

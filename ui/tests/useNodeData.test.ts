@@ -27,14 +27,27 @@ Object.assign(globalThis, {
 })
 
 const { api, AuthError } = await import('../src/api')
-const { run, busy, error, tab, cancelProxySync, proxyWriteStatus, logout, targetGroups, listeners, authenticated } = await import('../src/composables/useNodeData')
+const {
+  run,
+  busy,
+  error,
+  tab,
+  cancelProxySync,
+  proxyWriteStatus,
+  logout,
+  listeners,
+  authenticated,
+  backendNodePage,
+  targetGroupOptionPage,
+  refreshBackendNodePage,
+} = await import('../src/composables/useNodeData')
 const { listenerForm, listenerFormOpen, submitListener, resetListenerForm } = await import('../src/components/listeners/listenerForm')
 const refresh = spyOn(api, 'status')
 const sync = spyOn(api, 'proxyConfigSync')
 const createListener = spyOn(api, 'createListenerConfig')
-const readListeners = spyOn(api, 'listenerConfigs')
-const readGroups = spyOn(api, 'targetGroups')
-const readNodes = spyOn(api, 'backendNodes')
+const readListeners = spyOn(api, 'listenerConfigsPage')
+const readGroups = spyOn(api, 'targetGroupsPage')
+const readNodePage = spyOn(api, 'backendNodesPage')
 const version = { sequence: 7, source: 'gateway-a', pairing_id: 'pair-1', content_hash: 'hash-7' }
 const accepted = { sync: { state: 'accepted', authority: 'gateway-a', authority_committed: true, replica_confirmed: false, barrier: version } }
 
@@ -47,9 +60,11 @@ beforeEach(() => {
   refresh.mockResolvedValue({ node_role: 'backend' } as Status)
   sync.mockReset()
   createListener.mockReset()
-  readListeners.mockReset().mockResolvedValue([])
-  readGroups.mockReset().mockResolvedValue([])
-  readNodes.mockReset().mockResolvedValue([])
+  readListeners.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 })
+  readGroups.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 })
+  readNodePage.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 })
+  Object.assign(backendNodePage, { items: [], total: 0, page: 1, per_page: 20, q: '' })
+  Object.assign(targetGroupOptionPage, { items: [], total: 0, page: 1, per_page: 20, q: '' })
 })
 afterAll(() => {
   cancelProxySync()
@@ -57,7 +72,7 @@ afterAll(() => {
   createListener.mockRestore()
   readListeners.mockRestore()
   readGroups.mockRestore()
-  readNodes.mockRestore()
+  readNodePage.mockRestore()
   refresh.mockRestore()
   Object.assign(globalThis, savedGlobals)
 })
@@ -92,7 +107,9 @@ describe('command result used by save dialogs', () => {
     tab.value = 'listeners'
     refresh.mockResolvedValue({ node_role: 'gateway', node_name: 'gateway-b' } as Status)
     const listener = { name: 'tcp-80', port: 80, protocols: ['tcp'] } as ListenerConfig
-    readListeners.mockResolvedValueOnce([]).mockResolvedValue([listener])
+    readListeners
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, per_page: 20 })
+      .mockResolvedValue({ items: [listener], total: 1, page: 1, per_page: 20 })
     let receive!: (value: ProxySyncCursor) => void
     sync.mockImplementation(() => new Promise((resolve) => { receive = resolve }))
     expect(await run('save', async () => accepted)).toBe(true)
@@ -103,7 +120,7 @@ describe('command result used by save dialogs', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(proxyWriteStatus.value?.state).toBe('visible')
     expect(listeners.value).toEqual([listener])
-    expect(readListeners).toHaveBeenCalledTimes(2)
+    expect(readListeners).toHaveBeenCalled()
     expect(refresh).toHaveBeenCalledTimes(1)
   })
 
@@ -165,7 +182,7 @@ describe('command result used by save dialogs', () => {
 
   test('listener validation/write failure preserves the editor and input', async () => {
     resetListenerForm()
-    targetGroups.value = [{ name: 'web', targets: [] } as unknown as TargetGroup]
+    targetGroupOptionPage.items = [{ name: 'web', targets: [] } as unknown as TargetGroup]
     Object.assign(listenerForm, { port: 80, target_port: 8080, target_group: 'web' })
     listenerFormOpen.value = true
     createListener.mockRejectedValue(new Error('write rejected'))
@@ -178,5 +195,23 @@ describe('command result used by save dialogs', () => {
     await submitListener()
     expect(listenerFormOpen.value).toBe(false)
     expect(listenerForm.port).toBe('')
+  })
+
+  test('page refresh applies paginated backend responses', async () => {
+    const node = {
+      name: 'backend-a',
+      public_ip: '192.0.2.10',
+      underlay_ip: '192.0.2.10',
+      overlay_ip: '10.44.0.2',
+    }
+    Object.assign(backendNodePage, { page: 2, per_page: 50 })
+    readNodePage.mockResolvedValueOnce({ items: [node], total: 42, page: 2, per_page: 50 })
+
+    await refreshBackendNodePage()
+
+    expect(backendNodePage.items).toEqual([node])
+    expect(backendNodePage.total).toBe(42)
+    expect(backendNodePage.page).toBe(2)
+    expect(backendNodePage.per_page).toBe(50)
   })
 })

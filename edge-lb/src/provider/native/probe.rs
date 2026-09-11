@@ -75,11 +75,13 @@ fn probe_round(
     schedule: &mut HashMap<String, (ProbeTarget, Instant)>,
     runtimes: &mut HashMap<String, ProbeRuntime>,
 ) {
-    let mut effective = cfg.clone();
-    if let Err(error) = super::hydrate_proxy_config_from_api(&mut effective) {
-        tracing::warn!("[probe] native proxy state refresh failed: {error:#}");
-        return;
-    }
+    let effective = match hydrated_probe_config(cfg) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!("[probe] native proxy state refresh failed: {error:#}");
+            return;
+        }
+    };
     let targets = scheduled_targets(&effective);
     let keys = targets
         .iter()
@@ -108,18 +110,28 @@ fn probe_round(
         return;
     }
     // Do not publish a result for a probe definition removed or edited during I/O.
-    let mut current = cfg.clone();
-    if super::hydrate_proxy_config_from_api(&mut current).is_err() {
-        return;
-    }
+    let current = match hydrated_probe_config(cfg) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!("[probe] native proxy state refresh failed: {error:#}");
+            return;
+        }
+    };
     let current_targets = scheduled_targets(&current);
     outcomes.retain(|(target, _)| current_targets.contains(target));
     let transitions = apply_results(cfg, &outcomes, runtimes);
     if transitions > 0
-        && let Err(e) = crate::linux::native_dnat::refresh_target_health(cfg)
+        && let Err(e) = crate::linux::native_dnat::refresh_target_health(&current)
     {
         tracing::warn!("[probe] native health map refresh failed: {e:#}");
     }
+}
+
+fn hydrated_probe_config(cfg: &Config) -> Result<Config> {
+    let mut effective = cfg.clone();
+    super::hydrate_proxy_config_from_api(&mut effective)?;
+    crate::control::merge_active_backend_subscriptions(&mut effective)?;
+    Ok(effective)
 }
 
 fn probe_is_due(
@@ -162,8 +174,13 @@ pub fn scheduled_targets(cfg: &Config) -> Vec<ProbeTarget> {
         let timeout = Duration::from_secs(period_secs.min(3)).max(Duration::from_millis(500));
         let retries = group.retries.unwrap_or(DEFAULT_RETRIES).max(1);
         for target in &group.targets {
-            let address = cfg.resolve_backend_target_address(target);
-            if address.is_unspecified() || address.is_loopback() {
+            let datapath_address = cfg.resolve_backend_target_address(target);
+            let probe_address = cfg.resolve_backend_probe_address(target);
+            if datapath_address.is_unspecified()
+                || datapath_address.is_loopback()
+                || probe_address.is_unspecified()
+                || probe_address.is_loopback()
+            {
                 continue;
             }
             let listener_identities = listener_identities(cfg, &group.name);
@@ -173,12 +190,12 @@ pub fn scheduled_targets(cfg: &Config) -> Vec<ProbeTarget> {
             let names = listener_identities
                 .iter()
                 .map(|(protocol, target_port)| {
-                    target_health_identity(&group.name, address, protocol, *target_port)
+                    target_health_identity(&group.name, datapath_address, protocol, *target_port)
                 })
                 .collect::<Vec<_>>();
             out.push(ProbeTarget {
                 names,
-                address,
+                address: probe_address,
                 port: probe_port,
                 probe_type: probe_type.clone(),
                 probe_req: group.probe_req.clone(),
@@ -648,7 +665,9 @@ fn names_key(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BackendTarget, Config, FileConfig, Listener, Protocol, TargetGroup};
+    use crate::config::{
+        BackendNode, BackendTarget, Config, FileConfig, Listener, Protocol, TargetGroup,
+    };
     use std::path::PathBuf;
 
     fn local_probe(kind: &str, port: u16) -> ProbeTarget {
@@ -860,6 +879,35 @@ mod tests {
             vec![target_health_identity(
                 "web",
                 "192.0.2.10".parse().unwrap(),
+                "tcp",
+                8080
+            )]
+        );
+    }
+
+    #[test]
+    fn monitored_backend_target_probes_underlay_but_updates_overlay_health() {
+        let mut cfg = cfg_with_group(true, Some("tcp"));
+        cfg.file.backend_nodes.push(BackendNode {
+            name: "backend-1".to_string(),
+            public_ip: "198.51.100.20".parse().unwrap(),
+            underlay_ip: "192.0.2.20".parse().unwrap(),
+            overlay_ip: "10.255.255.2/24".to_string(),
+        });
+        cfg.file.target_groups[0].targets[0] = BackendTarget {
+            backend: Some("backend-1".to_string()),
+            address: "192.0.2.20".parse().unwrap(),
+            weight: 1,
+        };
+
+        let targets = scheduled_targets(&cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address, "192.0.2.20".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            targets[0].names,
+            vec![target_health_identity(
+                "web",
+                "10.255.255.2".parse().unwrap(),
                 "tcp",
                 8080
             )]

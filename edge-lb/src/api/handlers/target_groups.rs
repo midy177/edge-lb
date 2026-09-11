@@ -6,7 +6,7 @@ use crate::{
 };
 
 use super::{
-    common::{maybe_paginate_json, require_gateway_role},
+    common::{paginate_json, require_gateway_role},
     proxy_config::{self, ProxyConfigOperation},
 };
 
@@ -17,7 +17,7 @@ pub(in crate::api) fn target_groups(cfg: &Config, query: &str) -> Reply {
     match target_group_views(cfg) {
         Ok(groups) => {
             let items = groups.as_array().cloned().unwrap_or_default();
-            Reply::json(200, maybe_paginate_json(items, query))
+            Reply::json(200, paginate_json(items, query))
         }
         Err(e) => Reply::error(500, format!("{e:#}")),
     }

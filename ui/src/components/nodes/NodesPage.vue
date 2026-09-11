@@ -20,7 +20,7 @@ import { formatDiscovery } from '@/lib/format'
 import { backendNodePage, backendSubscriptionsError, refreshBackendNodePage } from '@/composables/useNodeData'
 
 watch(
-  () => [backendNodePage.value.page, backendNodePage.value.q],
+  () => [backendNodePage.page, backendNodePage.q],
   () => { void refreshBackendNodePage() },
 )
 onMounted(() => {

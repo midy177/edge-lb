@@ -12,13 +12,14 @@ flowchart LR
     dnat["native DNAT<br/>select target + write flow"]
     mark["DSCP marker<br/>match listener port"]
     backend["backend app"]
-    retmark["backend nftables<br/>ct mark -> fwmark"]
+    retmark["backend nftables<br/>DSCP -> ct mark / fwmark"]
+    udplearn["UDP tuple learn<br/>client ip.port"]
     vxret["edge-return<br/>VXLAN VNI 100"]
     vxhub["edge-hub"]
     snat["native reverse NAT / SNAT"]
 
     client -->|"VIP or gateway IP:port"| gw_ing
-    gw_ing --> dnat --> mark --> backend
+    gw_ing --> dnat --> mark --> udplearn --> backend
     backend --> retmark --> vxret --> vxhub --> snat --> client
 ```
 
@@ -26,8 +27,10 @@ flowchart LR
 
 - gateway 收到客户端请求后做 DNAT，目标为监听绑定的目标组成员。
 - backend 看到真实客户端源 IP。
-- gateway 为进入目标端口的流量写 DSCP，backend 根据 DSCP 设置 conntrack mark
-  和 fwmark。
+- gateway 为进入目标端口的流量写 DSCP，backend 根据 `edge-return` ingress 包上的
+  DSCP 设置 conntrack mark 和 fwmark。
+- backend 不接收 listener、target group、service port 或 active gateway 状态。后端
+  只接收 VXLAN/DSCP return-path contract。
 - backend 回包通过策略路由进入 `edge-return` VXLAN。
 - gateway 在 `edge-hub` 收到回包后按 flow state 做反向 NAT，回给客户端。
 
@@ -63,6 +66,38 @@ table = 1000 + (gateway_slot + 1) * 64 + (dscp & 0x3f)
 路由表中允许存在 gateway underlay 的 host route，用于避免访问 gateway underlay
 地址时被 fwmark 默认路由递归送回 VXLAN。
 
+## UDP 回包修正
+
+TCP 回包通常能通过 conntrack reply direction 继承回程 mark。UDP 服务若绑定
+`0.0.0.0`，内核可能按主路由选择 backend underlay 源地址回包，导致 conntrack 不能
+把它识别为原 VXLAN ingress 流的 reply。
+
+edge-lb 的 backend 规则不能通过业务端口解决这个问题。backend nft 只允许使用
+VXLAN/DSCP 信号：
+
+```nft
+set udp_reply_106e {
+    type ipv4_addr . inet_service
+    flags dynamic,timeout
+    timeout 30s
+}
+
+chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "edge-return" ip dscp ef counter ct mark set 0x106e
+    iifname "edge-return" ip dscp ef update @udp_reply_106e { ip saddr . udp sport timeout 30s }
+}
+
+chain output {
+    type route hook output priority mangle; policy accept;
+    ip daddr . udp dport @udp_reply_106e counter ip saddr set 10.255.15.3 meta mark set 0x106e
+}
+```
+
+该动态 set 的 key 是客户端地址和客户端 UDP 源端口；不是 backend service port。
+所以 backend 仍然不知道 `8080` 或任何 listener 配置。不同 gateway 使用各自 DSCP、
+mark、overlay 源地址和动态 set。
+
 ## 验证命令
 
 管理 API：
@@ -94,14 +129,22 @@ backend 回程状态：
 ip -d link show edge-return
 ip rule show
 ip route show table <derived-table>
+sudo nft -a list table inet edge_lb_return
 ```
 
 业务连通性：
 
 ```bash
 printf 'discover\n' | nc -N -w 1 <vip-or-gateway-ip> <port>
-printf 'discover\n' | nc -uv -w 1 <vip-or-gateway-ip> <port>
+printf 'discover\n' | nc -u -w 3 <vip-or-gateway-ip> <port>
 ```
+
+UDP 验证时，backend nft table 里应看到：
+
+- `prerouting` 的 `iifname "edge-return" ip dscp <value>` counter 增加。
+- 对应 `udp_reply_<mark>` set 出现客户端 `ip . port`，并随 timeout 过期。
+- `output` 的 `ip daddr . udp dport @udp_reply_<mark>` counter 增加。
+- 不应出现 `udp sport <backend-service-port>` 这类按业务端口匹配的规则。
 
 ## 预期结果
 

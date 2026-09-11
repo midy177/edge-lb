@@ -75,7 +75,6 @@ export const api = {
   proxyConfigSync: (signal?: AbortSignal) =>
     request<ProxySyncCursor>('GET', '/api/v1/ha/proxy-config-sync', undefined, signal),
   status: () => request<Status>('GET', '/api/v1/status'),
-  targetGroups: () => request<TargetGroup[]>('GET', '/api/v1/target-groups'),
   targetGroupsPage: (params: PageQuery) =>
     request<PageResult<TargetGroup>>('GET', withQuery('/api/v1/target-groups', params)),
   exportTargetGroups: () => request<TargetGroupExport>('GET', '/api/v1/target-groups/export'),
@@ -86,7 +85,6 @@ export const api = {
     request<ProxyWriteResult<TargetGroup>>('PUT', `/api/v1/target-groups/${encodeURIComponent(name)}`, group),
   deleteTargetGroup: (name: string) =>
     request<ProxyWriteResult<{ status: string; name: string }>>('DELETE', `/api/v1/target-groups/${encodeURIComponent(name)}`),
-  listenerConfigs: () => request<ListenerConfig[]>('GET', '/api/v1/listener-configs'),
   listenerConfigsPage: (params: PageQuery) =>
     request<PageResult<ListenerConfig>>('GET', withQuery('/api/v1/listener-configs', params)),
   exportListenerConfigs: () => request<{ version: number; listeners: ListenerConfig[] }>('GET', '/api/v1/listener-configs/export'),
@@ -99,7 +97,6 @@ export const api = {
   deleteListenerConfig: (name: string) =>
     request<ProxyWriteResult<{ status: string; name: string }>>('DELETE', `/api/v1/listener-configs/${encodeURIComponent(name)}`),
   gatewayNodes: () => request<GatewayNode[]>('GET', '/api/v1/nodes/gateways'),
-  backendNodes: () => request<BackendNode[]>('GET', '/api/v1/nodes/backends'),
   backendNodesPage: (params: PageQuery) =>
     request<PageResult<BackendNode>>('GET', withQuery('/api/v1/nodes/backends', params)),
   discoverPublicIp: () =>

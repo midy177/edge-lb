@@ -80,11 +80,32 @@ impl FileConfig {
     }
 
     pub fn resolve_backend_target_address(&self, target: &BackendTarget) -> IpAddr {
+        let backends = self.backend_nodes_effective();
+        if let Some(address) = target.backend.as_ref().and_then(|name| {
+            backends
+                .iter()
+                .find(|backend| &backend.name == name)
+                .and_then(|backend| parse_overlay_host(&backend.overlay_ip).ok())
+        }) {
+            return address;
+        }
+        backends
+            .iter()
+            .find(|backend| backend.underlay_ip == target.address)
+            .and_then(|backend| parse_overlay_host(&backend.overlay_ip).ok())
+            .unwrap_or(target.address)
+    }
+
+    pub fn resolve_backend_probe_address(&self, target: &BackendTarget) -> IpAddr {
+        if !target.address.is_unspecified() {
+            return target.address;
+        }
+        let backends = self.backend_nodes_effective();
         target
             .backend
             .as_ref()
             .and_then(|name| {
-                self.backend_nodes_effective()
+                backends
                     .iter()
                     .find(|backend| &backend.name == name)
                     .map(|backend| backend.underlay_ip)
@@ -457,6 +478,70 @@ mod tests {
 
         file.validate()
             .expect("native default DNAT listener should be valid");
+    }
+
+    #[test]
+    fn native_backend_targets_resolve_to_overlay_addresses() {
+        let mut file = FileConfig::default();
+        file.backend_nodes.push(BackendNode {
+            name: "backend-1".to_string(),
+            public_ip: "198.51.100.20".parse().unwrap(),
+            underlay_ip: "192.0.2.20".parse().unwrap(),
+            overlay_ip: "10.255.255.2/24".to_string(),
+        });
+        let cfg = Config {
+            file,
+            path: DEFAULT_CONFIG_PATH.into(),
+        };
+
+        assert_eq!(
+            cfg.resolve_backend_target_address(&BackendTarget {
+                backend: Some("backend-1".to_string()),
+                address: "192.0.2.20".parse().unwrap(),
+                weight: 1,
+            }),
+            "10.255.255.2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            cfg.resolve_backend_target_address(&BackendTarget {
+                backend: None,
+                address: "192.0.2.20".parse().unwrap(),
+                weight: 1,
+            }),
+            "10.255.255.2".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn backend_probe_address_uses_underlay_address() {
+        let mut file = FileConfig::default();
+        file.backend_nodes.push(BackendNode {
+            name: "backend-1".to_string(),
+            public_ip: "198.51.100.20".parse().unwrap(),
+            underlay_ip: "192.0.2.20".parse().unwrap(),
+            overlay_ip: "10.255.255.2/24".to_string(),
+        });
+        let cfg = Config {
+            file,
+            path: DEFAULT_CONFIG_PATH.into(),
+        };
+
+        assert_eq!(
+            cfg.resolve_backend_probe_address(&BackendTarget {
+                backend: Some("backend-1".to_string()),
+                address: "192.0.2.20".parse().unwrap(),
+                weight: 1,
+            }),
+            "192.0.2.20".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            cfg.resolve_backend_probe_address(&BackendTarget {
+                backend: Some("backend-1".to_string()),
+                address: "0.0.0.0".parse().unwrap(),
+                weight: 1,
+            }),
+            "192.0.2.20".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]

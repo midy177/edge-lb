@@ -34,7 +34,15 @@ import PaginationBar from '@/components/common/PaginationBar.vue'
 import { api, type ListenerConfig } from '@/api'
 import { t as text } from '@/lib/i18n'
 import { listenerSelectOptions } from '@/lib/lb'
-import { busy, listenerPage, refreshListenerPage, run, status, targetGroups } from '@/composables/useNodeData'
+import {
+  busy,
+  listenerPage,
+  refreshListenerPage,
+  refreshTargetGroupOptions,
+  run,
+  status,
+  targetGroupOptionPage,
+} from '@/composables/useNodeData'
 import {
   canSubmitListener,
   applyListenerTargetGroup,
@@ -78,8 +86,13 @@ async function onListenerImport(event: Event) {
 }
 
 watch(
-  () => listenerPage.value.page,
+  () => listenerPage.page,
   () => { void refreshListenerPage() },
+)
+
+watch(
+  () => targetGroupOptionPage.page,
+  () => { void refreshTargetGroupOptions() },
 )
 </script>
 
@@ -248,12 +261,26 @@ watch(
             <div class="mt-5 border-t pt-4">
               <div class="space-y-1.5">
                 <Label>{{ text('targetGroup') }} <span class="text-destructive">*</span></Label>
+                <PaginationBar
+                  v-model:page="targetGroupOptionPage.page"
+                  v-model:q="targetGroupOptionPage.q"
+                  :total="targetGroupOptionPage.total"
+                  :per-page="targetGroupOptionPage.per_page"
+                  @refresh="refreshTargetGroupOptions"
+                />
                 <Select :model-value="listenerForm.target_group" @update:model-value="applyListenerTargetGroup">
                   <SelectTrigger class="w-full">
                     <SelectValue :placeholder="text('targetGroup')" />
                   </SelectTrigger>
                   <SelectContent disable-portal>
-                    <SelectItem v-for="group in targetGroups" :key="group.name" :value="group.name">
+                    <SelectItem
+                      v-if="listenerForm.target_group && !targetGroupOptionPage.items.some((group) => group.name === listenerForm.target_group)"
+                      :value="listenerForm.target_group"
+                      disabled
+                    >
+                      {{ listenerForm.target_group }}
+                    </SelectItem>
+                    <SelectItem v-for="group in targetGroupOptionPage.items" :key="group.name" :value="group.name">
                       {{ group.name }}
                     </SelectItem>
                   </SelectContent>

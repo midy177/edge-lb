@@ -8,7 +8,7 @@ use crate::{
         model::{AutomationConfig, AutomationExport, AutomationTemplate, AutomationTestResult},
         store, sync, validate,
     },
-    config::{BackendTarget, Config, TargetGroup},
+    config::{BackendNode, BackendTarget, Config, TargetGroup},
     events,
     provider::native,
 };
@@ -338,6 +338,7 @@ fn test_template(
 fn automation_nodes(cfg: &Config) -> Vec<crate::automation::model::MatchedNode> {
     let subscriptions =
         crate::control::active_backend_subscriptions_status().unwrap_or_else(|_| json!({}));
+    let canonical_backends = cfg.backend_nodes_effective();
     crate::control::active_backend_nodes(cfg)
         .unwrap_or_else(|e| {
             tracing::warn!("[automation] active backend node lookup skipped: {e:#}");
@@ -345,9 +346,11 @@ fn automation_nodes(cfg: &Config) -> Vec<crate::automation::model::MatchedNode> 
         })
         .into_iter()
         .filter_map(|node| {
-            let sub = subscriptions.get(&node.name);
+            let sub = subscription_for_backend(&subscriptions, &node);
+            let name = canonical_backend_name(&canonical_backends, &node)
+                .unwrap_or_else(|| node.name.clone());
             filter::matched_node_from_backend(
-                node.name,
+                name,
                 node.public_ip,
                 node.underlay_ip,
                 sub.and_then(|s| s.get("public_ip_source"))
@@ -359,6 +362,42 @@ fn automation_nodes(cfg: &Config) -> Vec<crate::automation::model::MatchedNode> 
             )
         })
         .collect()
+}
+
+fn subscription_for_backend<'a>(
+    subscriptions: &'a serde_json::Value,
+    node: &BackendNode,
+) -> Option<&'a serde_json::Value> {
+    let subs = subscriptions.as_object()?;
+    subs.get(&node.name).or_else(|| {
+        let underlay = node.underlay_ip.to_string();
+        subs.values().find(|sub| {
+            sub.get("underlay_ip")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == underlay)
+        })
+    })
+}
+
+fn canonical_backend_name(backends: &[BackendNode], node: &BackendNode) -> Option<String> {
+    backends
+        .iter()
+        .find(|backend| backend.name == node.name)
+        .or_else(|| {
+            backends
+                .iter()
+                .find(|backend| backend.underlay_ip == node.underlay_ip)
+        })
+        .or_else(|| {
+            (!node.public_ip.is_unspecified())
+                .then(|| {
+                    backends
+                        .iter()
+                        .find(|backend| backend.public_ip == node.public_ip)
+                })
+                .flatten()
+        })
+        .map(|backend| backend.name.clone())
 }
 
 fn reconcile_templates(cfg: &Config, config: &AutomationConfig) -> anyhow::Result<bool> {
@@ -465,7 +504,7 @@ fn planned_target_group_for_nodes(
                         .find(|target| target.address == address)
                 });
                 Ok::<BackendTarget, anyhow::Error>(BackendTarget {
-                    backend: None,
+                    backend: Some(node.name),
                     address,
                     weight: old.map(|target| target.weight).unwrap_or(1),
                 })
@@ -522,7 +561,7 @@ fn merge_import(
 mod tests {
     use crate::{
         automation::model::AutomationTemplate,
-        config::{BackendTarget, TargetGroup},
+        config::{BackendNode, BackendTarget, TargetGroup},
     };
 
     #[test]
@@ -551,5 +590,26 @@ mod tests {
         let planned = super::planned_target_group_for_nodes(&template, &[], None).unwrap();
         assert_eq!(planned.name, "new-targets");
         assert!(planned.targets.is_empty());
+    }
+
+    #[test]
+    fn automation_backend_identity_uses_configured_backend_name() {
+        let configured = vec![BackendNode {
+            name: "192.168.0.13".to_string(),
+            public_ip: "43.162.213.70".parse().unwrap(),
+            underlay_ip: "192.168.0.13".parse().unwrap(),
+            overlay_ip: "10.255.15.2/24".to_string(),
+        }];
+        let subscribed = BackendNode {
+            name: "VM-0-13-ubuntu".to_string(),
+            public_ip: "43.162.213.70".parse().unwrap(),
+            underlay_ip: "192.168.0.13".parse().unwrap(),
+            overlay_ip: "auto".to_string(),
+        };
+
+        assert_eq!(
+            super::canonical_backend_name(&configured, &subscribed).as_deref(),
+            Some("192.168.0.13")
+        );
     }
 }

@@ -4,20 +4,27 @@
 
 ## 1. 变更规则
 
+- 涉及 gateway/backend 边界、xDS snapshot、数据面回程语义、HA ownership 或
+  API 资源模型的架构变更，必须先同步设计并得到确认，再修改代码和部署。
 - 监听配置和目标组是 edge-lb 自有模型，不映射成外部负载均衡器的业务对象。
 - 监听配置只负责对外地址、对外端口、协议、调度策略、转发模式、目标组绑定和连接超时。
 - 目标组只负责后端地址、权重和健康探测配置；监听配置负责目标转发端口。
 - `Config.services` 和 `TargetEndpoint` 已删除；监听配置和目标组是唯一业务模型。
   native map 写入和 DSCP 端口推导都必须直接从 `listeners + target_groups`
   计算，不能重新引入运行期 service 投影。
-- backend xDS 只下发 backend 配置回程 VXLAN 所必需的 contract：
+- backend xDS 只下发 backend 配置回程 VXLAN/DSCP 所必需的 contract：
   gateway underlay IP、gateway overlay IP、backend overlay IP、VXLAN
   设备/VNI/端口/MTU，以及每个 gateway 的 DSCP、fwmark 和 route table。
   不能下发监听、目标组、目标端口、健康探测、backend inventory、公网 IP 或任何
-  gateway 业务配置字段。
-- backend nft 回程打标只按 gateway DSCP 识别连接，不匹配 L4 protocol 或
+  gateway 业务配置字段；也不能下发 active gateway 状态或 UDP service port。
+- backend nft 基础回程打标只按 gateway DSCP 识别连接，不匹配 L4 protocol 或
   backend port。业务端口边界由 gateway DSCP marker 负责；backend 不再依赖
-  `return_ports` 或监听端口裁剪。
+  `return_ports`、监听端口裁剪或 active gateway。
+- UDP 服务若绑定 `0.0.0.0`，Linux 可能用 underlay 源地址发回包，导致 conntrack
+  无法把它识别为原 VXLAN ingress 流的 reply。backend 只能从已进入 backend VXLAN
+  设备且命中 DSCP 的 UDP 包中学习 `client_ip . client_port` 动态 tuple，并在
+  `output` 对命中该 tuple 的 UDP 回包修正 source overlay 和 fwmark。动态 tuple
+  有短 timeout；规则不得匹配或写入任何 backend service port。
 - backend nft 回程打标必须同时匹配配置中的 backend VXLAN ingress 设备名
   （默认 `edge-return`）和 DSCP。直连 backend 的业务流量即使带相同 DSCP，也不能被
   edge-lb return-path 规则设置 `ct mark`。
@@ -53,7 +60,8 @@
   `overlay_cidr`。peer overlay 允许属于对端网段，不能用本机 `gateway.overlay_ip`
   覆盖，也不能要求所有 `gateway_nodes[].overlay_ip` 都属于本机
   `network.overlay_cidr`。
-- 后端只接收并执行回程数据面配置，不判断 active gateway，不保存 gateway 的 HA 运行来源。
+- 后端只接收并执行 VXLAN/DSCP 回程数据面配置，不判断 active gateway，不保存
+  gateway 的 HA 运行来源，也不接收 listener/target group/service port。
 - IPv4 forwarding 由 gateway 和 backend 启动时幂等开启：gateway 用于 DNAT 后转发，backend 用于容器、桥接地址或其他本地路由目标的回程转发；cleanup 不关闭这个主机级能力。
 
 ## Backend VXLAN reachability

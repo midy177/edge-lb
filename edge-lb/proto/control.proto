@@ -41,10 +41,13 @@ message DiscoveryResponse {
 }
 
 message ConfigSnapshot {
+  // Backend xDS is a datapath contract only: VXLAN/DSCP return-path state.
+  // Do not add listener, target-group, service-port, or active-gateway
+  // semantics here.
   Network network = 2;
   repeated GatewayNode gateway_nodes = 3;
-  reserved 4, 5;
-  reserved "backend_nodes", "services";
+  reserved 4, 5, 7, 8;
+  reserved "backend_nodes", "services", "udp_service_ports", "active_gateway_underlay_ip";
   repeated GatewayReturnPath gateway_return_paths = 6;
 }
 

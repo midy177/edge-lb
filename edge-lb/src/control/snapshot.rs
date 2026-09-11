@@ -575,6 +575,7 @@ mod tests {
 
         assert!(file.listeners.is_empty());
         assert!(file.target_groups.is_empty());
+        assert_eq!(file.network.gateway_ip, local_ip("192.0.2.11"));
         assert_eq!(file.backend_return_paths.len(), 2);
         assert_eq!(
             file.backend_return_paths[0].gateway_underlay_ip,

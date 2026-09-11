@@ -190,7 +190,7 @@ function targetHealth(target: BackendTarget, group: TargetGroup) {
 }
 
 watch(
-  () => targetGroupPage.value.page,
+  () => targetGroupPage.page,
   () => { void refreshTargetGroupPage() },
 )
 </script>

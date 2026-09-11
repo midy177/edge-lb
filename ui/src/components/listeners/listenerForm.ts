@@ -24,7 +24,7 @@ import {
   optionalPositiveInt,
   requiredPort,
 } from '@/lib/validation'
-import { error, run, targetGroups } from '@/composables/useNodeData'
+import { error, refreshTargetGroupOptions, run, targetGroupOptionPage } from '@/composables/useNodeData'
 
 export type ListenerForm = {
   name: string
@@ -70,7 +70,7 @@ export const listenerForm = reactive<ListenerForm>({ ...emptyListener })
 export const editingListener = ref<string | null>(null)
 export const listenerFormOpen = ref(false)
 
-const targetGroupOptions = computed(() => targetGroups.value)
+const targetGroupOptions = computed(() => targetGroupOptionPage.items)
 function targetGroupByName(name: string) {
   return targetGroupOptions.value.find((group) => group.name === name)
 }
@@ -171,6 +171,9 @@ export function listenerPayload(): ListenerConfig {
 }
 
 export function editListener(listener: ListenerConfig) {
+  targetGroupOptionPage.page = 1
+  targetGroupOptionPage.q = listener.target_group ?? ''
+  void refreshTargetGroupOptions()
   const group = targetGroupByName(listener.target_group ?? '')
   const probeType = normalizeProbeType(group?.probe_type)
   Object.assign(listenerForm, {
@@ -214,6 +217,9 @@ export function applyListenerTargetGroup(value: string | number | null | undefin
 
 export async function openNewListener() {
   resetListenerForm()
+  targetGroupOptionPage.page = 1
+  targetGroupOptionPage.q = ''
+  void refreshTargetGroupOptions()
   listenerFormOpen.value = true
 }
 

@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    common::{maybe_paginate_json, require_gateway_role},
+    common::{paginate_json, require_gateway_role},
     proxy_config::{self, ProxyConfigOperation},
 };
 
@@ -92,7 +92,7 @@ pub(in crate::api) fn list_configs(cfg: &Config, query: &str) -> Reply {
     match persisted_listeners(cfg) {
         Ok(listeners) => Reply::json(
             200,
-            maybe_paginate_json(
+            paginate_json(
                 listeners
                     .into_iter()
                     .map(|listener| serde_json::to_value(listener).unwrap())

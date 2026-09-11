@@ -14,7 +14,6 @@ pub(in crate::api) fn require_gateway_role(cfg: &Config) -> Option<Reply> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::api) struct PageQuery {
-    pub enabled: bool,
     pub page: usize,
     pub per_page: usize,
     pub q: String,
@@ -22,7 +21,6 @@ pub(in crate::api) struct PageQuery {
 
 pub(in crate::api) fn page_query(query: &str) -> PageQuery {
     let mut out = PageQuery {
-        enabled: false,
         page: 1,
         per_page: 20,
         q: String::new(),
@@ -31,29 +29,18 @@ pub(in crate::api) fn page_query(query: &str) -> PageQuery {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
             "page" => {
-                out.enabled = true;
                 out.page = value.parse::<usize>().unwrap_or(1).max(1);
             }
-            "per_page" | "perPage" | "page_size" | "pageSize" => {
-                out.enabled = true;
+            "per_page" => {
                 out.per_page = value.parse::<usize>().unwrap_or(20).clamp(1, 200);
             }
             "q" => {
-                out.enabled = true;
                 out.q = decode_query_value(value).trim().to_ascii_lowercase();
             }
             _ => {}
         }
     }
     out
-}
-
-pub(in crate::api) fn maybe_paginate_json(items: Vec<Value>, query: &str) -> Value {
-    let page = page_query(query);
-    if !page.enabled {
-        return Value::Array(items);
-    }
-    paginate_items(items, page)
 }
 
 pub(in crate::api) fn paginate_json(items: Vec<Value>, query: &str) -> Value {
@@ -140,21 +127,29 @@ mod tests {
 
     #[test]
     fn page_query_parses_and_clamps() {
-        assert_eq!(page_query("page=2&per_page=500&q=tcp%2D80").page, 2);
         let parsed = page_query("page=2&per_page=500&q=tcp%2D80");
-        assert!(parsed.enabled);
+        assert_eq!(parsed.page, 2);
         assert_eq!(parsed.per_page, 200);
         assert_eq!(parsed.q, "tcp-80");
     }
 
     #[test]
-    fn maybe_paginate_filters_nested_values() {
+    fn page_query_ignores_parameter_aliases() {
+        let parsed = page_query("perPage=50&page_size=50&pageSize=50");
+
+        assert_eq!(parsed.per_page, 20);
+    }
+
+    #[test]
+    fn paginate_filters_nested_values() {
         let items = vec![
             json!({"name":"tcp-80","target":{"address":"10.0.0.1"}}),
             json!({"name":"udp-53","target":{"address":"10.0.0.2"}}),
         ];
-        let value = maybe_paginate_json(items, "page=1&per_page=10&q=10.0.0.2");
+        let value = paginate_json(items, "q=10.0.0.2");
         assert_eq!(value["total"], 1);
+        assert_eq!(value["page"], 1);
+        assert_eq!(value["per_page"], 20);
         assert_eq!(value["items"][0]["name"], "udp-53");
     }
 

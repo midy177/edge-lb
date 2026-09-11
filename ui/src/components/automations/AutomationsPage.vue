@@ -94,10 +94,10 @@ const generatedTargetGroupName = computed(() => {
 })
 
 const formError = computed(() => validateTemplate(form.value))
-const enabledCount = computed(() => automationTemplatePage.value.items.filter((item) => item.enabled).length)
+const enabledCount = computed(() => automationTemplatePage.items.filter((item) => item.enabled).length)
 
 watch(
-  () => automationTemplatePage.value.page,
+  () => automationTemplatePage.page,
   () => { void refreshAutomationPage() },
 )
 
@@ -111,7 +111,7 @@ function defaultTemplate(): AutomationTemplateForm {
     target_group: {
       name: '',
       monitor: false,
-      probe_type: 'none',
+      probe_type: 'tcp',
       probe_port: null,
       probe_req: null,
       probe_resp: null,
@@ -275,6 +275,9 @@ function validateTemplate(template: AutomationTemplateForm) {
 
 function setMonitor(enabled: boolean) {
   form.value.target_group.monitor = enabled
+  if (enabled && (!form.value.target_group.probe_type || form.value.target_group.probe_type === 'none')) {
+    form.value.target_group.probe_type = 'tcp'
+  }
 }
 
 function normalizedTemplate(): AutomationTemplate {
@@ -283,7 +286,8 @@ function normalizedTemplate(): AutomationTemplate {
   if (next.node_scope === 'all') {
     next.node_filter = defaultFilter()
   }
-  next.target_group.probe_type = next.target_group.monitor ? next.target_group.probe_type || 'tcp' : 'none'
+  const probeType = next.target_group.probe_type?.trim().toLowerCase()
+  next.target_group.probe_type = next.target_group.monitor && probeType !== 'none' ? probeType || 'tcp' : 'none'
   if (!['tcp', 'udp', 'http', 'https'].includes(next.target_group.probe_type || '')) {
     next.target_group.probe_req = null
     next.target_group.probe_resp = null

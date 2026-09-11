@@ -71,12 +71,14 @@ netlink socket。规则层只删除"属于 edge-lb mark/table 范围且不再是
 优先级被外来规则占用时自动顺延，不覆盖。每条 return path 的 DSCP 超出 0..=63 时
 直接报错，不再静默截断为 DSCP 0 匹配。
 
-gateway 下发的 snapshot 只包含 backend 回程数据面所需内容：overlay CIDR、
+gateway 下发的 snapshot 只包含 backend 回程 VXLAN/DSCP 数据面所需内容：overlay CIDR、
 gateway VXLAN 接口名、VNI、VXLAN 端口、MTU、本 gateway 节点信息，以及本
 gateway 的 return path contract。contract 包含 gateway underlay IP、
 gateway overlay IP、本 backend overlay IP、DSCP、fwmark 和 route table。
 backend inventory、公网 IP、业务 listener、target group、目标端口、健康探测配置
 和运行期服务投影不进入 backend xDS，也不参与 backend snapshot version 计算。
+active gateway 状态和 UDP service port 也不得进入 backend xDS；backend 只按
+包上携带的 DSCP 选择对应 return path。
 
 HA 多 gateway 下，backend 会合并多个 gateway stream。只有已收到所有配置中的
 gateway snapshot 后才会 apply；缺少任一 gateway 时只保持当前数据面并等待，避免
@@ -92,8 +94,16 @@ table = 1000 + (slot+1)*64 + dscp            # slot 0 → 1064..1127
 ```
 
 两台 gateway 即使配置相同 DSCP 也不会共享 mark/table。backend nft 只在包从
-backend VXLAN 设备进入时按 DSCP 区分来自不同 gateway 的回程连接并打 `ct mark`，
-不匹配 L4 protocol 或 backend port；直连业务流量即使携带相同 DSCP 也不会被捕获。
+backend VXLAN 设备进入时按 DSCP 区分来自不同 gateway 的回程连接并打 `ct mark`。
+基础回程打标不匹配 L4 protocol 或 backend port；直连业务流量即使携带相同 DSCP
+也不会被捕获。
+
+UDP 有一个额外的源地址修正路径：当 UDP 服务绑定 `0.0.0.0` 时，Linux 可能用
+backend underlay 地址作为回包源，导致 conntrack 无法把回包识别为 VXLAN ingress
+流的 reply。backend 因此在 `prerouting` 从“VXLAN 设备 ingress + DSCP 命中”的 UDP
+包学习 `client_ip . client_port` 动态 set，在 `output` 只对命中该动态 set 的 UDP
+回包修正为本路径的 backend overlay 源地址并设置对应 fwmark。这个规则不使用业务
+listener、target group、service port 或 active gateway 状态。
 policy route 再把不同 mark 的回包送入对应 gateway 的 VXLAN 下一跳。
 `edge-return` 同时持有多个本地 overlay 地址和多个 VXLAN FDB peer；overlay
 镜像地址与网关自身或其他 backend 已占地址冲突时跳过并告警，不抢占。
@@ -109,9 +119,12 @@ eBPF。这样备机不会错误绑定主机的 underlay 或把共享 VIP 当成�
 2. gateway `eth0 ingress` 上的 DSCP eBPF 只匹配 default-mode listener 的 VIP 端口，将
    DSCP 设为 EF，同时保留 ECN bits。
 3. gateway native DNAT 将目标地址改写为 backend underlay，不改客户端源 IP。
-4. backend nft 对 DSCP EF 正向连接设置 `ct mark`，回包方向继承为 `fwmark`。
-5. backend 策略路由将已标记回包送入 `edge-return`。
-6. gateway `edge-hub ingress` 上的 native reverse NAT 恢复监听 VIP 后返回客户端。
+4. backend nft 对 VXLAN ingress 且 DSCP 命中的正向连接设置 `ct mark`，回包方向
+   继承为 `fwmark`。
+5. UDP 回包若因服务绑定 `0.0.0.0` 使用了 underlay 源地址，backend nft 依据
+   ingress DSCP 学到的客户端 tuple 修正源 overlay 和 fwmark。
+6. backend 策略路由将已标记回包送入 `edge-return`。
+7. gateway `edge-hub ingress` 上的 native reverse NAT 恢复监听 VIP 后返回客户端。
 
 非 default-mode listener 和直连 backend 公网 IP 的流量不会由 edge-lb 自动加入 DSCP
 回程路径，不会被策略路由送入 VXLAN。

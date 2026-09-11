@@ -149,14 +149,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                 .targets
                 .iter()
                 .filter(|target| {
-                    matches!(target.state, NativeTargetState::Active)
-                        && observed_target_is_active(
-                            observed_targets.as_ref(),
-                            &listener.target_group,
-                            target.address,
-                            listener.key.protocol.ip_proto(),
-                            target.port,
-                        )
+                    native_target_is_active(observed_targets.as_ref(), listener, target)
                 })
                 .map(|target| target.weight)
                 .filter(|weight| *weight > 0)
@@ -204,6 +197,9 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                 );
             }
             for (target_id, target) in listener.targets.iter().enumerate() {
+                if !native_target_is_active(observed_targets.as_ref(), listener, target) {
+                    continue;
+                }
                 targets.insert(
                     NativeTargetKey {
                         listener_id: *listener_id,
@@ -213,16 +209,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                         address: u32::from_be_bytes(target.address.octets()),
                         port: target.port,
                         weight: target.weight.min(u16::MAX as u32) as u16,
-                        flags: u32::from(
-                            matches!(target.state, NativeTargetState::Active)
-                                && observed_target_is_active(
-                                    observed_targets.as_ref(),
-                                    &listener.target_group,
-                                    target.address,
-                                    listener.key.protocol.ip_proto(),
-                                    target.port,
-                                ),
-                        ),
+                        flags: 1,
                     },
                     0,
                 )?;
@@ -294,6 +281,21 @@ fn observed_target_is_active(
                 Some("nok") | Some("inactive") | Some("down")
             )
         })
+}
+
+fn native_target_is_active(
+    observed: Option<&TargetHealthList>,
+    listener: &crate::provider::native::NativeListener,
+    target: &crate::provider::native::NativeTarget,
+) -> bool {
+    matches!(target.state, NativeTargetState::Active)
+        && observed_target_is_active(
+            observed,
+            &listener.target_group,
+            target.address,
+            listener.key.protocol.ip_proto(),
+            target.port,
+        )
 }
 
 fn attach_program(bpf: &mut Ebpf, name: &str, dev: &str, priority: u16) -> Result<()> {
@@ -388,16 +390,7 @@ fn sync_listener_map(
         let weight_total = listener
             .targets
             .iter()
-            .filter(|target| {
-                matches!(target.state, NativeTargetState::Active)
-                    && observed_target_is_active(
-                        observed_targets.as_ref(),
-                        &listener.target_group,
-                        target.address,
-                        listener.key.protocol.ip_proto(),
-                        target.port,
-                    )
-            })
+            .filter(|target| native_target_is_active(observed_targets.as_ref(), listener, target))
             .map(|target| target.weight)
             .filter(|weight| *weight > 0)
             .sum::<u32>();
@@ -455,6 +448,9 @@ fn sync_target_map(
             );
         }
         for (target_id, target) in listener.targets.iter().enumerate() {
+            if !native_target_is_active(observed_targets.as_ref(), listener, target) {
+                continue;
+            }
             let key = NativeTargetKey {
                 listener_id: *listener_id,
                 target_id: target_id as u32,
@@ -466,16 +462,7 @@ fn sync_target_map(
                     address: u32::from_be_bytes(target.address.octets()),
                     port: target.port,
                     weight: target.weight.min(u16::MAX as u32) as u16,
-                    flags: u32::from(
-                        matches!(target.state, NativeTargetState::Active)
-                            && observed_target_is_active(
-                                observed_targets.as_ref(),
-                                &listener.target_group,
-                                target.address,
-                                listener.key.protocol.ip_proto(),
-                                target.port,
-                            ),
-                    ),
+                    flags: 1,
                 },
                 0,
             )?;
@@ -789,60 +776,20 @@ fn replace_active_flows(cfg: &Config, loads: &StdHashMap<NativeTargetLoadKey, u3
     Ok(())
 }
 
-/// Refresh the active/inactive flag of every target in the pinned
-/// TARGETS map from observed probe state, without touching TC attachment
-/// or the running programs. Called by the probe worker on health
-/// transitions; safe to run when the datapath is not attached (no-op).
+/// Refresh endpoint membership in the pinned TARGETS map from observed probe
+/// state, without touching TC attachment or the running programs. Unhealthy
+/// targets are removed from the eBPF target map instead of being kept with an
+/// inactive flag.
 pub fn refresh_target_health(cfg: &Config) -> Result<()> {
     let pin = pin_path(cfg, TARGETS);
     if !pin.exists() {
         return Ok(());
     }
     let listeners = listeners_from_config(cfg)?;
+    let listener_ids = stable_listener_assignments(&listeners)?;
     let observed = target_health_native(cfg).ok();
-    let map_data = MapData::from_pin(&pin).with_context(|| format!("opening pinned {TARGETS}"))?;
-    let map =
-        Map::from_map_data(map_data).with_context(|| format!("{TARGETS} is not a hash map"))?;
-    let mut targets: HashMap<MapData, NativeTargetKey, NativeTargetValue> =
-        HashMap::try_from(map).with_context(|| format!("{TARGETS} key/value layout mismatch"))?;
-    let mut changed = 0usize;
-    for (listener_id, listener) in stable_listener_assignments(&listeners)? {
-        for (target_id, target) in listener.targets.iter().enumerate() {
-            let key = NativeTargetKey {
-                listener_id,
-                target_id: target_id as u32,
-            };
-            let Some(mut value) = targets.get(&key, 0).ok() else {
-                continue;
-            };
-            let active = matches!(target.state, NativeTargetState::Active)
-                && observed_target_is_active(
-                    observed.as_ref(),
-                    &listener.target_group,
-                    target.address,
-                    listener.key.protocol.ip_proto(),
-                    target.port,
-                );
-            let flags = u32::from(active);
-            if value.flags != flags {
-                value.flags = flags;
-                targets.insert(key, value, 0)?;
-                changed += 1;
-                tracing::info!(
-                    "[native-dnat] target {}:{} {} -> {} (listener {})",
-                    target.address,
-                    target.port,
-                    if flags == 1 { "inactive" } else { "active" },
-                    if flags == 1 { "active" } else { "inactive" },
-                    listener_id
-                );
-            }
-        }
-    }
+    sync_target_map(cfg, &listener_ids)?;
     refresh_listener_weights(cfg, &listeners, observed.as_ref())?;
-    if changed == 0 {
-        tracing::debug!("[native-dnat] target health refresh: no changes");
-    }
     Ok(())
 }
 
@@ -875,16 +822,7 @@ fn refresh_listener_weights(
         value.weight_total = listener
             .targets
             .iter()
-            .filter(|target| {
-                matches!(target.state, NativeTargetState::Active)
-                    && observed_target_is_active(
-                        observed,
-                        &listener.target_group,
-                        target.address,
-                        listener.key.protocol.ip_proto(),
-                        target.port,
-                    )
-            })
+            .filter(|target| native_target_is_active(observed, listener, target))
             .map(|target| target.weight)
             .filter(|weight| *weight > 0)
             .sum();
@@ -1026,6 +964,68 @@ mod tests {
             "192.0.2.10".parse().unwrap(),
             6,
             8080,
+        ));
+    }
+
+    #[test]
+    fn native_target_active_requires_config_and_observed_health() {
+        let listener = crate::provider::native::NativeListener {
+            name: "web-tcp".to_string(),
+            target_group: "web".to_string(),
+            key: crate::provider::native::NativeListenerKey {
+                vip_ip: Ipv4Addr::new(198, 51, 100, 10),
+                vip_port: 80,
+                protocol: crate::provider::native::NativeProtocol::Tcp,
+            },
+            select: 0,
+            inactive_timeout_secs: 60,
+            dscp: 46,
+            targets: Vec::new(),
+        };
+        let mut target = crate::provider::native::NativeTarget {
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            port: 8080,
+            weight: 1,
+            state: crate::provider::native::NativeTargetState::Active,
+        };
+
+        assert!(super::native_target_is_active(None, &listener, &target));
+
+        let ok = super::TargetHealthList {
+            entries: vec![crate::provider::native::TargetHealthEntry {
+                host_name: "192.0.2.10".to_string(),
+                name: "web:192.0.2.10_tcp_8080".to_string(),
+                target_group: "web".to_string(),
+                current_state: Some("ok".to_string()),
+                ..crate::provider::native::TargetHealthEntry::default()
+            }],
+        };
+        assert!(super::native_target_is_active(
+            Some(&ok),
+            &listener,
+            &target
+        ));
+
+        let nok = super::TargetHealthList {
+            entries: vec![crate::provider::native::TargetHealthEntry {
+                host_name: "192.0.2.10".to_string(),
+                name: "web:192.0.2.10_tcp_8080".to_string(),
+                target_group: "web".to_string(),
+                current_state: Some("nok".to_string()),
+                ..crate::provider::native::TargetHealthEntry::default()
+            }],
+        };
+        assert!(!super::native_target_is_active(
+            Some(&nok),
+            &listener,
+            &target
+        ));
+
+        target.state = crate::provider::native::NativeTargetState::Inactive;
+        assert!(!super::native_target_is_active(
+            Some(&ok),
+            &listener,
+            &target
         ));
     }
 

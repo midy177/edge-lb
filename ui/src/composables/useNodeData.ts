@@ -1,7 +1,7 @@
 //! 共享数据状态(模块级单例)与加载逻辑:status/nodes/listeners 等
 //! 所有页面组件直接 import;不渲染 UI。`run` 是操作包装(busy + 刷新)。
 
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { AuthError, api, clearToken, getToken, setToken } from '@/api'
 import type {
   BackendNode,
@@ -78,10 +78,11 @@ export const targetGroups = ref<TargetGroup[]>([])
 export const listeners = ref<ListenerConfig[]>([])
 export const gatewayNodes = ref<GatewayNode[]>([])
 export const backendNodes = ref<BackendNode[]>([])
-export const targetGroupPage = ref(pageState<TargetGroup>())
-export const listenerPage = ref(pageState<ListenerConfig>())
-export const backendNodePage = ref(pageState<BackendNode>())
-export const automationTemplatePage = ref(pageState<AutomationTemplate>())
+export const targetGroupPage = reactive(pageState<TargetGroup>())
+export const targetGroupOptionPage = reactive(pageState<TargetGroup>())
+export const listenerPage = reactive(pageState<ListenerConfig>())
+export const backendNodePage = reactive(pageState<BackendNode>())
+export const automationTemplatePage = reactive(pageState<AutomationTemplate>())
 export const backendSubscriptions = ref<Record<string, BackendSubscription>>({})
 export const haConfig = ref<GatewayHaConfig | null>(null)
 export const haStatus = ref<GatewayHaStatus | null>(null)
@@ -240,7 +241,13 @@ export async function refreshTargetGroupData() {
 }
 
 export async function refreshListenerData() {
-  await Promise.all([refreshBackendNodes(), refreshTargetGroups(), refreshListeners(), refreshListenerPage()])
+  await Promise.all([
+    refreshBackendNodes(),
+    refreshTargetGroups(),
+    refreshTargetGroupOptions(),
+    refreshListeners(),
+    refreshListenerPage(),
+  ])
 }
 
 export async function refreshGatewayNodes() {
@@ -249,39 +256,45 @@ export async function refreshGatewayNodes() {
 
 export async function refreshBackendNodes() {
   const session = dataSession
-  const value = await api.backendNodes()
-  if (session === dataSession) backendNodes.value = value
+  const value = await api.backendNodesPage({ page: 1, per_page: 200 })
+  if (session === dataSession) backendNodes.value = value.items
 }
 
 export async function refreshBackendNodePage() {
   const session = dataSession
-  const value = await api.backendNodesPage(pageParams(backendNodePage.value))
+  const value = await api.backendNodesPage(pageParams(backendNodePage))
   if (session !== dataSession) return
-  applyPage(backendNodePage.value, value)
+  applyPage(backendNodePage, value)
 }
 
 export async function refreshTargetGroups() {
   const session = dataSession
-  const value = await api.targetGroups()
-  if (session === dataSession) targetGroups.value = value
+  const value = await api.targetGroupsPage({ page: 1, per_page: 200 })
+  if (session === dataSession) targetGroups.value = value.items
 }
 
 export async function refreshTargetGroupPage() {
   const session = dataSession
-  const value = await api.targetGroupsPage(pageParams(targetGroupPage.value))
-  if (session === dataSession) applyPage(targetGroupPage.value, value)
+  const value = await api.targetGroupsPage(pageParams(targetGroupPage))
+  if (session === dataSession) applyPage(targetGroupPage, value)
+}
+
+export async function refreshTargetGroupOptions() {
+  const session = dataSession
+  const value = await api.targetGroupsPage(pageParams(targetGroupOptionPage))
+  if (session === dataSession) applyPage(targetGroupOptionPage, value)
 }
 
 export async function refreshListeners() {
   const session = dataSession
-  const value = await api.listenerConfigs()
-  if (session === dataSession) listeners.value = value
+  const value = await api.listenerConfigsPage({ page: 1, per_page: 200 })
+  if (session === dataSession) listeners.value = value.items
 }
 
 export async function refreshListenerPage() {
   const session = dataSession
-  const value = await api.listenerConfigsPage(pageParams(listenerPage.value))
-  if (session === dataSession) applyPage(listenerPage.value, value)
+  const value = await api.listenerConfigsPage(pageParams(listenerPage))
+  if (session === dataSession) applyPage(listenerPage, value)
 }
 
 export async function refreshSubscriptions() {
@@ -334,20 +347,20 @@ export async function refreshNotificationData() {
 export async function refreshAutomationData() {
   automationsError.value = ''
   if (!isGateway.value) {
-    automationTemplatePage.value.items = []
-    automationTemplatePage.value.total = 0
+    automationTemplatePage.items = []
+    automationTemplatePage.total = 0
     return
   }
   try {
     const [page] = await Promise.all([
-      api.automationTemplatesPage(pageParams(automationTemplatePage.value)),
+      api.automationTemplatesPage(pageParams(automationTemplatePage)),
       refreshBackendNodes(),
     ])
-    applyPage(automationTemplatePage.value, page)
+    applyPage(automationTemplatePage, page)
   } catch (e) {
     automationsError.value = e instanceof Error ? e.message : String(e)
-    automationTemplatePage.value.items = []
-    automationTemplatePage.value.total = 0
+    automationTemplatePage.items = []
+    automationTemplatePage.total = 0
   }
 }
 
@@ -355,18 +368,18 @@ export async function refreshAutomationPage() {
   const session = dataSession
   automationsError.value = ''
   if (!isGateway.value) {
-    automationTemplatePage.value.items = []
-    automationTemplatePage.value.total = 0
+    automationTemplatePage.items = []
+    automationTemplatePage.total = 0
     return
   }
   try {
-    const value = await api.automationTemplatesPage(pageParams(automationTemplatePage.value))
-    if (session === dataSession) applyPage(automationTemplatePage.value, value)
+    const value = await api.automationTemplatesPage(pageParams(automationTemplatePage))
+    if (session === dataSession) applyPage(automationTemplatePage, value)
   } catch (e) {
     if (session === dataSession) {
       automationsError.value = e instanceof Error ? e.message : String(e)
-      automationTemplatePage.value.items = []
-      automationTemplatePage.value.total = 0
+      automationTemplatePage.items = []
+      automationTemplatePage.total = 0
     }
   }
 }
@@ -411,10 +424,11 @@ export function logout() {
   status.value = null
   listeners.value = []
   targetGroups.value = []
-  listenerPage.value.items = []
-  targetGroupPage.value.items = []
-  backendNodePage.value.items = []
-  automationTemplatePage.value.items = []
+  listenerPage.items = []
+  targetGroupPage.items = []
+  targetGroupOptionPage.items = []
+  backendNodePage.items = []
+  automationTemplatePage.items = []
 }
 
 //! 切 tab 时只刷新当前页需要的数据;status 已加载则复用,不重复拉取。

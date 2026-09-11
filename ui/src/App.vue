@@ -13,7 +13,6 @@ import {
   Input,
   Label,
   Tabs,
-  TabsContent,
 } from '@/components/ui'
 import AppHeader from '@/components/layout/AppHeader.vue'
 import AutomationsPage from '@/components/automations/AutomationsPage.vue'
@@ -169,33 +168,33 @@ watch(tab, () => {
             <AlertTriangle class="size-4" /> {{ error }}
           </div>
 
-          <TabsContent value="overview">
+          <section v-if="tab === 'overview'" role="tabpanel" class="flex-1 outline-none">
             <OverviewPage />
-          </TabsContent>
+          </section>
 
-          <TabsContent value="nodes">
+          <section v-if="tab === 'nodes'" role="tabpanel" class="flex-1 outline-none">
             <NodesPage />
-          </TabsContent>
+          </section>
 
-          <TabsContent value="target-groups">
+          <section v-if="tab === 'target-groups'" role="tabpanel" class="flex-1 outline-none">
             <TargetGroupsPage />
-          </TabsContent>
+          </section>
 
-          <TabsContent value="listeners">
+          <section v-if="tab === 'listeners'" role="tabpanel" class="flex-1 outline-none">
             <ListenersPage />
-          </TabsContent>
+          </section>
 
-          <TabsContent value="automations">
+          <section v-if="tab === 'automations'" role="tabpanel" class="flex-1 outline-none">
             <AutomationsPage />
-          </TabsContent>
+          </section>
 
-          <TabsContent value="ha">
+          <section v-if="tab === 'ha'" role="tabpanel" class="flex-1 outline-none">
             <HaPage />
-          </TabsContent>
+          </section>
 
-          <TabsContent value="notifications">
+          <section v-if="tab === 'notifications'" role="tabpanel" class="flex-1 outline-none">
             <NotificationsPage />
-          </TabsContent>
+          </section>
         </main>
       </Tabs>
     </template>

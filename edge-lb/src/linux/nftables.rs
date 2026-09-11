@@ -1,4 +1,5 @@
 //! Minimal nf_tables netlink encoder for edge-lb owned tables.
+#![allow(dead_code)]
 
 use std::{ffi::CString, io, mem::size_of, os::fd::RawFd};
 

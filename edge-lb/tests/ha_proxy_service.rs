@@ -299,7 +299,10 @@ fn production_ha_api_retries_after_process_restart_and_fences_roles_and_tokens()
     assert_eq!(after["pending"], true);
     b.start();
     wait_synced(&a, &b);
-    assert_eq!(b.get("/api/v1/listener-configs")[0]["name"], "tcp-udp-80");
+    assert_eq!(
+        b.get("/api/v1/listener-configs")["items"][0]["name"],
+        "tcp-udp-80"
+    );
     assert!(
         b.get("/api/v1/ha/proxy-config-sync")["sequence"]
             .as_u64()
@@ -442,7 +445,7 @@ fn production_ha_api_retries_after_process_restart_and_fences_roles_and_tokens()
         &b.name,
     );
     wait_synced(&b, &a);
-    assert_eq!(a.get("/api/v1/listener-configs"), json!([]));
+    assert_eq!(a.get("/api/v1/listener-configs")["items"], json!([]));
     a.write(
         Method::DELETE,
         "/api/v1/target-groups/web",
