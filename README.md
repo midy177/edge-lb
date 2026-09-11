@@ -128,6 +128,33 @@ non-loopback address requires `gateway.api.auth_token` (Bearer). API calls
 must also match `gateway.api.trusted_source_cidrs`; an empty list derives the
 local underlay subnet automatically.
 
+## Performance snapshot
+
+The 2026-09-11 high-concurrency lab run used VIP `192.168.0.6:8080` and omits
+public addresses from the documentation. Full details are in
+**[docs/high-concurrency-test-report-2026-09-11.md](docs/high-concurrency-test-report-2026-09-11.md)**.
+
+| Role | Host | Lab address | Runtime | CPU / memory | CPU frequency sample |
+| --- | --- | --- | --- | --- | --- |
+| gateway-a | VM-0-12-ubuntu | `192.168.0.12` | `edge-lb 0.1.7`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
+| gateway-b | VM-0-16-ubuntu | `192.168.0.16` | `edge-lb 0.1.7`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
+| backend-a | VM-0-14-ubuntu | `192.168.0.14` | `edge-lb 0.1.7`, active | 1 vCPU AMD EPYC 7K62, 0.9 GiB | 2595.1 MHz |
+| backend-b | VM-0-13-ubuntu | `192.168.0.13` | `edge-lb 0.1.7`, active | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
+| client | VM-0-10-ubuntu | `192.168.0.10` | `ha-bench` | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
+
+| Scenario | TCP success CPS | TCP success rate | UDP throughput | UDP success rate |
+| --- | ---: | ---: | ---: | ---: |
+| `concurrency=16`, `timeout=1000ms` | 8734.2 | 100.00% | 19502.2 req/s | 100.00% |
+| `concurrency=64`, `timeout=1000ms` | 8906.9 | 99.98% | 31204.1 req/s | 99.97% |
+| `concurrency=64`, `timeout=3000ms` | 8928.1 | 100.00% | 30856.4 req/s | 99.99% |
+| `concurrency=64`, `timeout=5000ms` | 8839.3 | 100.00% | 31658.8 req/s | 99.99% |
+
+The TCP test mode was `new-per-request`, so TCP RPS is equivalent to CPS for
+this run. UDP used reused worker sockets, so it is reported as request
+throughput rather than CPS. Timeout counts dropped as the client timeout grew;
+the remaining UDP tail timeouts point more toward backend service capacity or
+host protocol-stack queue pressure than a fixed edge-lb forwarding-path fault.
+
 ## Repository layout
 
 ```text

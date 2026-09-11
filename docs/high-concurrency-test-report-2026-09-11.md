@@ -5,19 +5,21 @@
 
 ## 结论
 
-本轮高并发回归在 `concurrency=64` 下完成。TCP 在 3 秒超时阈值下达到 `100.00%` 成功率；UDP 在高压下仍有少量超时，3 秒阈值下成功率为 `99.99%`。压测结束后，两台 gateway 的 target group 均保持 `ok`，`NATIVE_TARGETS` 均为 `8` 个元素，两台 backend 服务均正常监听 TCP/UDP `8080`。
+本轮高并发回归在 `concurrency=64` 下完成。TCP 在 3 秒和 5 秒超时阈值下均达到 `100.00%` 成功率；UDP 在高压下仍有少量超时，超时阈值从 3 秒放宽到 5 秒后 timeout 从 `232` 次下降到 `164` 次，成功率保持 `99.99%`。压测结束后，两台 gateway 的 target group 均保持 `ok`，`NATIVE_TARGETS` 均为 `8` 个元素，两台 backend 服务均正常监听 TCP/UDP `8080`。
 
-公网 UDP 探测 `43.128.39.211:8080` 已恢复响应，返回 backend `192.168.0.13`。
+公网 UDP 探测 `<gateway-public-entry>:8080` 已恢复响应，返回 backend `192.168.0.13`。
+
+高并发 timeout 的表现随超时阈值放宽而明显缓解，尤其 TCP 在 3 秒和 5 秒阈值下均无失败；当前判断更倾向于 backend 服务处理能力或主机协议栈队列压力，而不是 edge-lb 固定转发路径异常。
 
 ## 测试环境
 
-| 角色 | 主机 | 地址 | 状态 |
-| --- | --- | --- | --- |
-| gateway-a | VM-0-12-ubuntu | `43.154.188.31` / `192.168.0.12` | `edge-lb 0.1.7`, active |
-| gateway-b | VM-0-16-ubuntu | `129.226.226.55` / `192.168.0.16` | `edge-lb 0.1.7`, active |
-| backend-a | VM-0-14-ubuntu | `192.168.0.14` | `edge-lb 0.1.7`, active |
-| backend-b | VM-0-13-ubuntu | `43.162.213.70` / `192.168.0.13` | `edge-lb 0.1.7`, active |
-| client | VM-0-10-ubuntu | `129.226.141.9` / `192.168.0.10` | `ha-bench` |
+| 角色 | 主机 | 地址 | 运行状态 | OS / Kernel | CPU 配置 | 内存 | CPU 频率采样 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| gateway-a | VM-0-12-ubuntu | `192.168.0.12` | `edge-lb 0.1.7`, active | Ubuntu 26.04 LTS / Linux 7.0.0-14-generic | 2 vCPU, AMD EPYC 7K62, 1 thread/core | 3.6 GiB | avg/min/max `2595.1/2595.1/2595.1 MHz` |
+| gateway-b | VM-0-16-ubuntu | `192.168.0.16` | `edge-lb 0.1.7`, active | Ubuntu 26.04 LTS / Linux 7.0.0-28-generic | 2 vCPU, AMD EPYC 7K62, 1 thread/core | 3.6 GiB | avg/min/max `2595.1/2595.1/2595.1 MHz` |
+| backend-a | VM-0-14-ubuntu | `192.168.0.14` | `edge-lb 0.1.7`, active | Ubuntu 26.04 LTS / Linux 7.0.0-14-generic | 1 vCPU, AMD EPYC 7K62, 1 thread/core | 0.9 GiB | avg/min/max `2595.1/2595.1/2595.1 MHz` |
+| backend-b | VM-0-13-ubuntu | `192.168.0.13` | `edge-lb 0.1.7`, active | Ubuntu 26.04 LTS / Linux 7.0.0-14-generic | 2 vCPU, General Processors, 2 threads/core | 1.9 GiB | avg/min/max `2595.1/2595.1/2595.1 MHz` |
+| client | VM-0-10-ubuntu | `192.168.0.10` | `ha-bench` | Ubuntu 26.04 LTS / Linux 7.0.0-14-generic | 2 vCPU, General Processors, 2 threads/core | 1.9 GiB | avg/min/max `2595.1/2595.1/2595.1 MHz` |
 
 后端测试服务：
 
@@ -34,7 +36,7 @@
 ### 低并发基线
 
 ```bash
-ssh ubuntu@129.226.141.9 \
+ssh <client-host> \
   '/usr/local/bin/ha-bench --target 192.168.0.6 --port 8080 \
   --protocol both --duration 30 --concurrency 16 \
   --payload discover --expect private_ipv4 --timeout-ms 1000 \
@@ -44,7 +46,7 @@ ssh ubuntu@129.226.141.9 \
 ### 高并发，1 秒超时
 
 ```bash
-ssh ubuntu@129.226.141.9 \
+ssh <client-host> \
   '/usr/local/bin/ha-bench --target 192.168.0.6 --port 8080 \
   --protocol both --duration 60 --concurrency 64 \
   --payload discover --expect private_ipv4 --timeout-ms 1000 \
@@ -54,22 +56,32 @@ ssh ubuntu@129.226.141.9 \
 ### 高并发，3 秒超时对照
 
 ```bash
-ssh ubuntu@129.226.141.9 \
+ssh <client-host> \
   '/usr/local/bin/ha-bench --target 192.168.0.6 --port 8080 \
   --protocol both --duration 60 --concurrency 64 \
   --payload discover --expect private_ipv4 --timeout-ms 3000 \
   --out /tmp/edge-lb-ha-vip-192.168.0.6-high-concurrency-c64-timeout3000.tsv'
 ```
 
+### 高并发，5 秒超时对照
+
+```bash
+ssh <client-host> \
+  '/usr/local/bin/ha-bench --target 192.168.0.6 --port 8080 \
+  --protocol both --duration 60 --concurrency 64 \
+  --payload discover --expect private_ipv4 --timeout-ms 5000 \
+  --out /tmp/edge-lb-ha-vip-192.168.0.6-high-concurrency-c64-timeout5000.tsv'
+```
+
 ### 公网 UDP 探测
 
 ```bash
-(printf 'discover\n'; sleep 1) | nc -uv -w 2 43.128.39.211 8080
+(printf 'discover\n'; sleep 1) | nc -uv -w 2 <gateway-public-entry> 8080
 ```
 
 ## 测试结果
 
-## CPS 与吞吐换算
+### CPS 与吞吐换算
 
 本报告中的 TCP 压测模式为 `tcp_conn_mode=new-per-request`，每个 TCP 请求都会新建一次连接，因此 TCP RPS 可以近似视为 CPS。
 
@@ -78,10 +90,11 @@ ssh ubuntu@129.226.141.9 \
 | `concurrency=16`, `timeout=1000ms` | 8734.2 | 8734.2 | 0.0 | 19502.2 req/s |
 | `concurrency=64`, `timeout=1000ms` | 8908.9 | 8906.9 | 2.1 | 31204.1 req/s |
 | `concurrency=64`, `timeout=3000ms` | 8928.1 | 8928.1 | 0.0 | 30856.4 req/s |
+| `concurrency=64`, `timeout=5000ms` | 8839.3 | 8839.3 | 0.0 | 31658.8 req/s |
 
 本轮已验证的最高稳定 TCP 成功 CPS 为 `8928.1`，对应 `concurrency=64`、`timeout=3000ms`、TCP 成功率 `100.00%`。在 `timeout=1000ms` 的更严格阈值下，TCP 尝试 CPS 为 `8908.9`，成功 CPS 为 `8906.9`，失败 CPS 约 `2.1`。
 
-UDP 使用 `udp_socket_mode=reuse-per-worker`，没有连接建立过程，不能按 CPS 表述；本轮高并发下 UDP 请求吞吐约 `30.9k` 到 `31.2k req/s`。
+UDP 使用 `udp_socket_mode=reuse-per-worker`，没有连接建立过程，不能按 CPS 表述；本轮高并发下 UDP 请求吞吐约 `30.9k` 到 `31.7k req/s`。
 
 ### 低并发基线，concurrency=16，timeout=1000ms
 
@@ -125,11 +138,25 @@ UDP 使用 `udp_socket_mode=reuse-per-worker`，没有连接建立过程，不�
 | TCP | 270272 | 265412 |
 | UDP | 1481267 | 369887 |
 
+### 高并发，concurrency=64，timeout=5000ms
+
+| 协议 | total | ok | fail | 成功率 | RPS | p50 | p95 | p99 | max | 错误 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| TCP | 530356 | 530356 | 0 | 100.00% | 8839.3 | 5.493ms | 14.974ms | 19.600ms | 1069.893ms | 无 |
+| UDP | 1899530 | 1899366 | 164 | 99.99% | 31658.8 | 0.912ms | 6.251ms | 9.638ms | 5498.554ms | timed out |
+
+后端分布：
+
+| 协议 | `192.168.0.13` | `192.168.0.14` |
+| --- | ---: | ---: |
+| TCP | 267153 | 263203 |
+| UDP | 1557697 | 341669 |
+
 ### 公网 UDP 探测结果
 
 ```text
-Connection to 43.128.39.211 port 8080 [udp/http-alt] succeeded!
-{"hostname":"netdiscover-serve","private_ipv4":"192.168.0.13","public_ipv4":"43.162.213.70","public_ipv6":"","client_ip":"103.84.136.171","client_port":21623}
+Connection to <gateway-public-entry> port 8080 [udp/http-alt] succeeded!
+{"hostname":"netdiscover-serve","private_ipv4":"192.168.0.13","public_ipv4":"<redacted>","public_ipv6":"","client_ip":"<redacted>","client_port":21623}
 ```
 
 ## 压测后状态
@@ -179,13 +206,13 @@ udp UNCONN 0.0.0.0:8080
 
 ## 观察与判断
 
-1. TCP 高并发路径稳定。`concurrency=64` 下放宽到 3 秒超时后 0 失败，p99 约 `18.796ms`，说明正常延迟主体稳定，1 秒超时失败来自极少量尾延迟。
-2. UDP 高并发路径可用但存在少量超时。`concurrency=64` 下 3 秒超时仍有 `232` 次 timeout，成功率 `99.99%`，需要在更长时间窗口或更高并发下继续观察是否与客户端发送速率、内核 UDP buffer、回程路径或单 active gateway 压力有关。
+1. TCP 高并发路径稳定。`concurrency=64` 下放宽到 3 秒和 5 秒超时后均为 0 失败，p99 约 `18.8ms` 到 `19.6ms`，说明正常延迟主体稳定，1 秒超时失败来自极少量尾延迟。
+2. UDP 高并发路径可用但存在少量超时。`concurrency=64` 下 3 秒超时有 `232` 次 timeout，5 秒超时下降到 `164` 次 timeout，成功率均为 `99.99%`。拉长超时可以降低 timeout，但不能完全归零，更倾向于 backend 服务处理能力、UDP socket buffer、softirq backlog 或主机协议栈队列压力，而不是固定转发路径不通。
 3. 控制面和健康面未出现异常。压测后 target group、target health、backend 容器、监听状态和 eBPF map 都保持正常。
 4. UDP 后端分布不如 TCP 均匀。当前 `ha-bench` UDP 模式为 `reuse-per-worker`，源端口数量受 worker 数影响，分布会受到哈希输入影响；这不等同于真实大量客户端源端口的分布。
 
 ## 后续建议
 
-1. 增加 `concurrency=128`、`duration=300s` 的长稳测试，分别记录 1 秒和 3 秒超时阈值结果。
+1. 增加 `concurrency=128`、`duration=300s` 的长稳测试，分别记录 1 秒、3 秒和 5 秒超时阈值结果。
 2. 高并发 UDP 场景同时采集 `ss -su`、网卡丢包、softnet、nft counters 和 gateway eBPF stats，定位少量 timeout 的发生点。
 3. 增加 UDP 多源端口或多客户端测试，降低 `reuse-per-worker` 对后端分布判断的影响。

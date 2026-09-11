@@ -115,6 +115,32 @@ POST    /api/v1/operations/{apply|cleanup}
 （Bearer），否则拒绝启动。API 来源还要匹配 `gateway.api.trusted_source_cidrs`；
 空数组表示自动信任本机 underlay IP 所在网段。
 
+## 性能测试摘要
+
+2026-09-11 高并发实验使用 VIP `192.168.0.6:8080`，文档中已省略公网地址。
+完整报告见
+**[docs/high-concurrency-test-report-2026-09-11.md](docs/high-concurrency-test-report-2026-09-11.md)**。
+
+| 角色 | 主机 | 实验地址 | 运行状态 | CPU / 内存 | CPU 频率采样 |
+| --- | --- | --- | --- | --- | --- |
+| gateway-a | VM-0-12-ubuntu | `192.168.0.12` | `edge-lb 0.1.7`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
+| gateway-b | VM-0-16-ubuntu | `192.168.0.16` | `edge-lb 0.1.7`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
+| backend-a | VM-0-14-ubuntu | `192.168.0.14` | `edge-lb 0.1.7`, active | 1 vCPU AMD EPYC 7K62, 0.9 GiB | 2595.1 MHz |
+| backend-b | VM-0-13-ubuntu | `192.168.0.13` | `edge-lb 0.1.7`, active | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
+| client | VM-0-10-ubuntu | `192.168.0.10` | `ha-bench` | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
+
+| 场景 | TCP 成功 CPS | TCP 成功率 | UDP 请求吞吐 | UDP 成功率 |
+| --- | ---: | ---: | ---: | ---: |
+| `concurrency=16`, `timeout=1000ms` | 8734.2 | 100.00% | 19502.2 req/s | 100.00% |
+| `concurrency=64`, `timeout=1000ms` | 8906.9 | 99.98% | 31204.1 req/s | 99.97% |
+| `concurrency=64`, `timeout=3000ms` | 8928.1 | 100.00% | 30856.4 req/s | 99.99% |
+| `concurrency=64`, `timeout=5000ms` | 8839.3 | 100.00% | 31658.8 req/s | 99.99% |
+
+TCP 测试模式为 `new-per-request`，因此本轮 TCP RPS 可视为 CPS。UDP 使用 worker
+socket 复用，没有连接建立过程，所以按请求吞吐统计。随着客户端 timeout 拉长，
+timeout 数明显下降；剩余 UDP 尾部 timeout 更倾向于 backend 服务处理能力或主机
+协议栈队列压力，而不是 edge-lb 固定转发路径异常。
+
 ## 仓库结构
 
 ```text
